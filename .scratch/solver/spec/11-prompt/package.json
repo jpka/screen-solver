@@ -1,0 +1,9 @@
+{
+  "name": "11-prompt-measure",
+  "private": true,
+  "description": "Throwaway token measurement for ticket #11. npm install && node measure.js",
+  "dependencies": {
+    "@anthropic-ai/tokenizer": "^0.0.4",
+    "gpt-tokenizer": "^3.0.1"
+  }
+}
