@@ -1,0 +1,11 @@
+{
+  "name": "screen-solver",
+  "private": true,
+  "description": "Wayfinder map and spec for the Screen Solver app. No product code yet.",
+  "scripts": {
+    "setup": "bash .claude/hooks/session-start.sh"
+  },
+  "devDependencies": {
+    "skills": "1.5.21"
+  }
+}
