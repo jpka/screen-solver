@@ -1,0 +1,605 @@
+<!--
+  PROTOTYPE — throwaway. Ticket 06: the output window.
+  Three variants of the output window, switchable via ?variant=A|B|C.
+  A = Focus pane (interrupt & replace)
+  B = Sidebar timeline (queue)
+  C = Log / transcript (append)
+-->
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Screen Solver — output window prototype</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --bg-raised: #1b1e24;
+    --bg-inset: #101216;
+    --border: #2a2e37;
+    --text: #e6e8eb;
+    --text-dim: #8b9099;
+    --text-faint: #5a5f68;
+    --accent: #5b9dff;
+    --green: #4cc38a;
+    --amber: #e0a83e;
+    --red: #e2555c;
+    --mono: "Cascadia Code", "Consolas", "SF Mono", Menlo, monospace;
+    --ui: -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--ui);
+    font-size: 13px;
+    overflow: hidden;
+  }
+  #app { position: absolute; inset: 0; display: flex; flex-direction: column; }
+
+  code, pre, .mono { font-family: var(--mono); }
+
+  /* ---- shared bits ---- */
+  .titlebar {
+    height: 34px;
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    background: var(--bg-raised);
+    border-bottom: 1px solid var(--border);
+    -webkit-app-region: drag;
+    user-select: none;
+  }
+  .titlebar .title { font-weight: 600; font-size: 12px; color: var(--text-dim); }
+  .titlebar .spacer { flex: 1; }
+  .icon-btn {
+    -webkit-app-region: no-drag;
+    width: 22px; height: 22px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 5px; cursor: pointer; color: var(--text-dim);
+    border: 1px solid transparent;
+  }
+  .icon-btn:hover { background: var(--bg-inset); color: var(--text); }
+  .icon-btn.active { color: var(--accent); border-color: var(--accent); background: rgba(91,157,255,.1); }
+
+  .status-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 9px; border-radius: 20px; font-size: 11px; font-weight: 600;
+    letter-spacing: .02em; text-transform: uppercase;
+    background: var(--bg-inset); border: 1px solid var(--border); color: var(--text-dim);
+    white-space: nowrap;
+  }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .status-pill.idle { color: var(--text-faint); }
+  .status-pill.watching { color: var(--accent); }
+  .status-pill.capturing { color: var(--amber); }
+  .status-pill.thinking { color: var(--amber); }
+  .status-pill.streaming { color: var(--green); }
+  .status-pill.errored { color: var(--red); }
+  .pulse .status-dot { animation: pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+
+  .codeblock {
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 12.5px;
+    line-height: 1.55;
+    overflow-x: auto;
+    white-space: pre;
+    position: relative;
+  }
+  .codeblock .cursor { display: inline-block; width: 7px; height: 1em; background: var(--accent); vertical-align: text-bottom; animation: blink 1s step-end infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .kw { color: #c792ea; } .str { color: #c3e88d; } .cmt { color: var(--text-faint); font-style: italic; } .num { color: #f78c6c; } .fn { color: #82aaff; }
+
+  .explanation { color: var(--text-dim); line-height: 1.6; font-size: 12.5px; white-space: pre-wrap; }
+  .entry-title { font-size: 14px; font-weight: 600; margin: 0 0 8px; }
+  .badge { font-size: 10px; padding: 1px 6px; border-radius: 4px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
+  .badge.interrupted { background: rgba(226,85,92,.15); color: var(--red); }
+  .badge.queued { background: rgba(224,168,62,.15); color: var(--amber); }
+  .badge.done { background: rgba(76,195,138,.15); color: var(--green); }
+
+  .jump-btn {
+    position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+    background: var(--accent); color: #08101f; border: none; border-radius: 20px;
+    padding: 6px 14px; font-size: 12px; font-weight: 700; cursor: pointer;
+    box-shadow: 0 4px 14px rgba(0,0,0,.4);
+  }
+
+  /* ---- prototype-only chrome ---- */
+  #controls {
+    position: fixed; top: 10px; right: 10px; z-index: 50;
+    background: #000; border: 1px solid #333; border-radius: 8px;
+    padding: 8px; display: flex; flex-direction: column; gap: 6px;
+    font-family: var(--ui); font-size: 11px; box-shadow: 0 6px 24px rgba(0,0,0,.5);
+  }
+  #controls .label { color: #888; font-weight: 700; letter-spacing: .05em; font-size: 9px; margin-bottom: 2px; }
+  #controls button {
+    background: #1c1c1c; color: #eee; border: 1px solid #3a3a3a; border-radius: 5px;
+    padding: 5px 8px; cursor: pointer; font-size: 11px; text-align: left;
+  }
+  #controls button:hover { background: #2a2a2a; }
+
+  #switcher {
+    position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 50;
+    display: flex; align-items: center; gap: 10px;
+    background: rgba(20,22,26,.95); border: 1px solid #444; border-radius: 24px;
+    padding: 6px 8px 6px 14px; box-shadow: 0 8px 30px rgba(0,0,0,.55);
+    font-family: var(--ui); backdrop-filter: blur(6px);
+  }
+  #switcher .variant-label { font-size: 12px; font-weight: 600; min-width: 190px; text-align: center; }
+  #switcher .variant-label small { display: block; font-weight: 400; color: var(--text-dim); font-size: 10px; margin-top: 1px; }
+  #switcher button.arrow {
+    width: 26px; height: 26px; border-radius: 50%; border: 1px solid #555; background: #24262c;
+    color: #fff; cursor: pointer; font-size: 13px; display:flex; align-items:center; justify-content:center;
+  }
+  #switcher button.arrow:hover { background: #33363e; }
+
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: #333844; border-radius: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="controls">
+  <div class="label">PROTOTYPE CONTROLS</div>
+  <button id="btn-new">▶ New problem</button>
+  <button id="btn-error">⚠ Simulate error</button>
+  <button id="btn-reset">↺ Reset</button>
+</div>
+
+<div id="switcher">
+  <button class="arrow" id="prev">←</button>
+  <div class="variant-label" id="variant-label"></div>
+  <button class="arrow" id="next">→</button>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Sample problems (stand in for real solve-call output)
+// ---------------------------------------------------------------------------
+const PROBLEMS = [
+  {
+    title: "Two Sum",
+    lang: "python",
+    code: `def two_sum(nums, target):
+    seen = {}
+    for i, n in enumerate(nums):
+        complement = target - n
+        if complement in seen:
+            return [seen[complement], i]
+        seen[n] = i
+    return []
+
+# example
+print(two_sum([2, 7, 11, 15], 9))  # [0, 1]`,
+    explanation: `Single pass, O(n) time / O(n) space.
+
+Track each number's index in a hash map as we scan. For the
+current number, check whether its complement (target - n) has
+already been seen — if so we've found the pair immediately,
+no need for a nested loop.
+
+Handles duplicates correctly because we check for the
+complement *before* inserting the current number.`
+  },
+  {
+    title: "Valid Parentheses",
+    lang: "javascript",
+    code: `function isValid(s) {
+  const pairs = { ')': '(', ']': '[', '}': '{' };
+  const stack = [];
+  for (const ch of s) {
+    if (ch === '(' || ch === '[' || ch === '{') {
+      stack.push(ch);
+    } else if (pairs[ch]) {
+      if (stack.pop() !== pairs[ch]) return false;
+    }
+  }
+  return stack.length === 0;
+}
+
+// example
+console.log(isValid("{[()]}")); // true`,
+    explanation: `Classic stack problem, O(n) time / O(n) space.
+
+Push every opening bracket. On a closing bracket, pop and
+check it matches the expected opener via the pairs lookup.
+String is valid only if the stack is empty at the end — an
+early false covers mismatches, and a non-empty stack at the
+end covers unclosed brackets.`
+  },
+  {
+    title: "Merge Intervals",
+    lang: "python",
+    code: `def merge(intervals):
+    intervals.sort(key=lambda x: x[0])
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+print(merge([[1,3],[2,6],[8,10],[15,18]]))
+# [[1, 6], [8, 10], [15, 18]]`,
+    explanation: `Sort by start, O(n log n) — merging itself is O(n).
+
+Once sorted, an interval only needs to be compared against
+the last merged interval: if it overlaps (its start is at or
+before the previous end), extend that interval's end;
+otherwise it starts a new group.`
+  }
+];
+let problemIdx = 0;
+function nextProblem() { const p = PROBLEMS[problemIdx % PROBLEMS.length]; problemIdx++; return p; }
+
+// ---------------------------------------------------------------------------
+// Tiny syntax highlighter — good enough for a prototype, not production
+// ---------------------------------------------------------------------------
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function highlight(code) {
+  var escd = esc(code);
+  var bs = String.fromCharCode(92);
+  var wb = bs + 'b';
+  var dq = '"(?:[^"' + bs + bs + ']|' + bs + bs + '.)*"';
+  var sq = "'(?:[^'" + bs + bs + "]|" + bs + bs + ".)*'";
+  var pattern =
+    '(#.*$|//.*$)' + '|' +
+    '(' + dq + '|' + sq + ')' + '|' +
+    wb + '(def|return|if|elif|else|for|while|in|import|from|class|function|const|let|var|new|true|True|false|False|None|null|console|print)' + wb + '|' +
+    wb + '(' + bs + 'd+)' + wb;
+  var tokenRe = new RegExp(pattern, 'gm');
+  return escd.replace(tokenRe, function (m, cmt, str, kw, num) {
+    if (cmt) return '<span class="cmt">' + cmt + '</span>';
+    if (str) return '<span class="str">' + str + '</span>';
+    if (kw) return '<span class="kw">' + kw + '</span>';
+    if (num) return '<span class="num">' + num + '</span>';
+    return m;
+  });
+}
+
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+const state = {
+  status: 'idle',            // idle | watching | capturing | thinking | streaming | errored
+  live: null,                // the in-flight/most-recent entry
+  history: [],                // completed/interrupted entries, newest first
+  queue: [],                  // variant B only
+  viewing: null,               // history entry id being viewed (null = live), variant A/B
+  errorMsg: null,
+  autoScrollA: true,
+  autoScrollC: true,
+};
+let entrySeq = 1;
+let streamTimer = null;
+
+function makeEntry(problem) {
+  return {
+    id: entrySeq++,
+    title: problem.title,
+    lang: problem.lang,
+    fullCode: problem.code,
+    fullExplanation: problem.explanation,
+    codeShown: 0,
+    explShown: 0,
+    status: 'streaming',       // streaming | done | interrupted | errored
+    startedAt: Date.now(),
+  };
+}
+
+function stopStream() { if (streamTimer) { clearInterval(streamTimer); streamTimer = null; } }
+
+function beginSolve(problem, mode) {
+  // mode: 'interrupt' (A), 'queue' (B), 'append' (C)
+  const entry = makeEntry(problem);
+
+  if (mode === 'interrupt' && state.live && state.live.status === 'streaming') {
+    state.live.status = 'interrupted';
+    state.history.unshift(state.live);
+  } else if (mode === 'append' && state.live && state.live.status === 'streaming') {
+    state.live.status = 'interrupted';
+    state.history.unshift(state.live);
+  } else if (mode === 'queue' && state.live && state.live.status === 'streaming') {
+    state.queue.push(problem);
+    render();
+    return; // don't start yet, wait for current to finish
+  }
+
+  state.live = entry;
+  state.status = 'capturing';
+  render();
+  setTimeout(() => { state.status = 'thinking'; render(); }, 500);
+  setTimeout(() => {
+    state.status = 'streaming';
+    stopStream();
+    streamTimer = setInterval(() => {
+      if (entry.status !== 'streaming') { stopStream(); return; }
+      if (entry.codeShown < entry.fullCode.length) {
+        entry.codeShown = Math.min(entry.fullCode.length, entry.codeShown + 3);
+      } else if (entry.explShown < entry.fullExplanation.length) {
+        entry.explShown = Math.min(entry.fullExplanation.length, entry.explShown + 3);
+      } else {
+        entry.status = 'done';
+        state.history.unshift(entry);
+        stopStream();
+        state.status = 'watching';
+        // drain queue (variant B)
+        if (state.queue.length) {
+          const next = state.queue.shift();
+          setTimeout(() => beginSolve(next, 'queue-drain'), 250);
+        }
+      }
+      render();
+    }, 40);
+    render();
+  }, 1400);
+}
+// queue-drain should behave like a fresh solve, not re-queue
+const _origBeginSolve = beginSolve;
+
+function simulateError() {
+  stopStream();
+  state.status = 'errored';
+  state.errorMsg = 'Anthropic API error: overloaded_error — retrying in the real app; simulated here as a hard stop.';
+  if (state.live && state.live.status === 'streaming') {
+    state.live.status = 'errored';
+    state.history.unshift(state.live);
+  }
+  render();
+}
+
+function resetAll() {
+  stopStream();
+  state.status = 'idle';
+  state.live = null;
+  state.history = [];
+  state.queue = [];
+  state.viewing = null;
+  state.errorMsg = null;
+  render();
+  setTimeout(() => { state.status = 'watching'; render(); }, 400);
+}
+
+document.getElementById('btn-new').onclick = () => {
+  const p = nextProblem();
+  const mode = variant === 'A' ? 'interrupt' : variant === 'B' ? 'queue' : 'append';
+  beginSolve(p, mode);
+};
+document.getElementById('btn-error').onclick = simulateError;
+document.getElementById('btn-reset').onclick = resetAll;
+
+// ---------------------------------------------------------------------------
+// Variant A — Focus pane (interrupt & replace, history behind a drawer)
+// ---------------------------------------------------------------------------
+let historyOpenA = false;
+let pinnedA = true;
+function renderA(root) {
+  const s = state;
+  const viewingEntry = s.viewing != null ? s.history.find(h => h.id === s.viewing) : null;
+  const shown = viewingEntry || s.live;
+
+  root.innerHTML = `
+    <div class="titlebar">
+      <div class="title">Screen Solver</div>
+      <div class="spacer"></div>
+      <div class="status-pill ${s.status} ${['watching','capturing','thinking','streaming'].includes(s.status)?'pulse':''}">
+        <span class="status-dot"></span>${s.status}
+      </div>
+      <div class="icon-btn ${pinnedA?'active':''}" id="pinA" title="Always on top">📌</div>
+      <div class="icon-btn" id="histA" title="History">🕘</div>
+      <div class="icon-btn" id="setA" title="Settings">⚙️</div>
+    </div>
+    <div style="flex:1; position:relative; overflow:hidden; display:flex;">
+      <div id="mainA" style="flex:1; overflow-y:auto; padding:18px 20px;"></div>
+      <div id="drawerA" style="position:absolute; top:0; right:${historyOpenA?'0':'-280px'}; width:260px; height:100%; background:var(--bg-raised); border-left:1px solid var(--border); transition:right .2s ease; padding:14px; overflow-y:auto;">
+        <div style="font-weight:700; font-size:12px; color:var(--text-dim); margin-bottom:10px; text-transform:uppercase; letter-spacing:.04em;">History</div>
+        ${s.history.length===0 ? '<div style="color:var(--text-faint);">No answers yet.</div>' : s.history.map(h => `
+          <div class="hist-item" data-id="${h.id}" style="padding:8px; border-radius:6px; cursor:pointer; margin-bottom:4px; ${s.viewing===h.id?'background:var(--bg-inset);':''}">
+            <div style="font-weight:600; font-size:12px;">${esc(h.title)}</div>
+            <div style="color:var(--text-faint); font-size:10px; margin-top:2px;">
+              ${new Date(h.startedAt).toLocaleTimeString()} ${h.status==='interrupted'?'<span class="badge interrupted">interrupted</span>':h.status==='errored'?'<span class="badge interrupted">errored</span>':''}
+            </div>
+          </div>`).join('')}
+      </div>
+    </div>
+  `;
+  const mainA = root.querySelector('#mainA');
+  if (!shown) {
+    mainA.innerHTML = `<div style="color:var(--text-faint); text-align:center; margin-top:80px;">Watching for a kata to appear…</div>`;
+  } else {
+    mainA.innerHTML = renderEntryBlock(shown, s.viewing == null);
+    if (s.viewing == null && s.autoScrollA) mainA.scrollTop = mainA.scrollHeight;
+  }
+  mainA.onscroll = () => {
+    if (s.viewing != null) return;
+    const atBottom = mainA.scrollHeight - mainA.scrollTop - mainA.clientHeight < 30;
+    s.autoScrollA = atBottom;
+    const jump = root.querySelector('#jumpA');
+    if (jump) jump.style.display = atBottom ? 'none' : 'block';
+  };
+  root.querySelector('#pinA').onclick = () => { pinnedA = !pinnedA; renderA(root); };
+  root.querySelector('#histA').onclick = () => { historyOpenA = !historyOpenA; renderA(root); };
+  root.querySelectorAll('.hist-item').forEach(el => {
+    el.onclick = () => { s.viewing = Number(el.dataset.id); render(); };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Variant B — Sidebar timeline (queue behind current)
+// ---------------------------------------------------------------------------
+let pinnedB = true;
+function renderB(root) {
+  const s = state;
+  const items = [...(s.live ? [s.live] : []), ...s.history];
+  const selected = s.viewing != null ? items.find(i => i.id === s.viewing) : (s.live || items[0]);
+
+  root.innerHTML = `
+    <div style="flex:1; display:flex; overflow:hidden;">
+      <div style="width:250px; flex:0 0 auto; background:var(--bg-raised); border-right:1px solid var(--border); display:flex; flex-direction:column;">
+        <div class="titlebar" style="border-bottom:1px solid var(--border);">
+          <div class="title">Screen Solver</div>
+        </div>
+        <div style="padding:10px 12px; display:flex; align-items:center; gap:8px; border-bottom:1px solid var(--border);">
+          <div class="status-pill ${s.status} ${['watching','capturing','thinking','streaming'].includes(s.status)?'pulse':''}">
+            <span class="status-dot"></span>${s.status}
+          </div>
+          ${s.queue.length ? `<div class="badge queued">${s.queue.length} queued</div>` : ''}
+        </div>
+        <div style="flex:1; overflow-y:auto; padding:8px;">
+          ${items.length===0 ? '<div style="color:var(--text-faint); padding:8px;">No answers yet.</div>' : items.map(h => `
+            <div class="hist-item" data-id="${h.id}" style="padding:9px 8px; border-radius:6px; cursor:pointer; margin-bottom:3px; border:1px solid ${selected&&selected.id===h.id?'var(--accent)':'transparent'}; ${selected&&selected.id===h.id?'background:var(--bg-inset);':''}">
+              <div style="display:flex; align-items:center; gap:6px;">
+                ${h.status==='streaming'?'<span class="status-dot pulse" style="color:var(--green);"></span>':''}
+                <div style="font-weight:600; font-size:12px;">${esc(h.title)}</div>
+              </div>
+              <div style="color:var(--text-faint); font-size:10px; margin-top:3px;">
+                ${new Date(h.startedAt).toLocaleTimeString()}
+                ${h.status==='interrupted'?' · <span class="badge interrupted">interrupted</span>':''}
+                ${h.status==='errored'?' · <span class="badge interrupted">errored</span>':''}
+                ${h.status==='done'?' · <span class="badge done">done</span>':''}
+              </div>
+            </div>`).join('')}
+          ${s.queue.map((q,i) => `<div style="padding:9px 8px; opacity:.5;"><div style="font-weight:600; font-size:12px;">${esc(q.title)}</div><div class="badge queued" style="margin-top:3px;">queued</div></div>`).join('')}
+        </div>
+        <div style="padding:8px 12px; border-top:1px solid var(--border); display:flex; gap:6px;">
+          <div class="icon-btn ${pinnedB?'active':''}" id="pinB" title="Always on top">📌</div>
+          <div class="icon-btn" id="setB" title="Settings">⚙️</div>
+        </div>
+      </div>
+      <div id="mainB" style="flex:1; overflow-y:auto; padding:18px 20px;"></div>
+    </div>
+  `;
+  const mainB = root.querySelector('#mainB');
+  mainB.innerHTML = selected ? renderEntryBlock(selected, false) : `<div style="color:var(--text-faint); text-align:center; margin-top:80px;">Watching for a kata to appear…</div>`;
+  root.querySelector('#pinB').onclick = () => { pinnedB = !pinnedB; renderB(root); };
+  root.querySelectorAll('.hist-item').forEach(el => {
+    el.onclick = () => { s.viewing = Number(el.dataset.id); render(); };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Variant C — Log / transcript (append, chronological, no separate "current")
+// ---------------------------------------------------------------------------
+function renderC(root) {
+  const s = state;
+  const items = [...s.history].reverse().concat(s.live ? [s.live] : []); // chronological, oldest first
+
+  root.innerHTML = `
+    <div class="titlebar">
+      <div class="title mono">Screen Solver — ${s.status}${s.status==='errored' && s.errorMsg ? ': ' + esc(s.errorMsg) : ''}</div>
+      <div class="spacer"></div>
+      <div class="icon-btn active" title="Always on top">📌</div>
+      <div class="icon-btn" title="Settings">⚙️</div>
+    </div>
+    <div id="logC" style="flex:1; overflow-y:auto; padding:16px 20px; display:flex; flex-direction:column; gap:18px;"></div>
+  `;
+  const log = root.querySelector('#logC');
+  if (items.length === 0) {
+    log.innerHTML = `<div class="mono" style="color:var(--text-faint);">$ watching for changes…</div>`;
+  } else {
+    log.innerHTML = items.map(entry => `
+      <div class="mono" style="color:var(--text-faint); font-size:11px;">
+        ${entry.status==='interrupted' ? '◌ interrupted — superseded by a newer change' :
+          entry.status==='errored' ? '✕ solve failed' :
+          entry.status==='streaming' ? '▸ streaming answer…' : '● change detected — solved'}
+      </div>
+      ${renderEntryBlock(entry, false, entry.status==='interrupted')}
+    `).join('<hr style="border:none; border-top:1px solid var(--border); margin:2px 0;">');
+  }
+  if (s.autoScrollC) log.scrollTop = log.scrollHeight;
+  log.onscroll = () => {
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 30;
+    s.autoScrollC = atBottom;
+    const jump = root.querySelector('#jumpC');
+    if (jump) jump.style.display = atBottom ? 'none' : 'block';
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Shared entry block renderer
+// ---------------------------------------------------------------------------
+function renderEntryBlock(entry, showJumpA, dimmed) {
+  const code = entry.fullCode.slice(0, entry.codeShown);
+  const expl = entry.fullExplanation.slice(0, entry.explShown);
+  const codeDone = entry.codeShown >= entry.fullCode.length;
+  const statusBadge = entry.status === 'interrupted' ? '<span class="badge interrupted">interrupted</span>'
+    : entry.status === 'errored' ? '<span class="badge interrupted">errored</span>'
+    : entry.status === 'done' ? '<span class="badge done">done</span>' : '';
+  return `
+    <div style="${dimmed ? 'opacity:.45;' : ''} max-width: 720px;">
+      <div class="entry-title">${esc(entry.title)} ${statusBadge}</div>
+      <div class="codeblock">${highlight(code)}${!codeDone && entry.status==='streaming' ? '<span class="cursor"></span>' : ''}</div>
+      ${(codeDone && (expl || entry.status==='streaming')) ? `<div class="explanation" style="margin-top:10px;">${esc(expl)}${entry.explShown < entry.fullExplanation.length && entry.status==='streaming' ? '<span class="cursor"></span>' : ''}</div>` : ''}
+    </div>
+  `;
+}
+
+// ---------------------------------------------------------------------------
+// Variant switcher
+// ---------------------------------------------------------------------------
+const VARIANTS = {
+  A: { name: 'Focus pane', desc: 'interrupt & replace, history in a drawer', render: renderA },
+  B: { name: 'Sidebar timeline', desc: 'persistent history, new problems queue', render: renderB },
+  C: { name: 'Log / transcript', desc: 'chronological feed, no separate "current"', render: renderC },
+};
+const order = ['A','B','C'];
+function getVariantFromURL() {
+  const v = new URLSearchParams(location.search).get('variant');
+  return VARIANTS[v] ? v : 'A';
+}
+let variant = getVariantFromURL();
+
+function render() {
+  const root = document.getElementById('app');
+  VARIANTS[variant].render(root);
+  const label = document.getElementById('variant-label');
+  label.innerHTML = `${variant} — ${VARIANTS[variant].name}<small>${VARIANTS[variant].desc}</small>`;
+}
+
+function setVariant(v) {
+  variant = v;
+  const url = new URL(location);
+  url.searchParams.set('variant', v);
+  history.replaceState(null, '', url);
+  render();
+}
+
+document.getElementById('prev').onclick = () => {
+  const i = order.indexOf(variant);
+  setVariant(order[(i - 1 + order.length) % order.length]);
+};
+document.getElementById('next').onclick = () => {
+  const i = order.indexOf(variant);
+  setVariant(order[(i + 1) % order.length]);
+};
+document.addEventListener('keydown', e => {
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  if (['INPUT','TEXTAREA'].includes(tag) || document.activeElement?.isContentEditable) return;
+  if (e.key === 'ArrowLeft') document.getElementById('prev').click();
+  if (e.key === 'ArrowRight') document.getElementById('next').click();
+});
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+state.status = 'idle';
+render();
+setTimeout(() => { state.status = 'watching'; render(); }, 400);
+setTimeout(() => {
+  const mode = variant === 'A' ? 'interrupt' : variant === 'B' ? 'queue' : 'append';
+  beginSolve(nextProblem(), mode);
+}, 1200);
+</script>
+</body>
+</html>

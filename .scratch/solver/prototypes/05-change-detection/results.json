@@ -1,0 +1,186 @@
+[
+  {
+    "pair": "01_idle_a.png -> 02_idle_b.png",
+    "note": "idle +700ms, no action",
+    "truth": "same",
+    "regions": {
+      "whole": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      },
+      "instructions": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      },
+      "editor": {
+        "pixelDiffPercent": 0.01,
+        "hashDistance": 0
+      },
+      "rightPane": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      }
+    }
+  },
+  {
+    "pair": "02_idle_b.png -> 03_idle_c.png",
+    "note": "idle +700ms again, no action",
+    "truth": "same",
+    "regions": {
+      "whole": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      },
+      "instructions": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      },
+      "editor": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      },
+      "rightPane": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      }
+    }
+  },
+  {
+    "pair": "03_idle_c.png -> 04_scrolled.png",
+    "note": "scrolled instructions pane",
+    "truth": "same",
+    "regions": {
+      "whole": {
+        "pixelDiffPercent": 1.51,
+        "hashDistance": 2
+      },
+      "instructions": {
+        "pixelDiffPercent": 3.87,
+        "hashDistance": 12
+      },
+      "editor": {
+        "pixelDiffPercent": 0.01,
+        "hashDistance": 0
+      },
+      "rightPane": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      }
+    }
+  },
+  {
+    "pair": "04_scrolled.png -> 05_hover.png",
+    "note": "hovered a nav icon",
+    "truth": "same",
+    "regions": {
+      "whole": {
+        "pixelDiffPercent": 3.37,
+        "hashDistance": 16
+      },
+      "instructions": {
+        "pixelDiffPercent": 6.91,
+        "hashDistance": 17
+      },
+      "editor": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      },
+      "rightPane": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      }
+    }
+  },
+  {
+    "pair": "05_hover.png -> 06_typing1.png",
+    "note": "typed first chunk in editor",
+    "truth": "same",
+    "regions": {
+      "whole": {
+        "pixelDiffPercent": 3.4,
+        "hashDistance": 17
+      },
+      "instructions": {
+        "pixelDiffPercent": 6.91,
+        "hashDistance": 17
+      },
+      "editor": {
+        "pixelDiffPercent": 0.24,
+        "hashDistance": 3
+      },
+      "rightPane": {
+        "pixelDiffPercent": 0.05,
+        "hashDistance": 5
+      }
+    }
+  },
+  {
+    "pair": "06_typing1.png -> 07_typing2.png",
+    "note": "typed more in editor",
+    "truth": "same",
+    "regions": {
+      "whole": {
+        "pixelDiffPercent": 0.03,
+        "hashDistance": 2
+      },
+      "instructions": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      },
+      "editor": {
+        "pixelDiffPercent": 0.27,
+        "hashDistance": 2
+      },
+      "rightPane": {
+        "pixelDiffPercent": 0.05,
+        "hashDistance": 3
+      }
+    }
+  },
+  {
+    "pair": "07_typing2.png -> 08_typing_settled.png",
+    "note": "idle +600ms after typing stopped",
+    "truth": "same",
+    "regions": {
+      "whole": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 1
+      },
+      "instructions": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      },
+      "editor": {
+        "pixelDiffPercent": 0.02,
+        "hashDistance": 0
+      },
+      "rightPane": {
+        "pixelDiffPercent": 0,
+        "hashDistance": 0
+      }
+    }
+  },
+  {
+    "pair": "08_typing_settled.png -> 09_new_problem.png",
+    "note": "navigated to a different kata",
+    "truth": "different",
+    "regions": {
+      "whole": {
+        "pixelDiffPercent": 2.42,
+        "hashDistance": 10
+      },
+      "instructions": {
+        "pixelDiffPercent": 4.83,
+        "hashDistance": 19
+      },
+      "editor": {
+        "pixelDiffPercent": 0.98,
+        "hashDistance": 2
+      },
+      "rightPane": {
+        "pixelDiffPercent": 1.08,
+        "hashDistance": 9
+      }
+    }
+  }
+]
