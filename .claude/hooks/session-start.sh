@@ -17,8 +17,11 @@ cd "$CLAUDE_PROJECT_DIR"
 # the current HEAD of mattpocock/skills (the CLI has no documented flag to
 # pin an upstream ref) — skills-lock.json records the hashes actually
 # installed, so `git diff skills-lock.json` after a run shows any drift.
+# Use explicit --skill/--agent rather than --all: --all expands to
+# `--agent '*'`, which overrides the narrower flag and fans the install out
+# to every agent target the CLI knows about, leaving a stray ./agent/ dir.
 npm install --no-audit --no-fund
-npx skills add mattpocock/skills --all --agent claude-code -y
+npx skills add mattpocock/skills --skill '*' --agent claude-code -y
 
 # --- GitHub CLI ---------------------------------------------------------
 # There is no official npm package for the real `gh` binary — the "gh"
