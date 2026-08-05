@@ -2,7 +2,7 @@
 
 Parent: [Screen Solver](../map.md)
 Type: grilling
-Status: open
+Status: resolved
 Blocked by: 02
 
 ## Question

@@ -1,0 +1,45 @@
+# Packaging spec for Screen Solver — decided in ticket #10.
+# https://github.com/jpka/screen-solver/issues/10
+#
+# Format: electron-builder NSIS, per-user, one-click. Not MSIX (see the ticket),
+# not portable, not unpackaged.
+
+appId: dev.jpka.screen-solver          # do not change: pins %APPDATA% path (see below)
+productName: Screen Solver             # do not change: userData = %APPDATA%\Screen Solver
+
+# userData (#8's config.json + encrypted key blob, #9's usage.json) resolves from
+# productName. Renaming either field on a later build orphans every stored setting,
+# the DPAPI-encrypted API key, and the 30-day spend history. Treat both as frozen.
+
+directories:
+  output: dist
+  buildResources: build
+
+files:
+  - "out/**/*"                         # compiled TS
+  - "package.json"
+
+asar: true
+
+# No publish provider. Releases are built locally and installed locally; nothing
+# is uploaded. This also keeps `electron-builder` from failing on a missing token.
+publish: null
+
+win:
+  target:
+    - nsis
+  icon: build/icon.ico
+  # Unsigned. The installer is built and run on the same machine, so it never
+  # carries mark-of-the-web and SmartScreen never fires. Downloading the same
+  # artifact from a release page WOULD trigger it — one more reason releases stay local.
+
+nsis:
+  oneClick: true                       # no wizard; personal tool, no options to choose
+  perMachine: false                    # installs to %LOCALAPPDATA%\Programs — no UAC, no admin
+  allowToChangeInstallationDirectory: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Screen Solver
+  deleteAppDataOnUninstall: false      # REQUIRED: uninstall/reinstall must not wipe the
+                                       # API key, settings, or spend history
+  artifactName: "${productName}-${version}-setup.${ext}"
