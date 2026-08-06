@@ -8,3 +8,5 @@ node_modules/
 
 # Per-machine session state, not shared config.
 .claude/settings.local.json
+
+.env
