@@ -168,22 +168,34 @@ phone. Add `?variant=A`…`F` to force a single framed layout instead.
 
 - **Fullscreen is available in both layouts** — a FAB above settings in C,
   a rail-footer button in D — via the standard Fullscreen API with a
-  `webkit` fallback, and the icon reflects current state.
+  `webkit` fallback, and the icon reflects current state. **Confirmed
+  working on the target device** (Android Chrome).
 
-  **Caveat, unverified on the target device:** Safari on *iPhone* has never
-  exposed the Fullscreen API for arbitrary elements (iPad and Android
-  Chrome do). The button is feature-detected and renders visibly disabled
-  with an explanatory tooltip rather than failing silently, so the
-  degradation is honest — but if the phone in play is an iPhone, the real
-  route to chrome-less display is "Add to Home Screen" plus a
-  `display: standalone` web-app manifest, which is a different mechanism
-  and not prototyped here. Worth settling against the actual device before
-  this is written into the spec.
+  Known limitation, not hit here: Safari on *iPhone* has never exposed the
+  Fullscreen API for arbitrary elements. The button is feature-detected and
+  renders visibly disabled with an explanatory tooltip rather than failing
+  silently. If an iPhone ever matters, the route to chrome-less display is
+  "Add to Home Screen" plus a `display: standalone` manifest — a different
+  mechanism, not prototyped.
+
+- **The forced-variant trap, worth carrying into the real client.** During
+  device testing the landscape layout appeared stuck on a portrait phone.
+  The detection was correct throughout; a stale `?variant=D` in the URL was
+  overriding it, and the switcher had been writing that param back on every
+  use so it survived reloads and address-bar autocomplete. Two fixes, both
+  general lessons: **a debug override must be visually obvious whenever it
+  is active** (the badge now reads amber `FORCED D` instead of looking
+  identical to normal operation), and **an override must not persist itself
+  into the URL** unless explicitly asked for. Also worth noting the
+  throwaway server sent *no* cache headers, which could independently have
+  masked any fix behind a cached page — `serve.js` now sends `no-store`.
 
 ## Capture
 
 Full variant set committed to the throwaway branch `prototype/21-web-client`
-per [`/prototype`](../../../docs/agents/issue-tracker.md); this README's
-"What it settled" section is the answer folded into
-[The web client (#21)](https://github.com/jpka/screen-solver/issues/21)'s
-resolution comment.
+per `/prototype`; this README's "What it settled" section is the answer
+folded into [The web client (#21)](https://github.com/jpka/screen-solver/issues/21)'s
+resolution comment. Nothing here is promoted to `main` — the variant code was
+written under prototype constraints (no tests, no error handling) and the
+real client should be written fresh against the decisions, not lifted from
+this file.
