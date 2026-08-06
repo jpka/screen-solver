@@ -193,6 +193,7 @@
     border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px; font-size: 10.5px;
     cursor: pointer; backdrop-filter: blur(6px);
   }
+  #proto-toggle.forced { color: var(--amber); border-color: var(--amber); }
   #controls { position: fixed; top: 40px; left: 8px; z-index: 60; background: #000d; border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-size: 11.5px; display: flex; flex-direction: column; gap: 6px; width: 186px; backdrop-filter: blur(6px); max-height: 78vh; overflow-y: auto; }
   #controls .title { font-weight: 700; letter-spacing: .04em; color: var(--text-dim); }
   #controls button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; cursor: pointer; font-size: 11px; text-align: left; }
@@ -306,10 +307,23 @@ const NAMES = {
   D: "Split rail", E: "Code | prose columns", F: "Horizontal filmstrip"
 };
 
-/* Real orientation detection. Landscape layout needs both a landscape aspect
-   AND enough width to justify a rail — a 500px-wide desktop window that
-   happens to be landscape still reads better as the log. */
-const mqLandscape = window.matchMedia("(orientation: landscape) and (min-width: 600px)");
+/* Real orientation detection.
+
+   Source of truth is a direct dimension comparison, not the media query —
+   matchMedia is used only as one of several change *triggers*. A compound
+   query is one more thing that can silently not match; innerWidth vs
+   innerHeight cannot.
+
+   Landscape layout also needs enough width to justify a rail, so a small
+   landscape *window* on a desktop still reads better as the log. The floor
+   is 480px so that every phone in landscape (iPhone SE is 568px, the
+   narrowest in practice) clears it. */
+const LANDSCAPE_MIN_WIDTH = 480;
+const mqLandscape = window.matchMedia("(orientation: landscape)");
+
+function orientationIsLandscape() {
+  return window.innerWidth > window.innerHeight && window.innerWidth >= LANDSCAPE_MIN_WIDTH;
+}
 
 const params = new URLSearchParams(location.search);
 const requested = params.get("variant");
@@ -319,7 +333,7 @@ if (requested) {
 }
 
 function effectiveVariant() {
-  return S.mode === "auto" ? (mqLandscape.matches ? "D" : "C") : S.mode;
+  return S.mode === "auto" ? (orientationIsLandscape() ? "D" : "C") : S.mode;
 }
 function isAuto() { return S.mode === "auto"; }
 
@@ -681,17 +695,29 @@ function render() {
   }
 
   document.getElementById("switcher-label").innerHTML = isAuto()
-    ? `<b>AUTO</b> — live: <b>${v}</b> <span class="orient">· ${mqLandscape.matches ? "landscape" : "portrait"} · real viewport</span>`
+    ? `<b>AUTO</b> — live: <b>${v}</b> <span class="orient">· ${orientationIsLandscape() ? "landscape" : "portrait"} · real viewport</span>`
     : `<b>${v}</b> — ${NAMES[v]} <span class="orient">· ${LANDSCAPE_VARIANTS.includes(v) ? "landscape" : "portrait"} frame</span>`;
 
   document.getElementById("readout").innerHTML =
     `viewport ${window.innerWidth}×${window.innerHeight}<br>` +
-    `orientation: ${mqLandscape.matches ? "landscape" : "portrait"}<br>` +
+    `orientation: ${orientationIsLandscape() ? "landscape" : "portrait"} (mq says ${mqLandscape.matches ? "landscape" : "portrait"})<br>` +
     `fullscreen: ${isFullscreen() ? "on" : "off"}${fsSupported() ? "" : " (unsupported)"}`;
 
   document.getElementById("controls").classList.toggle("proto-hidden", !S.protoChromeOpen);
   document.getElementById("switcher").classList.toggle("proto-hidden", !S.protoChromeOpen);
-  document.getElementById("proto-toggle").textContent = S.protoChromeOpen ? "proto ▾" : "proto ▸";
+
+  /* Always-visible state badge. On a phone the controls panel starts
+     collapsed, so without this there is no way to tell a genuine detection
+     failure from a stale ?variant= in the URL. */
+  const toggle = document.getElementById("proto-toggle");
+  const arrow = S.protoChromeOpen ? "▾" : "▸";
+  if (isAuto()) {
+    toggle.textContent = `proto ${arrow} · auto → ${v}`;
+    toggle.classList.remove("forced");
+  } else {
+    toggle.textContent = `proto ${arrow} · FORCED ${v}`;
+    toggle.classList.add("forced");
+  }
 
   wireDynamicHandlers();
 }
@@ -718,12 +744,16 @@ function wireDynamicHandlers() {
 }
 
 /* ---------- live orientation + fullscreen listeners ---------- */
-mqLandscape.addEventListener("change", () => {
-  /* In auto mode this is the whole point: layout swaps under the user with no
-     reload. Selection state is deliberately preserved across the swap. */
-  render();
-});
+/* Several triggers, all cheap, because a missed one means the layout silently
+   stops matching the device. `orientationchange` in particular fires on
+   Android before the resize settles, so re-render on the next frame too. */
+mqLandscape.addEventListener("change", () => render());
 window.addEventListener("resize", () => render());
+window.addEventListener("orientationchange", () => {
+  render();
+  requestAnimationFrame(render);
+  setTimeout(render, 250);
+});
 document.addEventListener("fullscreenchange", () => render());
 document.addEventListener("webkitfullscreenchange", () => render());
 
@@ -748,7 +778,10 @@ document.querySelectorAll("#controls [data-act]").forEach(btn => {
 function setVariant(v) {
   S.mode = v;
   const url = new URL(location.href);
-  url.searchParams.set("variant", v);
+  /* auto clears the param rather than writing ?variant=auto — otherwise the
+     URL stays sticky and a later reload silently reopens a forced layout. */
+  if (v === "auto") url.searchParams.delete("variant");
+  else url.searchParams.set("variant", v);
   history.replaceState(null, "", url);
   render();
 }
