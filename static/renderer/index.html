@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'"
+    />
+    <title>Screen Solver capture host</title>
+  </head>
+  <body>
+    <!--
+      The hidden renderer. Never shown to the user.
+
+      This page exists so the host has a DOM to run capture mechanism in:
+      desktopCapturer source -> getUserMedia -> canvas -> downscale -> encode,
+      handed to main over IPC. That lands in #30; until then the page is empty
+      on purpose. No decision logic ever belongs here.
+
+      The web client (#33) is a different thing entirely and will be served over
+      HTTP from static/client/, not loaded here.
+    -->
+  </body>
+</html>

@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+
+    // `src/` and `test/` are run directly by Node's built-in type stripping
+    // (`node --test test`), so relative imports carry a `.ts` extension. `tsc`
+    // rewrites those to `.js` when it emits `dist/` for Electron.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    // Type stripping erases types; it cannot *transform* syntax. This flag
+    // rejects the TypeScript features Node's stripper can't run (enums,
+    // namespaces, parameter properties).
+    "erasableSyntaxOnly": true,
+
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src", "test"]
+}
