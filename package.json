@@ -1,11 +1,23 @@
 {
   "name": "screen-solver",
   "private": true,
-  "description": "Wayfinder map and spec for the Screen Solver app. No product code yet.",
+  "type": "module",
+  "main": "dist/main/index.js",
+  "description": "Windows 11 local server that watches one browser window and streams Claude's answer to a web client.",
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
-    "setup": "bash .claude/hooks/session-start.sh"
+    "setup": "bash .claude/hooks/session-start.sh",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "start": "npm run build && node scripts/start.mjs"
   },
   "devDependencies": {
-    "skills": "1.5.21"
+    "@types/node": "^24.10.4",
+    "electron": "^43.3.0",
+    "skills": "1.5.21",
+    "typescript": "^7.0.2"
   }
 }
