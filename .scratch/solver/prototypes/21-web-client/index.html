@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PROTOTYPE — Web client (ticket #21)</title>
+<!--
+  PROTOTYPE — throwaway. Answers "what does the web client look like on a
+  phone and on a desktop browser?" (ticket #21).
+
+  Three variants of the focus pane, switchable via ?variant=, on a new
+  throwaway page (sub-shape B — no real web client route exists yet).
+  Simulates the real SSE vocabulary from ticket #18: start / delta{text} /
+  done{usage} / error{kind} / sync{text}, plus a connection-state signal
+  the wire protocol doesn't carry directly (browser online/offline +
+  EventSource readyState stand in for it here).
+-->
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14171c;
+    --panel-2: #1b1f26;
+    --border: #262b33;
+    --text: #e7e9ec;
+    --text-dim: #8b93a1;
+    --accent: #5b9dff;
+    --green: #3ecf8e;
+    --amber: #e0a740;
+    --red: #e0575c;
+    --code-bg: #0e1013;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); height: 100%; }
+  body { display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
+
+  /* device frame so phone-width can be judged without resizing the real window */
+  #device {
+    width: 100%;
+    max-width: 1100px;
+    display: flex;
+    justify-content: center;
+    padding: 24px 0 90px;
+  }
+  #device.phone-width { }
+  #frame {
+    width: 100%;
+    max-width: 720px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    min-height: 640px;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    transition: max-width .2s ease;
+  }
+  #device.phone-width #frame { max-width: 390px; border-radius: 28px; min-height: 780px; }
+
+  h1, h2, h3 { margin: 0; }
+  code, pre { font-family: "SF Mono", Consolas, "Cascadia Code", monospace; }
+
+  .muted { color: var(--text-dim); }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 9px; border-radius: 999px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .dot.connected { background: var(--green); }
+  .dot.reconnecting { background: var(--amber); animation: pulse 1s infinite; }
+  .dot.disconnected { background: var(--red); }
+  .dot.history { background: var(--accent); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
+  .answer-heading { font-size: 20px; font-weight: 650; margin: 0 0 10px; line-height: 1.3; }
+  .missing-line {
+    font-size: 13px; color: var(--amber); background: rgba(224,167,64,.08);
+    border-left: 2px solid var(--amber); padding: 6px 10px; border-radius: 4px; margin-bottom: 12px;
+  }
+  .code-wrap {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    margin-bottom: 14px; position: relative; overflow: hidden;
+  }
+  .code-head {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 6px 10px; font-size: 11px; color: var(--text-dim); border-bottom: 1px solid var(--border);
+  }
+  pre.code-body {
+    margin: 0; padding: 12px 14px; font-size: 13px; line-height: 1.55;
+    white-space: pre-wrap; word-break: break-word; overflow-x: auto;
+  }
+  pre.code-body.no-wrap { white-space: pre; word-break: normal; }
+  .wrap-toggle {
+    font-size: 11px; border: 1px solid var(--border); background: var(--panel-2); color: var(--text-dim);
+    border-radius: 999px; padding: 2px 8px; cursor: pointer;
+  }
+  .wrap-toggle:hover { color: var(--text); }
+  .prose p { font-size: 13.5px; line-height: 1.6; color: #cdd2da; margin: 0 0 10px; }
+  .cursor { display: inline-block; width: 7px; height: 15px; background: var(--accent); vertical-align: text-bottom; animation: blink 1s step-end infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .usage-line { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+  .sync-tag {
+    font-size: 11px; color: var(--accent); background: rgba(91,157,255,.1);
+    display: inline-block; padding: 2px 8px; border-radius: 999px; margin-bottom: 8px;
+    transition: opacity .4s ease;
+  }
+  .interrupted-tag {
+    font-size: 10px; color: var(--text-dim); border: 1px solid var(--border);
+    padding: 1px 6px; border-radius: 999px; margin-left: 8px;
+  }
+  .back-to-live {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px;
+    background: var(--accent); color: #06111f; border: none; border-radius: 999px;
+    padding: 6px 12px; cursor: pointer; font-weight: 600;
+  }
+
+  /* ============ VARIANT A — bottom sheet history ============ */
+  #vA { flex: 1; display: flex; flex-direction: column; height: 100%; }
+  #vA .top-bar {
+    padding: 8px 14px; display: flex; justify-content: space-between; align-items: center;
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  }
+  #vA .top-bar .state-label { font-size: 11.5px; }
+  #vA .settings-icon { color: var(--text-dim); font-size: 16px; cursor: pointer; }
+  #vA .pane { flex: 1; overflow-y: auto; padding: 16px; }
+  #vA .always-on-top-note { font-size: 11px; color: var(--text-dim); text-align: center; padding: 10px 20px 4px; }
+  #vA .history-tab {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    background: var(--panel-2); border-top: 1px solid var(--border);
+    padding: 10px 16px; display: flex; justify-content: space-between; align-items: center;
+    cursor: pointer; font-size: 13px;
+  }
+  #vA .sheet {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 0%;
+    background: var(--panel); border-top: 1px solid var(--border);
+    border-radius: 16px 16px 0 0; overflow: hidden; transition: height .28s ease;
+    display: flex; flex-direction: column; box-shadow: 0 -10px 30px rgba(0,0,0,.4);
+  }
+  #vA .sheet.open { height: 72%; }
+  #vA .sheet-handle { width: 36px; height: 4px; background: var(--border); border-radius: 999px; margin: 8px auto; }
+  #vA .sheet-header { display: flex; justify-content: space-between; padding: 0 16px 8px; font-size: 13px; color: var(--text-dim); }
+  #vA .sheet-list { overflow-y: auto; padding: 0 12px 16px; }
+  #vA .hist-item { padding: 10px 8px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  #vA .hist-item:hover { background: var(--panel-2); }
+  #vA .hist-item .t { font-size: 13.5px; font-weight: 600; }
+  #vA .hist-item .m { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+  /* ============ VARIANT B — header stack + overlay ============ */
+  #vB { flex: 1; display: flex; flex-direction: column; height: 100%; }
+  #vB .header {
+    height: 42px; flex: none; display: flex; align-items: center; gap: 10px;
+    padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--panel-2);
+  }
+  #vB .header .title-trunc { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #vB .header .icon-btn {
+    width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
+    border-radius: 6px; cursor: pointer; color: var(--text-dim); font-size: 15px; flex: none;
+  }
+  #vB .header .icon-btn:hover { background: var(--border); color: var(--text); }
+  #vB .pane { flex: 1; overflow-y: auto; padding: 16px; }
+  #vB .overlay {
+    position: absolute; inset: 0; background: var(--panel);
+    transform: translateX(100%); transition: transform .25s ease; display: flex; flex-direction: column;
+  }
+  #vB .overlay.open { transform: translateX(0); }
+  #vB .overlay-header { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  #vB .overlay-header .back { cursor: pointer; color: var(--text-dim); font-size: 15px; }
+  #vB .overlay-body { flex: 1; overflow-y: auto; padding: 8px 14px; }
+  #vB .hist-item { padding: 10px 4px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  #vB .hist-item:hover .t { color: var(--accent); }
+  #vB .hist-item .t { font-size: 13.5px; font-weight: 600; }
+  #vB .hist-item .m { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+  /* ============ VARIANT C — continuous log ============ */
+  #vC { flex: 1; overflow-y: auto; padding: 14px 14px 70px; position: relative; }
+  #vC .conn-banner {
+    font-size: 12px; text-align: center; padding: 6px; border-radius: 8px; margin-bottom: 10px;
+    background: rgba(224,167,64,.1); color: var(--amber); border: 1px solid rgba(224,167,64,.3);
+  }
+  #vC .conn-banner.disconnected { background: rgba(224,87,92,.1); color: var(--red); border-color: rgba(224,87,92,.3); }
+  #vC .entry {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px; margin-bottom: 12px;
+  }
+  #vC .entry.live { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(91,157,255,.25); }
+  #vC .entry.collapsed .code-wrap, #vC .entry.collapsed .prose,
+  #vC .entry.collapsed .answer-heading, #vC .entry.collapsed .missing-line,
+  #vC .entry.collapsed .usage-line, #vC .entry.collapsed .sync-tag { display: none; }
+  #vC .entry.collapsed { cursor: pointer; opacity: .82; }
+  #vC .entry.collapsed:hover { opacity: 1; }
+  #vC .entry-top { display: flex; justify-content: space-between; align-items: baseline; }
+  #vC .entry .ts { font-size: 11px; color: var(--text-dim); flex: none; }
+  #vC .fab {
+    position: fixed; bottom: 90px; right: calc(50% - 340px + 20px);
+    width: 42px; height: 42px; border-radius: 50%; background: var(--panel-2);
+    border: 1px solid var(--border); color: var(--text-dim); display: flex;
+    align-items: center; justify-content: center; font-size: 17px; cursor: pointer;
+  }
+  #device.phone-width #vC .fab { right: 30px; }
+
+  /* prototype chrome — controls + switcher, not part of the design under test */
+  #controls {
+    position: fixed; top: 12px; right: 12px; z-index: 50; background: #000c;
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-size: 11.5px;
+    display: flex; flex-direction: column; gap: 6px; max-width: 190px; backdrop-filter: blur(6px);
+  }
+  #controls .title { font-weight: 700; letter-spacing: .04em; color: var(--text-dim); margin-bottom: 2px; }
+  #controls button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; cursor: pointer; font-size: 11px; text-align: left;
+  }
+  #controls button:hover { border-color: var(--accent); }
+  #switcher {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 50;
+    background: #000c; border: 1px solid var(--border); border-radius: 999px;
+    display: flex; align-items: center; gap: 12px; padding: 8px 16px; backdrop-filter: blur(6px);
+    box-shadow: 0 6px 24px rgba(0,0,0,.4);
+  }
+  #switcher button { background: none; border: none; color: var(--text); font-size: 16px; cursor: pointer; padding: 2px 6px; }
+  #switcher .label { font-size: 12.5px; min-width: 220px; text-align: center; }
+  #switcher .label b { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div id="device">
+  <div id="frame"></div>
+</div>
+
+<div id="controls">
+  <div class="title">PROTOTYPE CONTROLS</div>
+  <button data-act="new">New answer (interrupt)</button>
+  <button data-act="error">Simulate error</button>
+  <button data-act="disconnect">Simulate disconnect</button>
+  <button data-act="reconnect">Simulate reconnect</button>
+  <button data-act="sync">Simulate mid-stream join</button>
+  <button data-act="width">Toggle phone / desktop width</button>
+  <button data-act="reset">Reset</button>
+</div>
+
+<div id="switcher">
+  <button data-nav="-1">←</button>
+  <div class="label" id="switcher-label"></div>
+  <button data-nav="1">→</button>
+</div>
+
+<script>
+/* ---------- demo data ---------- */
+const DEMO = [
+  {
+    title: "Sum of Positive",
+    lang: "javascript",
+    code: `function sumPositive(numbers) {\n  return numbers.reduce((total, n) => (n > 0 ? total + n : total), 0);\n}`,
+    prose: [
+      "A single left-to-right pass, adding each element only when it is positive. `reduce` seeded with `0` also gives the right answer for an empty array and for an array with no positive values, both of which the notes call out.",
+      "O(n) time, O(1) extra space."
+    ],
+    usage: { input: 342, output: 287 }
+  },
+  {
+    title: "Two Sum",
+    lang: "python",
+    code: `def two_sum(nums, target):\n    seen = {}\n    for i, n in enumerate(nums):\n        if target - n in seen:\n            return [seen[target - n], i]\n        seen[n] = i`,
+    prose: [
+      "One pass with a hash map from value to index. For each number, check whether its complement has already been seen before inserting the current number.",
+      "O(n) time, O(n) space."
+    ],
+    usage: { input: 298, output: 264 }
+  },
+  {
+    title: "Valid Parentheses",
+    lang: "javascript",
+    code: `function isValid(s) {\n  const pairs = { ')': '(', ']': '[', '}': '{' };\n  const stack = [];\n  for (const ch of s) {\n    if (ch in pairs) {\n      if (stack.pop() !== pairs[ch]) return false;\n    } else {\n      stack.push(ch);\n    }\n  }\n  return stack.length === 0;\n}`,
+    prose: [
+      "A stack tracks open brackets. Every closing bracket must match the most recently opened one, which a stack pop checks directly; a leftover stack at the end means an unclosed bracket.",
+      "O(n) time, O(n) space worst case."
+    ],
+    usage: { input: 276, output: 241 }
+  },
+  {
+    title: "Merge Intervals",
+    lang: "python",
+    missing: "the exact tie-breaking rule when two intervals touch at a single point — assumed touching endpoints merge.",
+    code: `def merge(intervals):\n    intervals.sort(key=lambda iv: iv[0])\n    merged = []\n    for start, end in intervals:\n        if merged and start <= merged[-1][1]:\n            merged[-1][1] = max(merged[-1][1], end)\n        else:\n            merged.append([start, end])\n    return merged`,
+    prose: [
+      "Sorting by start turns overlap-checking into a single pass: an interval only needs to be compared against the most recently merged one.",
+      "O(n log n) time for the sort, O(n) space for the output."
+    ],
+    usage: { input: 305, output: 251 }
+  }
+];
+
+/* ---------- state ---------- */
+const S = {
+  variant: "A",
+  phoneWidth: true,
+  socket: "connected",          // connected | reconnecting | disconnected
+  history: [
+    { ...DEMO[0], ts: "14 min ago", interrupted: false },
+    { ...DEMO[1], ts: "6 min ago", interrupted: true }
+  ],
+  live: null,                   // currently streaming/streamed entry
+  paneMode: "live",             // live | history
+  historyViewIndex: null,
+  sheetOpen: false,
+  overlayOpen: null,            // 'history' | 'settings' | null
+  wrapCode: true,
+  demoCursor: 2,
+  streamTimer: null
+};
+
+const params = new URLSearchParams(location.search);
+S.variant = (params.get("variant") || "A").toUpperCase();
+if (!["A","B","C"].includes(S.variant)) S.variant = "A";
+
+/* ---------- streaming engine ---------- */
+function stopStream() { if (S.streamTimer) { clearInterval(S.streamTimer); S.streamTimer = null; } }
+
+function startAnswer(demo, opts = {}) {
+  stopStream();
+  if (S.live && (S.live.state === "streaming" || S.live.state === "syncing")) {
+    S.history.unshift({ ...S.live, interrupted: true, ts: "just now" });
+  } else if (S.live && S.live.state === "done") {
+    S.history.unshift({ ...S.live, interrupted: false, ts: "just now" });
+  }
+  S.paneMode = "live";
+  S.sheetOpen = false;
+  S.overlayOpen = null;
+
+  const full = fullText(demo);
+  const startAt = opts.syncFrom ? Math.floor(full.length * opts.syncFrom) : 0;
+
+  S.live = {
+    ...demo,
+    state: opts.syncFrom ? "syncing" : "streaming",
+    revealed: startAt,
+    fullLen: full.length,
+    ts: "just now"
+  };
+  render();
+
+  if (opts.syncFrom) {
+    setTimeout(() => { if (S.live) { S.live.state = "streaming"; render(); } }, 500);
+  }
+
+  S.streamTimer = setInterval(() => {
+    if (!S.live) return stopStream();
+    S.live.revealed = Math.min(S.live.fullLen, S.live.revealed + 4);
+    if (S.live.revealed >= S.live.fullLen) {
+      S.live.state = "done";
+      stopStream();
+    }
+    render();
+  }, 22);
+}
+
+function fullText(demo) {
+  return (demo.missing || "") + demo.code + demo.prose.join(" ");
+}
+
+function revealedParts(demo, revealed) {
+  const missingLen = demo.missing ? demo.missing.length : 0;
+  const codeLen = demo.code.length;
+  const missingDone = Math.min(revealed, missingLen);
+  const codeDone = Math.min(Math.max(revealed - missingLen, 0), codeLen);
+  const proseAvail = Math.max(revealed - missingLen - codeLen, 0);
+  const proseJoined = demo.prose.join(" ");
+  const proseDone = proseJoined.slice(0, Math.min(proseAvail, proseJoined.length));
+  return {
+    missing: demo.missing ? demo.missing.slice(0, missingDone) : "",
+    missingComplete: missingDone >= missingLen,
+    code: demo.code.slice(0, codeDone),
+    codeComplete: codeDone >= codeLen,
+    prose: proseDone.split(" ").filter(p => p.length > 0)
+  };
+}
+
+function simulateError() {
+  stopStream();
+  if (S.live) { S.live.state = "error"; S.live.errorKind = "overloaded"; }
+  render();
+}
+
+/* ---------- rendering helpers shared across variants ---------- */
+function escapeHtml(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function connLabel() {
+  if (S.paneMode === "history") return { cls: "history", text: "Viewing history — not live" };
+  if (S.socket === "reconnecting") return { cls: "reconnecting", text: "Reconnecting…" };
+  if (S.socket === "disconnected") return { cls: "disconnected", text: "Disconnected" };
+  return { cls: "connected", text: "Connected" };
+}
+
+function answerBlockHtml(entry, { wrap, showCursor, interrupted }) {
+  if (!entry) return `<div class="muted" style="font-size:13px;">No answer yet.</div>`;
+  const isStreamed = entry.revealed !== undefined;
+  const parts = isStreamed ? revealedParts(entry, entry.revealed) : {
+    missing: entry.missing || "", missingComplete: true,
+    code: entry.code, codeComplete: true, prose: entry.prose
+  };
+  const showingCursorInCode = showCursor && isStreamed && !parts.missingComplete === false && !parts.codeComplete;
+  const showingCursorInProse = showCursor && isStreamed && parts.codeComplete && entry.state !== "done" && entry.state !== "error";
+
+  let html = `<div class="answer-heading">${escapeHtml(entry.title)}`;
+  if (interrupted) html += `<span class="interrupted-tag">interrupted</span>`;
+  html += `</div>`;
+
+  if (entry.state === "syncing") {
+    html += `<div class="sync-tag">syncing…</div>`;
+  }
+
+  if (parts.missing) {
+    html += `<div class="missing-line"><b>Missing:</b> ${escapeHtml(parts.missing)}${showingCursorInCode && !parts.missingComplete ? '<span class="cursor"></span>' : ''}</div>`;
+  }
+
+  html += `<div class="code-wrap">
+    <div class="code-head">
+      <span>${entry.lang}</span>
+      <span class="wrap-toggle" data-toggle-wrap="1">${wrap ? "wrap: on" : "wrap: off"}</span>
+    </div>
+    <pre class="code-body ${wrap ? "" : "no-wrap"}">${escapeHtml(parts.code)}${showingCursorInCode ? '<span class="cursor"></span>' : ''}</pre>
+  </div>`;
+
+  if (parts.prose.length) {
+    html += `<div class="prose">` + parts.prose.map((p,i) =>
+      `<p>${escapeHtml(p)}${showingCursorInProse && i === parts.prose.length - 1 ? '<span class="cursor"></span>' : ''}</p>`
+    ).join("") + `</div>`;
+  } else if (showingCursorInProse) {
+    html += `<div class="prose"><p><span class="cursor"></span></p></div>`;
+  }
+
+  if (entry.state === "error") {
+    html += `<div class="missing-line" style="color:var(--red); border-color:var(--red); background:rgba(224,87,92,.08);">
+      <b>error:</b> ${entry.errorKind || "unknown"} — the model call failed mid-stream. Partial answer above is preserved.
+    </div>`;
+  } else if (entry.state === "done") {
+    html += `<div class="usage-line">${entry.usage.input} in · ${entry.usage.output} out</div>`;
+  }
+
+  return html;
+}
+
+function historyRowHtml(entry, i, cls) {
+  return `<div class="hist-item" data-open-history="${i}">
+    <div class="t">${escapeHtml(entry.title)}${entry.interrupted ? '<span class="interrupted-tag">interrupted</span>' : ''}</div>
+    <div class="m">${entry.ts} · ${entry.usage.input + entry.usage.output} tok</div>
+  </div>`;
+}
+
+function currentDisplayEntry() {
+  if (S.paneMode === "history" && S.historyViewIndex !== null) return S.history[S.historyViewIndex];
+  return S.live;
+}
+
+/* ---------- variant A: bottom sheet history ---------- */
+function renderA() {
+  const conn = connLabel();
+  const entry = currentDisplayEntry();
+  const isLive = S.paneMode === "live";
+  return `
+  <div id="vA">
+    <div class="top-bar">
+      <span class="pill state-label"><span class="dot ${conn.cls}"></span>${conn.text}</span>
+      <span class="settings-icon" data-open-settings="1">⚙</span>
+    </div>
+    <div class="pane">
+      ${answerBlockHtml(entry, { wrap: S.wrapCode, showCursor: isLive, interrupted: !isLive && entry && entry.interrupted })}
+      ${!isLive ? `<button class="back-to-live" data-back-live="1">↩ Back to live</button>` : ""}
+      ${isLive ? `<div class="always-on-top-note">No pin here — a second open tab or your phone <i>is</i> the always-on-top.</div>` : ""}
+    </div>
+    <div class="history-tab" data-toggle-sheet="1" style="${S.sheetOpen ? 'display:none' : ''}">
+      <span>History (${S.history.length})</span><span>▲</span>
+    </div>
+    <div class="sheet ${S.sheetOpen ? "open" : ""}">
+      <div class="sheet-handle" data-toggle-sheet="1"></div>
+      <div class="sheet-header"><span>History</span><span data-toggle-sheet="1" style="cursor:pointer;">▼ close</span></div>
+      <div class="sheet-list">
+        ${S.history.map((h,i) => historyRowHtml(h,i)).join("") || '<div class="muted" style="padding:8px;">No past answers yet.</div>'}
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ---------- variant B: header stack + overlay ---------- */
+function renderB() {
+  const conn = connLabel();
+  const entry = currentDisplayEntry();
+  const isLive = S.paneMode === "live";
+  return `
+  <div id="vB">
+    <div class="header">
+      <span class="dot ${conn.cls}" title="${conn.text}"></span>
+      <span class="title-trunc">${entry ? escapeHtml(entry.title) : "Screen Solver"}</span>
+      <span class="icon-btn" data-overlay="history">☰</span>
+      <span class="icon-btn" data-overlay="settings">⚙</span>
+    </div>
+    <div class="pane">
+      ${answerBlockHtml(entry, { wrap: S.wrapCode, showCursor: isLive, interrupted: !isLive && entry && entry.interrupted })}
+      ${!isLive ? `<button class="back-to-live" data-back-live="1">↩ Back to live</button>` : ""}
+    </div>
+    <div class="overlay ${S.overlayOpen === 'history' ? 'open' : ''}">
+      <div class="overlay-header"><span class="back" data-close-overlay="1">←</span><span>History</span></div>
+      <div class="overlay-body">
+        ${S.history.map((h,i) => historyRowHtml(h,i)).join("") || '<div class="muted">No past answers yet.</div>'}
+      </div>
+    </div>
+    <div class="overlay ${S.overlayOpen === 'settings' ? 'open' : ''}">
+      <div class="overlay-header"><span class="back" data-close-overlay="1">←</span><span>Settings</span></div>
+      <div class="overlay-body">
+        <p class="muted" style="font-size:12.5px;">Target window, provider/model — out of this ticket's scope, placeholder only.</p>
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ---------- variant C: continuous log ---------- */
+function renderC() {
+  const conn = connLabel();
+  const rows = [];
+  if (S.socket !== "connected") {
+    rows.push(`<div class="conn-banner ${S.socket === 'disconnected' ? 'disconnected' : ''}">
+      ${S.socket === 'reconnecting' ? '⟳ reconnecting…' : '⚠ disconnected — showing last known state'}
+    </div>`);
+  }
+  if (S.live) {
+    rows.push(`<div class="entry live">
+      <div class="entry-top"><span class="pill"><span class="dot ${conn.cls}"></span>${S.paneMode === 'live' ? 'live' : 'live (background)'}</span><span class="ts">${S.live.ts}</span></div>
+      ${answerBlockHtml(S.live, { wrap: S.wrapCode, showCursor: true, interrupted: false })}
+    </div>`);
+  }
+  S.history.forEach((h, i) => {
+    const collapsed = true;
+    rows.push(`<div class="entry ${collapsed ? 'collapsed' : ''}" data-expand="${i}">
+      <div class="entry-top"><span style="font-size:13.5px; font-weight:600;">${escapeHtml(h.title)}${h.interrupted ? '<span class="interrupted-tag">interrupted</span>' : ''}</span><span class="ts">${h.ts}</span></div>
+      ${answerBlockHtml(h, { wrap: S.wrapCode, showCursor: false, interrupted: h.interrupted })}
+    </div>`);
+  });
+  return `<div id="vC">${rows.join("")}<div class="fab" data-open-settings="1">⚙</div></div>`;
+}
+
+/* ---------- top-level render ---------- */
+function render() {
+  const frame = document.getElementById("frame");
+  if (S.variant === "A") frame.innerHTML = renderA();
+  else if (S.variant === "B") frame.innerHTML = renderB();
+  else frame.innerHTML = renderC();
+
+  document.getElementById("device").classList.toggle("phone-width", S.phoneWidth);
+
+  const names = { A: "Bottom sheet history", B: "Header + overlay", C: "Continuous log" };
+  document.getElementById("switcher-label").innerHTML = `<b>${S.variant}</b> — ${names[S.variant]}`;
+
+  wireDynamicHandlers();
+}
+
+function wireDynamicHandlers() {
+  document.querySelectorAll("[data-toggle-sheet]").forEach(el =>
+    el.onclick = () => { S.sheetOpen = !S.sheetOpen; render(); });
+  document.querySelectorAll("[data-overlay]").forEach(el =>
+    el.onclick = () => { S.overlayOpen = el.dataset.overlay; render(); });
+  document.querySelectorAll("[data-close-overlay]").forEach(el =>
+    el.onclick = () => { S.overlayOpen = null; render(); });
+  document.querySelectorAll("[data-open-settings]").forEach(el =>
+    el.onclick = () => { S.overlayOpen = "settings"; render(); });
+  document.querySelectorAll("[data-open-history]").forEach(el =>
+    el.onclick = () => {
+      S.historyViewIndex = parseInt(el.dataset.openHistory, 10);
+      S.paneMode = "history"; S.sheetOpen = false; S.overlayOpen = null; render();
+    });
+  document.querySelectorAll("[data-expand]").forEach(el =>
+    el.onclick = (e) => {
+      if (e.target.closest("[data-toggle-wrap]")) return;
+      S.historyViewIndex = parseInt(el.dataset.expand, 10);
+      S.paneMode = "history"; render();
+    });
+  document.querySelectorAll("[data-back-live]").forEach(el =>
+    el.onclick = () => { S.paneMode = "live"; S.historyViewIndex = null; render(); });
+  document.querySelectorAll("[data-toggle-wrap]").forEach(el =>
+    el.onclick = (e) => { e.stopPropagation(); S.wrapCode = !S.wrapCode; render(); });
+}
+
+/* ---------- prototype control panel ---------- */
+document.querySelectorAll("#controls [data-act]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const act = btn.dataset.act;
+    if (act === "new") {
+      S.demoCursor = (S.demoCursor + 1) % DEMO.length;
+      startAnswer(DEMO[S.demoCursor]);
+    } else if (act === "error") {
+      simulateError();
+    } else if (act === "disconnect") {
+      S.socket = "disconnected"; render();
+    } else if (act === "reconnect") {
+      S.socket = "reconnecting"; render();
+      setTimeout(() => { S.socket = "connected"; render(); }, 1400);
+    } else if (act === "sync") {
+      S.demoCursor = (S.demoCursor + 1) % DEMO.length;
+      startAnswer(DEMO[S.demoCursor], { syncFrom: 0.55 });
+    } else if (act === "width") {
+      S.phoneWidth = !S.phoneWidth; render();
+    } else if (act === "reset") {
+      location.reload();
+    }
+  });
+});
+
+/* ---------- variant switcher ---------- */
+const ORDER = ["A", "B", "C"];
+function setVariant(v) {
+  S.variant = v;
+  const url = new URL(location.href);
+  url.searchParams.set("variant", v);
+  history.replaceState(null, "", url);
+  render();
+}
+document.querySelectorAll("#switcher [data-nav]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const dir = parseInt(btn.dataset.nav, 10);
+    const idx = ORDER.indexOf(S.variant);
+    setVariant(ORDER[(idx + dir + ORDER.length) % ORDER.length]);
+  });
+});
+document.addEventListener("keydown", (e) => {
+  const active = document.activeElement;
+  if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable)) return;
+  if (e.key === "ArrowLeft") document.querySelector('#switcher [data-nav="-1"]').click();
+  if (e.key === "ArrowRight") document.querySelector('#switcher [data-nav="1"]').click();
+});
+
+/* ---------- boot ---------- */
+render();
+setTimeout(() => startAnswer(DEMO[2]), 900);
+</script>
+</body>
+</html>
