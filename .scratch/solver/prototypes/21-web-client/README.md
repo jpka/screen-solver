@@ -3,14 +3,21 @@
 PROTOTYPE — throwaway. Answers "what does the web client look like on a phone
 and on a desktop browser?"
 
-Six variants of the focus pane, switchable via `?variant=`, on a new
-throwaway page (sub-shape B — no real web client route exists yet). Drives
-against the real SSE vocabulary from [The stream contract (#18)](https://github.com/jpka/screen-solver/issues/18):
+Drives against the real SSE vocabulary from [The stream contract (#18)](https://github.com/jpka/screen-solver/issues/18):
 `start` / `delta{text}` / `done{usage}` / `error{kind}` / `sync{text}`.
 
-The device frame changes shape with the variant — A/B/C render at 390×780
-(portrait phone), D/E/F at 844×390 (landscape phone). The desktop-size
-toggle widens whichever orientation is active.
+**The default mode is `auto` — this is the decided answer, not a variant.**
+It fills the real viewport, detects orientation with a real media query, and
+swaps layout live on rotation with no reload:
+
+| orientation | layout |
+|---|---|
+| portrait | **C — continuous log** |
+| landscape | **D — split rail** |
+
+`?variant=A`…`F` still forces a single layout inside a simulated device
+frame, kept so the rejected alternatives stay comparable. Those are history;
+`auto` is the thing to judge.
 
 ### Portrait — A, B, C (**C chosen**)
 
@@ -29,17 +36,20 @@ toggle widens whichever orientation is active.
   chrome. Settings live behind a floating action button since there's no
   header to hang it on.
 
-### Landscape — D, E, F (open)
+### Landscape — D, E, F (**D chosen**)
 
 Landscape inverts the scarcity: height is the constraint (a phone in
 landscape has ~390px, less browser chrome), width is abundant. A vertically
 stacked answer — heading, then code, then prose — is exactly the wrong shape
 for it, so these three disagree about what to do with the extra width.
 
-- **D — Split rail**: a 220px left rail carries connection state and the
-  answer list (live entry pinned at top, history below); the right pane
-  holds the full stacked answer. The most conventional of the three, and the
-  only one where history is visible at all times without a gesture.
+- **D — Split rail** ← **chosen for landscape**: a narrow left rail carries
+  connection state, the answer list (live entry pinned at top, history
+  below), and a footer with fullscreen + settings; the right pane holds the
+  full stacked answer. The only variant where history is visible at all
+  times without a gesture. Rail narrowed from 220px to **132px** after
+  review — at 844px wide, 220px spent a quarter of the viewport on a list
+  that is mostly empty in a short session. Titles clamp to two lines.
 - **E — Code | prose columns**: the *answer itself* splits — a thin 36px
   strip on top, then code in the left column and the explanation in the
   right, each scrolling independently. History and settings move to
@@ -58,8 +68,15 @@ No build step — a single static HTML file with inline JS.
 start .scratch/solver/prototypes/21-web-client/index.html
 ```
 
-(or just double-click `index.html`; add `?variant=B` or `?variant=C` to open
-directly into a variant — the switcher also works after load)
+To judge `auto` mode properly it has to be served and opened on a real
+phone — rotation and fullscreen can't be tested in a desktop frame:
+
+```bash
+node -e "const h=require('http'),f=require('fs'),p=require('path');h.createServer((q,s)=>{const n=q.url.split('?')[0]==='/'?'/index.html':q.url.split('?')[0];f.readFile(p.join(process.cwd(),n),(e,d)=>{if(e){s.writeHead(404);return s.end()}s.writeHead(200,{'Content-Type':n.endsWith('.html')?'text/html':'text/plain'});s.end(d)})}).listen(8080,'0.0.0.0',()=>console.log('http://<lan-ip>:8080'))"
+```
+
+Run it from this directory, then open `http://<host-lan-ip>:8080/` on the
+phone. Add `?variant=A`…`F` to force a single framed layout instead.
 
 ## Using it
 
@@ -83,7 +100,15 @@ directly into a variant — the switcher also works after load)
     frame to desktop dimensions, since the real question is how the same
     markup holds up at both sizes, not just phone-only.
   - **Reset** — reloads.
-- Bottom-center bar switches variants — click the arrows or press `←`/`→`.
+- Bottom-center bar cycles `auto` → A → … → F — click the arrows or press
+  `←`/`→`. In `auto` it shows which layout is live and the detected
+  orientation.
+- **`proto ▾` (top-left)** collapses all prototype chrome, so the client can
+  be seen unobstructed. It starts collapsed on viewports under 700px, which
+  is every phone.
+- The controls panel has a live readout of viewport size, detected
+  orientation, and fullscreen state — useful when driving this on a real
+  device where the numbers aren't otherwise visible.
 
 ## What it settled
 
@@ -115,27 +140,45 @@ directly into a variant — the switcher also works after load)
   scroll — no auto-scroll-while-reading problem showed up worth designing
   around.
 
-## Open — the landscape question
+- **Landscape layout — decided: D (split rail).** Picked by the user on a
+  real device, with the rail narrowed to 132px. E was the only variant that
+  removed scrolling entirely at 844×390 (splitting code from prose halves
+  the vertical extent) and F preserved C's framing most faithfully, but
+  both lost: E gives up a single readable answer column, and F pays a
+  two-axis scrolling cost — vertical inside a card *plus* horizontal
+  between cards — in the orientation with the least vertical room.
 
-Not yet decided; D/E/F are built for the user to judge on a real device.
-Observations from building them, for whatever they're worth:
+- **Orientation is handled automatically, not chosen.** `auto` mode listens
+  on `matchMedia("(orientation: landscape) and (min-width: 600px)")` and
+  re-renders on change, so rotating the phone mid-stream swaps C↔D live
+  with no reload and no interruption to the stream. The `min-width` clause
+  is deliberate: a narrow desktop window that happens to be landscape still
+  reads better as the log, so the rule keys off *shape*, not device type.
 
-- **E is the only one that removes scrolling entirely.** At 844×390 the
-  full answer — code, explanation and usage line — fits with room to spare,
-  because splitting code from prose halves the vertical extent. D and F both
-  still scroll vertically at that height.
-- **F pays a two-axis scrolling cost.** Vertical scroll *inside* a card plus
-  horizontal scroll *between* cards, in the orientation with the least
-  vertical room. It preserves C's framing most faithfully and is the most
-  awkward to actually drive.
-- **D is the safe one.** Nothing about it is surprising, and it's the only
-  variant where history stays visible without a gesture — but it spends
-  220px of width on a list that's mostly empty in a short session.
-- **Orientation change is a live event, not a page load.** None of these
-  handle rotating the phone mid-stream; the frame here is switched by
-  variant, not by a real media query. Whether the client swaps layout on
-  rotation, or picks one layout and holds it, is a real decision this
-  prototype does *not* answer.
+- **Rotation exposed a state-model mismatch between the two layouts.** D has
+  an explicit live-vs-history pane; C does not — an expanded past entry
+  there is just expanded, and the live entry is still live. Carrying D's
+  `paneMode: "history"` into C unchanged left C's live entry showing a
+  history-coloured status dot next to the label "live". Resolved by
+  normalising on the way into C: drop the history pane mode, keep *which*
+  entry was open, and it lands as an expanded card. **Any real
+  implementation needs this normalisation** — it is not free, and it is the
+  one non-obvious cost of switching layouts on rotation rather than picking
+  one and holding it.
+
+- **Fullscreen is available in both layouts** — a FAB above settings in C,
+  a rail-footer button in D — via the standard Fullscreen API with a
+  `webkit` fallback, and the icon reflects current state.
+
+  **Caveat, unverified on the target device:** Safari on *iPhone* has never
+  exposed the Fullscreen API for arbitrary elements (iPad and Android
+  Chrome do). The button is feature-detected and renders visibly disabled
+  with an explanatory tooltip rather than failing silently, so the
+  degradation is honest — but if the phone in play is an iPhone, the real
+  route to chrome-less display is "Add to Home Screen" plus a
+  `display: standalone` web-app manifest, which is a different mechanism
+  and not prototyped here. Worth settling against the actual device before
+  this is written into the spec.
 
 ## Capture
 

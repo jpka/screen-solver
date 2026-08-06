@@ -2,19 +2,21 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>PROTOTYPE — Web client (ticket #21)</title>
 <!--
   PROTOTYPE — throwaway. Answers "what does the web client look like on a
   phone and on a desktop browser?" (ticket #21).
 
-  Six variants, switchable via ?variant=, on a new throwaway page (sub-shape
-  B — no real web client route exists yet).
+  DEFAULT MODE IS `auto` — the decided answer. It fills the real viewport,
+  detects orientation with a real media query, and swaps layout live on
+  rotation:
 
-    A / B / C — portrait phone. C (continuous log) is the chosen portrait
-                answer; A and B are kept as the losing alternatives.
-    D / E / F — landscape, where vertical space is the scarce resource and
-                width is abundant. These are the open question.
+      portrait  -> C (continuous log)     [chosen]
+      landscape -> D (split rail)         [chosen]
+
+  ?variant=A..F still forces a single layout inside a simulated device
+  frame, kept so the rejected alternatives stay comparable.
 
   Simulates the real SSE vocabulary from ticket #18: start / delta{text} /
   done{usage} / error{kind} / sync{text}.
@@ -38,7 +40,15 @@
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
   body { display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
 
-  /* device frame so phone widths can be judged without resizing the real window */
+  /* ---- auto mode: fill the real viewport, no fake frame ---- */
+  #device.auto { width: 100%; padding: 0; }
+  #device.auto #frame {
+    width: 100vw; height: 100vh; height: 100dvh;
+    border: none; border-radius: 0;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  /* ---- framed mode: simulated device, for comparing A–F ---- */
   #device { width: 100%; display: flex; justify-content: center; padding: 20px 0 90px; }
   #frame {
     background: var(--panel); border: 1px solid var(--border);
@@ -46,10 +56,8 @@
     display: flex; flex-direction: column;
     width: 720px; height: 640px;
   }
-  /* portrait */
   #device.portrait.phone  #frame { width: 390px;  height: 780px; border-radius: 28px; }
   #device.portrait.wide   #frame { width: 720px;  height: 800px; }
-  /* landscape — the short-height case that D/E/F exist for */
   #device.landscape.phone #frame { width: 844px;  height: 390px; border-radius: 24px; }
   #device.landscape.wide  #frame { width: 1200px; height: 620px; }
 
@@ -66,14 +74,8 @@
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 
   .answer-heading { font-size: 20px; font-weight: 650; margin: 0 0 10px; line-height: 1.3; }
-  .missing-line {
-    font-size: 13px; color: var(--amber); background: rgba(224,167,64,.08);
-    border-left: 2px solid var(--amber); padding: 6px 10px; border-radius: 4px; margin-bottom: 12px;
-  }
-  .error-line {
-    font-size: 13px; color: var(--red); background: rgba(224,87,92,.08);
-    border-left: 2px solid var(--red); padding: 6px 10px; border-radius: 4px; margin-top: 10px;
-  }
+  .missing-line { font-size: 13px; color: var(--amber); background: rgba(224,167,64,.08); border-left: 2px solid var(--amber); padding: 6px 10px; border-radius: 4px; margin-bottom: 12px; }
+  .error-line { font-size: 13px; color: var(--red); background: rgba(224,87,92,.08); border-left: 2px solid var(--red); padding: 6px 10px; border-radius: 4px; margin-top: 10px; }
   .code-wrap { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
   .code-head { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; font-size: 11px; color: var(--text-dim); border-bottom: 1px solid var(--border); }
   pre.code-body { margin: 0; padding: 12px 14px; font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
@@ -93,17 +95,29 @@
   .hist-item .t { font-size: 13.5px; font-weight: 600; }
   .hist-item .m { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
 
-  .fab-abs {
-    position: absolute; bottom: 14px; right: 14px; width: 40px; height: 40px;
-    border-radius: 50%; background: var(--panel-2); border: 1px solid var(--border);
-    color: var(--text-dim); display: flex; align-items: center; justify-content: center;
-    font-size: 16px; cursor: pointer; z-index: 5;
+  /* icon buttons + FAB stack (fullscreen / settings) */
+  .icon-btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 6px; cursor: pointer; color: var(--text-dim); font-size: 15px; flex: none; }
+  .icon-btn:hover { background: var(--border); color: var(--text); }
+  .icon-btn.disabled { opacity: .35; cursor: not-allowed; }
+  .fab-stack { position: absolute; bottom: 14px; right: 14px; display: flex; flex-direction: column; gap: 8px; z-index: 5; }
+  .fab {
+    width: 40px; height: 40px; border-radius: 50%; background: var(--panel-2);
+    border: 1px solid var(--border); color: var(--text-dim); display: flex;
+    align-items: center; justify-content: center; font-size: 16px; cursor: pointer;
+    box-shadow: 0 2px 10px rgba(0,0,0,.35);
   }
+  .fab:hover { color: var(--text); border-color: var(--accent); }
+  .fab.disabled { opacity: .35; cursor: not-allowed; }
 
-  /* ============ A — bottom sheet history (portrait) ============ */
+  .overlay { position: absolute; inset: 0; background: var(--panel); transform: translateX(100%); transition: transform .25s ease; display: flex; flex-direction: column; z-index: 10; }
+  .overlay.open { transform: translateX(0); }
+  .overlay-header { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); flex: none; }
+  .overlay-header .back { cursor: pointer; color: var(--text-dim); font-size: 15px; }
+  .overlay-body { flex: 1; overflow-y: auto; padding: 8px 14px; }
+
+  /* ============ A — bottom sheet history (portrait, rejected) ============ */
   #vA { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   #vA .top-bar { padding: 8px 14px; display: flex; justify-content: space-between; align-items: center; background: linear-gradient(180deg, var(--panel-2), var(--panel)); }
-  #vA .settings-icon { color: var(--text-dim); font-size: 16px; cursor: pointer; }
   #vA .pane { flex: 1; overflow-y: auto; padding: 16px; }
   #vA .always-on-top-note { font-size: 11px; color: var(--text-dim); text-align: center; padding: 10px 20px 4px; }
   #vA .history-tab { position: absolute; left: 0; right: 0; bottom: 0; background: var(--panel-2); border-top: 1px solid var(--border); padding: 10px 16px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; font-size: 13px; }
@@ -113,21 +127,14 @@
   #vA .sheet-header { display: flex; justify-content: space-between; padding: 0 16px 8px; font-size: 13px; color: var(--text-dim); }
   #vA .sheet-list { overflow-y: auto; padding: 0 12px 16px; }
 
-  /* ============ B — header stack + overlay (portrait) ============ */
+  /* ============ B — header stack + overlay (portrait, rejected) ============ */
   #vB { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   #vB .header { height: 42px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--panel-2); }
   #vB .header .title-trunc { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #vB .icon-btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 6px; cursor: pointer; color: var(--text-dim); font-size: 15px; flex: none; }
-  #vB .icon-btn:hover { background: var(--border); color: var(--text); }
   #vB .pane { flex: 1; overflow-y: auto; padding: 16px; }
-  .overlay { position: absolute; inset: 0; background: var(--panel); transform: translateX(100%); transition: transform .25s ease; display: flex; flex-direction: column; z-index: 10; }
-  .overlay.open { transform: translateX(0); }
-  .overlay-header { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); flex: none; }
-  .overlay-header .back { cursor: pointer; color: var(--text-dim); font-size: 15px; }
-  .overlay-body { flex: 1; overflow-y: auto; padding: 8px 14px; }
 
-  /* ============ C — continuous log (portrait, CHOSEN) ============ */
-  #vC { flex: 1; overflow-y: auto; padding: 14px 14px 70px; min-height: 0; }
+  /* ============ C — continuous log (PORTRAIT, CHOSEN) ============ */
+  #vC { flex: 1; overflow-y: auto; padding: 14px 14px 78px; min-height: 0; }
   .conn-banner { font-size: 12px; text-align: center; padding: 6px; border-radius: 8px; margin-bottom: 10px; background: rgba(224,167,64,.1); color: var(--amber); border: 1px solid rgba(224,167,64,.3); }
   .conn-banner.disconnected { background: rgba(224,87,92,.1); color: var(--red); border-color: rgba(224,87,92,.3); }
   .entry { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
@@ -140,57 +147,71 @@
   .entry-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
   .entry .ts { font-size: 11px; color: var(--text-dim); flex: none; }
 
-  /* ============ D — split rail (landscape) ============ */
+  /* ============ D — split rail (LANDSCAPE, CHOSEN) ============ */
+  /* rail narrowed from 220px -> 132px: at 844px wide it was eating 26% of the
+     viewport for a list that is mostly empty in a short session. */
   #vD { flex: 1; display: flex; min-height: 0; }
-  #vD .rail { width: 220px; flex: none; border-right: 1px solid var(--border); background: var(--panel-2); display: flex; flex-direction: column; min-height: 0; }
-  #vD .rail-top { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-  #vD .rail-list { flex: 1; overflow-y: auto; padding: 6px 8px; }
-  #vD .rail-card { padding: 9px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 6px; border: 1px solid transparent; }
+  #vD .rail { width: 132px; flex: none; border-right: 1px solid var(--border); background: var(--panel-2); display: flex; flex-direction: column; min-height: 0; }
+  #vD .rail-top { padding: 8px 9px; border-bottom: 1px solid var(--border); }
+  #vD .rail-top .pill { padding: 0; font-size: 11px; }
+  #vD .rail-list { flex: 1; overflow-y: auto; padding: 5px 6px; }
+  #vD .rail-card { padding: 7px 8px; border-radius: 7px; cursor: pointer; margin-bottom: 5px; border: 1px solid transparent; }
   #vD .rail-card:hover { background: var(--panel); }
   #vD .rail-card.active { background: var(--panel); border-color: var(--accent); }
-  #vD .rail-card .t { font-size: 12.5px; font-weight: 600; line-height: 1.35; }
-  #vD .rail-card .m { font-size: 10.5px; color: var(--text-dim); margin-top: 3px; }
+  #vD .rail-card .t {
+    font-size: 11.5px; font-weight: 600; line-height: 1.3;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  #vD .rail-card .m { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
   #vD .rail-card.is-live .t { color: var(--accent); }
-  #vD .main { flex: 1; overflow-y: auto; padding: 16px 18px; min-width: 0; }
+  #vD .rail-card .int-dot { color: var(--text-dim); font-size: 9.5px; }
+  #vD .rail-footer { flex: none; border-top: 1px solid var(--border); padding: 5px; display: flex; justify-content: space-around; }
+  #vD .main { flex: 1; overflow-y: auto; padding: 14px 18px; min-width: 0; }
 
-  /* ============ E — code | prose columns (landscape) ============ */
+  /* ============ E — code | prose columns (landscape, rejected) ============ */
   #vE { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   #vE .strip { height: 36px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--panel-2); }
   #vE .strip .title-trunc { flex: 1; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #vE .icon-btn { width: 26px; height: 26px; display: flex; align-items: center; justify-content: center; border-radius: 6px; cursor: pointer; color: var(--text-dim); font-size: 14px; flex: none; }
-  #vE .icon-btn:hover { background: var(--border); color: var(--text); }
   #vE .cols { flex: 1; display: flex; min-height: 0; }
   #vE .col-code { flex: 1.35; min-width: 0; overflow-y: auto; padding: 12px; border-right: 1px solid var(--border); }
   #vE .col-prose { flex: 1; min-width: 0; overflow-y: auto; padding: 12px 14px; }
   #vE .col-label { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-dim); margin-bottom: 8px; }
   #vE .code-wrap { margin-bottom: 0; }
 
-  /* ============ F — horizontal filmstrip (landscape) ============ */
+  /* ============ F — horizontal filmstrip (landscape, rejected) ============ */
   #vF { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   #vF .strip-top { flex: none; padding: 8px 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); background: var(--panel-2); }
   #vF .film { flex: 1; display: flex; gap: 12px; overflow-x: auto; overflow-y: hidden; padding: 12px; scroll-snap-type: x mandatory; min-height: 0; }
   #vF .card { width: 340px; flex: none; scroll-snap-align: start; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 13px; overflow-y: auto; }
-  #device.landscape.wide #vF .card { width: 400px; }
   #vF .card.live { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(91,157,255,.25); }
   #vF .card-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
   #vF .card-top .ts { font-size: 10.5px; color: var(--text-dim); flex: none; }
 
-  /* prototype chrome — controls + switcher, not part of the design under test */
-  #controls { position: fixed; top: 12px; right: 12px; z-index: 50; background: #000c; border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-size: 11.5px; display: flex; flex-direction: column; gap: 6px; max-width: 190px; backdrop-filter: blur(6px); }
-  #controls .title { font-weight: 700; letter-spacing: .04em; color: var(--text-dim); margin-bottom: 2px; }
+  /* ---- prototype chrome (not part of the design under test) ---- */
+  #proto-toggle {
+    position: fixed; top: 8px; left: 8px; z-index: 60; background: #000c; color: var(--text-dim);
+    border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px; font-size: 10.5px;
+    cursor: pointer; backdrop-filter: blur(6px);
+  }
+  #controls { position: fixed; top: 40px; left: 8px; z-index: 60; background: #000d; border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-size: 11.5px; display: flex; flex-direction: column; gap: 6px; width: 186px; backdrop-filter: blur(6px); max-height: 78vh; overflow-y: auto; }
+  #controls .title { font-weight: 700; letter-spacing: .04em; color: var(--text-dim); }
   #controls button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; cursor: pointer; font-size: 11px; text-align: left; }
   #controls button:hover { border-color: var(--accent); }
-  #controls .hint { color: var(--text-dim); font-size: 10px; line-height: 1.4; }
-  #switcher { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 50; background: #000c; border: 1px solid var(--border); border-radius: 999px; display: flex; align-items: center; gap: 12px; padding: 8px 16px; backdrop-filter: blur(6px); box-shadow: 0 6px 24px rgba(0,0,0,.4); }
-  #switcher button { background: none; border: none; color: var(--text); font-size: 16px; cursor: pointer; padding: 2px 6px; }
-  #switcher .label { font-size: 12.5px; min-width: 250px; text-align: center; }
+  #controls .hint { color: var(--text-dim); font-size: 10px; line-height: 1.45; }
+  #controls .readout { color: var(--accent); font-size: 10px; line-height: 1.45; border-top: 1px solid var(--border); padding-top: 6px; }
+  #switcher { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); z-index: 60; background: #000d; border: 1px solid var(--border); border-radius: 999px; display: flex; align-items: center; gap: 8px; padding: 6px 12px; backdrop-filter: blur(6px); box-shadow: 0 6px 24px rgba(0,0,0,.4); }
+  #switcher button { background: none; border: none; color: var(--text); font-size: 15px; cursor: pointer; padding: 2px 6px; }
+  #switcher .label { font-size: 11.5px; min-width: 200px; text-align: center; }
   #switcher .label b { color: var(--accent); }
-  #switcher .orient { font-size: 10px; color: var(--text-dim); }
+  #switcher .orient { font-size: 9.5px; color: var(--text-dim); }
+  .proto-hidden { display: none !important; }
 </style>
 </head>
 <body>
 
 <div id="device"><div id="frame"></div></div>
+
+<div id="proto-toggle">proto ▾</div>
 
 <div id="controls">
   <div class="title">PROTOTYPE CONTROLS</div>
@@ -199,9 +220,10 @@
   <button data-act="disconnect">Simulate disconnect</button>
   <button data-act="reconnect">Simulate reconnect</button>
   <button data-act="sync">Simulate mid-stream join</button>
-  <button data-act="width">Toggle phone / desktop size</button>
+  <button data-act="width">Toggle framed phone / desktop</button>
   <button data-act="reset">Reset</button>
-  <div class="hint">A/B/C are portrait. D/E/F are landscape — the frame changes shape with the variant.</div>
+  <div class="hint">AUTO fills the real viewport and switches layout on rotation. A–F force one layout in a simulated frame.</div>
+  <div class="readout" id="readout"></div>
 </div>
 
 <div id="switcher">
@@ -258,40 +280,74 @@ const DEMO = [
 
 /* ---------- state ---------- */
 const S = {
-  variant: "C",
+  mode: "auto",                 // "auto" | "A".."F"
   wide: false,
-  socket: "connected",          // connected | reconnecting | disconnected
+  socket: "connected",
   history: [
     { ...DEMO[0], ts: "14 min ago", interrupted: false },
     { ...DEMO[1], ts: "6 min ago", interrupted: true }
   ],
   live: null,
-  paneMode: "live",             // live | history
+  paneMode: "live",
   historyViewIndex: null,
   sheetOpen: false,
   overlayOpen: null,
   wrapCode: true,
   demoCursor: 2,
-  streamTimer: null
+  streamTimer: null,
+  protoChromeOpen: true
 };
 
-const LANDSCAPE = ["D", "E", "F"];
-const ORDER = ["A", "B", "C", "D", "E", "F"];
+const LANDSCAPE_VARIANTS = ["D", "E", "F"];
+const ORDER = ["auto", "A", "B", "C", "D", "E", "F"];
 const NAMES = {
+  auto: "AUTO — C portrait / D landscape",
   A: "Bottom sheet history", B: "Header + overlay", C: "Continuous log",
   D: "Split rail", E: "Code | prose columns", F: "Horizontal filmstrip"
 };
 
+/* Real orientation detection. Landscape layout needs both a landscape aspect
+   AND enough width to justify a rail — a 500px-wide desktop window that
+   happens to be landscape still reads better as the log. */
+const mqLandscape = window.matchMedia("(orientation: landscape) and (min-width: 600px)");
+
 const params = new URLSearchParams(location.search);
-const requested = (params.get("variant") || "C").toUpperCase();
-if (ORDER.includes(requested)) S.variant = requested;
+const requested = params.get("variant");
+if (requested) {
+  const r = requested.toLowerCase() === "auto" ? "auto" : requested.toUpperCase();
+  if (ORDER.includes(r)) S.mode = r;
+}
+
+function effectiveVariant() {
+  return S.mode === "auto" ? (mqLandscape.matches ? "D" : "C") : S.mode;
+}
+function isAuto() { return S.mode === "auto"; }
+
+/* ---------- fullscreen ---------- */
+const fsEl = document.documentElement;
+function fsSupported() {
+  return !!(fsEl.requestFullscreen || fsEl.webkitRequestFullscreen);
+}
+function isFullscreen() {
+  return !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+function toggleFullscreen() {
+  if (!fsSupported()) return;
+  if (isFullscreen()) {
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  } else {
+    (fsEl.requestFullscreen || fsEl.webkitRequestFullscreen).call(fsEl);
+  }
+}
+function fsIcon() { return isFullscreen() ? "⤢" : "⛶"; }
+function fsTitle() {
+  if (!fsSupported()) return "Fullscreen not supported by this browser (iPhone Safari has no Fullscreen API)";
+  return isFullscreen() ? "Exit fullscreen" : "Fullscreen";
+}
 
 /* ---------- streaming engine ---------- */
 function stopStream() { if (S.streamTimer) { clearInterval(S.streamTimer); S.streamTimer = null; } }
-
-function fullText(demo) {
-  return (demo.missing || "") + demo.code + demo.prose.join("");
-}
+function fullText(demo) { return (demo.missing || "") + demo.code + demo.prose.join(""); }
 
 function startAnswer(demo, opts = {}) {
   stopStream();
@@ -300,15 +356,15 @@ function startAnswer(demo, opts = {}) {
   } else if (S.live && (S.live.state === "done" || S.live.state === "error")) {
     S.history.unshift({ ...S.live, interrupted: false, ts: "just now" });
   }
-  S.paneMode = "live";
-  S.historyViewIndex = null;
-  S.sheetOpen = false;
-  S.overlayOpen = null;
+  S.paneMode = "live"; S.historyViewIndex = null; S.sheetOpen = false; S.overlayOpen = null;
 
   const len = fullText(demo).length;
-  const startAt = opts.syncFrom ? Math.floor(len * opts.syncFrom) : 0;
-
-  S.live = { ...demo, state: opts.syncFrom ? "syncing" : "streaming", revealed: startAt, fullLen: len, ts: "just now" };
+  S.live = {
+    ...demo,
+    state: opts.syncFrom ? "syncing" : "streaming",
+    revealed: opts.syncFrom ? Math.floor(len * opts.syncFrom) : 0,
+    fullLen: len, ts: "just now"
+  };
   render();
 
   if (opts.syncFrom) setTimeout(() => { if (S.live) { S.live.state = "streaming"; render(); } }, 600);
@@ -336,7 +392,6 @@ function revealedParts(demo, revealed) {
     proseParas.push(p.slice(0, Math.min(proseAvail, p.length)));
     proseAvail -= p.length;
   }
-
   return {
     missing: demo.missing ? demo.missing.slice(0, missingDone) : "",
     missingComplete: missingDone >= missingLen,
@@ -357,14 +412,21 @@ function escapeHtml(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").rep
 
 function connLabel() {
   if (S.paneMode === "history") return { cls: "history", text: "Viewing history — not live" };
+  return socketLabel();
+}
+
+/* Socket state alone, ignoring which answer is being *viewed*. C needs this:
+   it has no live/history split, so its live entry is live no matter what
+   else is expanded below it. */
+function socketLabel() {
   if (S.socket === "reconnecting") return { cls: "reconnecting", text: "Reconnecting…" };
   if (S.socket === "disconnected") return { cls: "disconnected", text: "Disconnected" };
   return { cls: "connected", text: "Connected" };
 }
 
 function partsOf(entry) {
-  const streamed = entry.revealed !== undefined;
-  return streamed ? revealedParts(entry, entry.revealed)
+  return entry.revealed !== undefined
+    ? revealedParts(entry, entry.revealed)
     : { missing: entry.missing || "", missingComplete: true, code: entry.code, codeComplete: true, prose: entry.prose };
 }
 
@@ -389,23 +451,16 @@ function proseHtml(entry, parts, showCursor) {
 }
 
 function tailHtml(entry) {
-  if (entry.state === "error") {
-    return `<div class="error-line"><b>error:</b> ${entry.errorKind || "unknown"} — the call failed mid-stream. Partial answer above is preserved.</div>`;
-  }
-  if (entry.state === "done" || entry.revealed === undefined) {
-    return `<div class="usage-line">${entry.usage.input} in · ${entry.usage.output} out</div>`;
-  }
+  if (entry.state === "error") return `<div class="error-line"><b>error:</b> ${entry.errorKind || "unknown"} — the call failed mid-stream. Partial answer above is preserved.</div>`;
+  if (entry.state === "done" || entry.revealed === undefined) return `<div class="usage-line">${entry.usage.input} in · ${entry.usage.output} out</div>`;
   return "";
 }
 
-/* full answer, stacked — used by A, B, C, D, F */
 function answerBlockHtml(entry, { showCursor, interrupted, showHeading = true }) {
   if (!entry) return `<div class="muted" style="font-size:13px;">No answer yet.</div>`;
   const parts = partsOf(entry);
   let html = "";
-  if (showHeading) {
-    html += `<div class="answer-heading">${escapeHtml(entry.title)}${interrupted ? '<span class="interrupted-tag">interrupted</span>' : ''}</div>`;
-  }
+  if (showHeading) html += `<div class="answer-heading">${escapeHtml(entry.title)}${interrupted ? '<span class="interrupted-tag">interrupted</span>' : ''}</div>`;
   if (entry.state === "syncing") html += `<div class="sync-tag">syncing…</div>`;
   if (parts.missing) {
     const c = showCursor && entry.revealed !== undefined && !parts.missingComplete;
@@ -429,13 +484,31 @@ function currentDisplayEntry() {
   return S.live;
 }
 
-/* ---------- A: bottom sheet history (portrait) ---------- */
+function overlaysHtml() {
+  return `<div class="overlay ${S.overlayOpen === 'history' ? 'open' : ''}">
+      <div class="overlay-header"><span class="back" data-close-overlay="1">←</span><span>History</span></div>
+      <div class="overlay-body">${S.history.map(historyRowHtml).join("") || '<div class="muted">No past answers yet.</div>'}</div>
+    </div>
+    <div class="overlay ${S.overlayOpen === 'settings' ? 'open' : ''}">
+      <div class="overlay-header"><span class="back" data-close-overlay="1">←</span><span>Settings</span></div>
+      <div class="overlay-body"><p class="muted" style="font-size:12.5px;">Target window, provider/model — out of this ticket's scope, placeholder only.</p></div>
+    </div>`;
+}
+
+function fabStackHtml() {
+  return `<div class="fab-stack">
+    <div class="fab ${fsSupported() ? '' : 'disabled'}" data-fullscreen="1" title="${fsTitle()}">${fsIcon()}</div>
+    <div class="fab" data-open-settings="1" title="Settings">⚙</div>
+  </div>`;
+}
+
+/* ---------- A (rejected) ---------- */
 function renderA() {
   const conn = connLabel(), entry = currentDisplayEntry(), isLive = S.paneMode === "live";
   return `<div id="vA">
     <div class="top-bar">
       <span class="pill"><span class="dot ${conn.cls}"></span>${conn.text}</span>
-      <span class="settings-icon" data-open-settings="1">⚙</span>
+      <span class="icon-btn" data-open-settings="1">⚙</span>
     </div>
     <div class="pane">
       ${answerBlockHtml(entry, { showCursor: isLive, interrupted: !isLive && entry && entry.interrupted })}
@@ -448,12 +521,12 @@ function renderA() {
     <div class="sheet ${S.sheetOpen ? "open" : ""}">
       <div class="sheet-handle" data-toggle-sheet="1"></div>
       <div class="sheet-header"><span>History</span><span data-toggle-sheet="1" style="cursor:pointer;">▼ close</span></div>
-      <div class="sheet-list">${S.history.map(historyRowHtml).join("") || '<div class="muted" style="padding:8px;">No past answers yet.</div>'}</div>
+      <div class="sheet-list">${S.history.map(historyRowHtml).join("")}</div>
     </div>
   </div>`;
 }
 
-/* ---------- B: header stack + overlay (portrait) ---------- */
+/* ---------- B (rejected) ---------- */
 function renderB() {
   const conn = connLabel(), entry = currentDisplayEntry(), isLive = S.paneMode === "live";
   return `<div id="vB">
@@ -461,7 +534,7 @@ function renderB() {
       <span class="dot ${conn.cls}" title="${conn.text}"></span>
       <span class="title-trunc">${entry ? escapeHtml(entry.title) : "Screen Solver"}</span>
       <span class="icon-btn" data-overlay="history">☰</span>
-      <span class="icon-btn" data-overlay="settings">⚙</span>
+      <span class="icon-btn" data-open-settings="1">⚙</span>
     </div>
     <div class="pane">
       ${answerBlockHtml(entry, { showCursor: isLive, interrupted: !isLive && entry && entry.interrupted })}
@@ -471,20 +544,9 @@ function renderB() {
   </div>`;
 }
 
-function overlaysHtml() {
-  return `<div class="overlay ${S.overlayOpen === 'history' ? 'open' : ''}">
-      <div class="overlay-header"><span class="back" data-close-overlay="1">←</span><span>History</span></div>
-      <div class="overlay-body">${S.history.map(historyRowHtml).join("") || '<div class="muted">No past answers yet.</div>'}</div>
-    </div>
-    <div class="overlay ${S.overlayOpen === 'settings' ? 'open' : ''}">
-      <div class="overlay-header"><span class="back" data-close-overlay="1">←</span><span>Settings</span></div>
-      <div class="overlay-body"><p class="muted" style="font-size:12.5px;">Target window, provider/model — out of this ticket's scope, placeholder only.</p></div>
-    </div>`;
-}
-
-/* ---------- C: continuous log (portrait, CHOSEN) ---------- */
+/* ---------- C: continuous log (PORTRAIT, CHOSEN) ---------- */
 function renderC() {
-  const conn = connLabel(), rows = [];
+  const conn = socketLabel(), rows = [];
   if (S.socket !== "connected") {
     rows.push(`<div class="conn-banner ${S.socket === 'disconnected' ? 'disconnected' : ''}">
       ${S.socket === 'reconnecting' ? '⟳ reconnecting…' : '⚠ disconnected — showing last known state'}</div>`);
@@ -502,37 +564,42 @@ function renderC() {
       ${answerBlockHtml(h, { showCursor: false, interrupted: false, showHeading: false })}
     </div>`);
   });
-  return `<div id="vC">${rows.join("")}</div><div class="fab-abs" data-open-settings="1">⚙</div>${overlaysHtml()}`;
+  return `<div id="vC">${rows.join("")}</div>${fabStackHtml()}${overlaysHtml()}`;
 }
 
-/* ---------- D: split rail (landscape) ---------- */
+/* ---------- D: split rail (LANDSCAPE, CHOSEN) ---------- */
 function renderD() {
   const conn = connLabel(), entry = currentDisplayEntry(), isLive = S.paneMode === "live";
   const cards = [];
   if (S.live) {
     cards.push(`<div class="rail-card is-live ${isLive ? 'active' : ''}" data-back-live="1">
       <div class="t">${escapeHtml(S.live.title)}</div>
-      <div class="m">${S.live.state === 'done' ? 'latest' : S.live.state} · ${S.live.ts}</div>
+      <div class="m">${S.live.state === 'done' ? 'latest' : S.live.state}</div>
     </div>`);
   }
   S.history.forEach((h, i) => {
     cards.push(`<div class="rail-card ${!isLive && S.historyViewIndex === i ? 'active' : ''}" data-open-history="${i}">
-      <div class="t">${escapeHtml(h.title)}${h.interrupted ? '<span class="interrupted-tag">int.</span>' : ''}</div>
-      <div class="m">${h.ts}</div>
+      <div class="t">${escapeHtml(h.title)}</div>
+      <div class="m">${h.ts}${h.interrupted ? ' <span class="int-dot">· int.</span>' : ''}</div>
     </div>`);
   });
   return `<div id="vD">
     <div class="rail">
-      <div class="rail-top"><span class="pill" style="padding-left:0;"><span class="dot ${conn.cls}"></span>${S.paneMode === 'history' ? 'history' : (S.socket === 'connected' ? 'live' : S.socket)}</span>
-        <span class="icon-btn" data-open-settings="1" style="color:var(--text-dim);cursor:pointer;">⚙</span></div>
+      <div class="rail-top">
+        <span class="pill"><span class="dot ${conn.cls}"></span>${S.paneMode === 'history' ? 'history' : (S.socket === 'connected' ? 'live' : S.socket)}</span>
+      </div>
       <div class="rail-list">${cards.join("")}</div>
+      <div class="rail-footer">
+        <span class="icon-btn ${fsSupported() ? '' : 'disabled'}" data-fullscreen="1" title="${fsTitle()}">${fsIcon()}</span>
+        <span class="icon-btn" data-open-settings="1" title="Settings">⚙</span>
+      </div>
     </div>
     <div class="main">${answerBlockHtml(entry, { showCursor: isLive, interrupted: !isLive && entry && entry.interrupted })}</div>
     ${overlaysHtml()}
   </div>`;
 }
 
-/* ---------- E: code | prose columns (landscape) ---------- */
+/* ---------- E (rejected) ---------- */
 function renderE() {
   const conn = connLabel(), entry = currentDisplayEntry(), isLive = S.paneMode === "live";
   if (!entry) return `<div id="vE"><div class="strip"><span class="title-trunc">Screen Solver</span></div><div class="cols"><div class="col-code muted" style="font-size:13px;">No answer yet.</div></div></div>`;
@@ -543,6 +610,7 @@ function renderE() {
       <span class="title-trunc">${escapeHtml(entry.title)}${!isLive && entry.interrupted ? '<span class="interrupted-tag">interrupted</span>' : ''}</span>
       ${!isLive ? `<span class="icon-btn" data-back-live="1" title="Back to live">↩</span>` : ""}
       <span class="icon-btn" data-overlay="history">☰</span>
+      <span class="icon-btn ${fsSupported() ? '' : 'disabled'}" data-fullscreen="1" title="${fsTitle()}">${fsIcon()}</span>
       <span class="icon-btn" data-open-settings="1">⚙</span>
     </div>
     <div class="cols">
@@ -562,7 +630,7 @@ function renderE() {
   </div>`;
 }
 
-/* ---------- F: horizontal filmstrip (landscape) ---------- */
+/* ---------- F (rejected) ---------- */
 function renderF() {
   const conn = connLabel(), cards = [];
   if (S.live) {
@@ -580,8 +648,10 @@ function renderF() {
   return `<div id="vF">
     <div class="strip-top">
       <span style="font-size:12px; color:var(--text-dim);">← newest · scroll for older →</span>
-      ${S.socket !== 'connected' ? `<span class="pill" style="color:${S.socket === 'disconnected' ? 'var(--red)' : 'var(--amber)'};"><span class="dot ${conn.cls}"></span>${S.socket}</span>` : ''}
-      <span class="icon-btn" data-open-settings="1" style="color:var(--text-dim);cursor:pointer;font-size:14px;">⚙</span>
+      <span style="display:flex; gap:4px;">
+        <span class="icon-btn ${fsSupported() ? '' : 'disabled'}" data-fullscreen="1" title="${fsTitle()}">${fsIcon()}</span>
+        <span class="icon-btn" data-open-settings="1">⚙</span>
+      </span>
     </div>
     <div class="film">${cards.join("")}</div>
     ${overlaysHtml()}
@@ -590,16 +660,38 @@ function renderF() {
 
 /* ---------- top-level render ---------- */
 function render() {
+  const v = effectiveVariant();
+
+  /* Rotation carries state across two layouts that model selection
+     differently. D has an explicit live-vs-history pane; C does not — an
+     expanded past entry there is just expanded, the live entry is still
+     live. So landing on C, drop the history pane mode but keep which entry
+     was open, and it stays open as an expanded card. */
+  if (v === "C" && S.paneMode === "history") S.paneMode = "live";
+
   const frame = document.getElementById("frame");
   const fns = { A: renderA, B: renderB, C: renderC, D: renderD, E: renderE, F: renderF };
-  frame.innerHTML = fns[S.variant]();
+  frame.innerHTML = fns[v]();
 
-  const isLandscape = LANDSCAPE.includes(S.variant);
   const device = document.getElementById("device");
-  device.className = (isLandscape ? "landscape " : "portrait ") + (S.wide ? "wide" : "phone");
+  if (isAuto()) {
+    device.className = "auto";
+  } else {
+    device.className = (LANDSCAPE_VARIANTS.includes(v) ? "landscape " : "portrait ") + (S.wide ? "wide" : "phone");
+  }
 
-  document.getElementById("switcher-label").innerHTML =
-    `<b>${S.variant}</b> — ${NAMES[S.variant]} <span class="orient">${isLandscape ? "· landscape" : "· portrait"}</span>`;
+  document.getElementById("switcher-label").innerHTML = isAuto()
+    ? `<b>AUTO</b> — live: <b>${v}</b> <span class="orient">· ${mqLandscape.matches ? "landscape" : "portrait"} · real viewport</span>`
+    : `<b>${v}</b> — ${NAMES[v]} <span class="orient">· ${LANDSCAPE_VARIANTS.includes(v) ? "landscape" : "portrait"} frame</span>`;
+
+  document.getElementById("readout").innerHTML =
+    `viewport ${window.innerWidth}×${window.innerHeight}<br>` +
+    `orientation: ${mqLandscape.matches ? "landscape" : "portrait"}<br>` +
+    `fullscreen: ${isFullscreen() ? "on" : "off"}${fsSupported() ? "" : " (unsupported)"}`;
+
+  document.getElementById("controls").classList.toggle("proto-hidden", !S.protoChromeOpen);
+  document.getElementById("switcher").classList.toggle("proto-hidden", !S.protoChromeOpen);
+  document.getElementById("proto-toggle").textContent = S.protoChromeOpen ? "proto ▾" : "proto ▸";
 
   wireDynamicHandlers();
 }
@@ -610,6 +702,7 @@ function wireDynamicHandlers() {
   on("[data-overlay]", (el) => { S.overlayOpen = el.dataset.overlay; render(); });
   on("[data-close-overlay]", () => { S.overlayOpen = null; render(); });
   on("[data-open-settings]", () => { S.overlayOpen = "settings"; render(); });
+  on("[data-fullscreen]", () => toggleFullscreen());
   on("[data-open-history]", (el) => {
     S.historyViewIndex = parseInt(el.dataset.openHistory, 10);
     S.paneMode = "history"; S.sheetOpen = false; S.overlayOpen = null; render();
@@ -624,7 +717,20 @@ function wireDynamicHandlers() {
   on("[data-toggle-wrap]", (el, e) => { e.stopPropagation(); S.wrapCode = !S.wrapCode; render(); });
 }
 
+/* ---------- live orientation + fullscreen listeners ---------- */
+mqLandscape.addEventListener("change", () => {
+  /* In auto mode this is the whole point: layout swaps under the user with no
+     reload. Selection state is deliberately preserved across the swap. */
+  render();
+});
+window.addEventListener("resize", () => render());
+document.addEventListener("fullscreenchange", () => render());
+document.addEventListener("webkitfullscreenchange", () => render());
+
 /* ---------- prototype control panel ---------- */
+document.getElementById("proto-toggle").addEventListener("click", () => {
+  S.protoChromeOpen = !S.protoChromeOpen; render();
+});
 document.querySelectorAll("#controls [data-act]").forEach(btn => {
   btn.addEventListener("click", () => {
     const act = btn.dataset.act;
@@ -640,7 +746,7 @@ document.querySelectorAll("#controls [data-act]").forEach(btn => {
 
 /* ---------- variant switcher ---------- */
 function setVariant(v) {
-  S.variant = v;
+  S.mode = v;
   const url = new URL(location.href);
   url.searchParams.set("variant", v);
   history.replaceState(null, "", url);
@@ -649,7 +755,7 @@ function setVariant(v) {
 document.querySelectorAll("#switcher [data-nav]").forEach(btn => {
   btn.addEventListener("click", () => {
     const dir = parseInt(btn.dataset.nav, 10);
-    setVariant(ORDER[(ORDER.indexOf(S.variant) + dir + ORDER.length) % ORDER.length]);
+    setVariant(ORDER[(ORDER.indexOf(S.mode) + dir + ORDER.length) % ORDER.length]);
   });
 });
 document.addEventListener("keydown", (e) => {
@@ -660,6 +766,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 /* ---------- boot ---------- */
+if (window.innerWidth < 700) S.protoChromeOpen = false;
 render();
 setTimeout(() => startAnswer(DEMO[2]), 900);
 </script>
