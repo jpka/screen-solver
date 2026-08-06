@@ -8,12 +8,16 @@
   PROTOTYPE — throwaway. Answers "what does the web client look like on a
   phone and on a desktop browser?" (ticket #21).
 
-  Three variants of the focus pane, switchable via ?variant=, on a new
-  throwaway page (sub-shape B — no real web client route exists yet).
+  Six variants, switchable via ?variant=, on a new throwaway page (sub-shape
+  B — no real web client route exists yet).
+
+    A / B / C — portrait phone. C (continuous log) is the chosen portrait
+                answer; A and B are kept as the losing alternatives.
+    D / E / F — landscape, where vertical space is the scarce resource and
+                width is abundant. These are the open question.
+
   Simulates the real SSE vocabulary from ticket #18: start / delta{text} /
-  done{usage} / error{kind} / sync{text}, plus a connection-state signal
-  the wire protocol doesn't carry directly (browser online/offline +
-  EventSource readyState stand in for it here).
+  done{usage} / error{kind} / sync{text}.
 -->
 <style>
   :root {
@@ -31,32 +35,23 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); height: 100%; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
   body { display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
 
-  /* device frame so phone-width can be judged without resizing the real window */
-  #device {
-    width: 100%;
-    max-width: 1100px;
-    display: flex;
-    justify-content: center;
-    padding: 24px 0 90px;
-  }
-  #device.phone-width { }
+  /* device frame so phone widths can be judged without resizing the real window */
+  #device { width: 100%; display: flex; justify-content: center; padding: 20px 0 90px; }
   #frame {
-    width: 100%;
-    max-width: 720px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    overflow: hidden;
-    min-height: 640px;
-    display: flex;
-    flex-direction: column;
-    position: relative;
-    transition: max-width .2s ease;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; overflow: hidden; position: relative;
+    display: flex; flex-direction: column;
+    width: 720px; height: 640px;
   }
-  #device.phone-width #frame { max-width: 390px; border-radius: 28px; min-height: 780px; }
+  /* portrait */
+  #device.portrait.phone  #frame { width: 390px;  height: 780px; border-radius: 28px; }
+  #device.portrait.wide   #frame { width: 720px;  height: 800px; }
+  /* landscape — the short-height case that D/E/F exist for */
+  #device.landscape.phone #frame { width: 844px;  height: 390px; border-radius: 24px; }
+  #device.landscape.wide  #frame { width: 1200px; height: 620px; }
 
   h1, h2, h3 { margin: 0; }
   code, pre { font-family: "SF Mono", Consolas, "Cascadia Code", monospace; }
@@ -75,155 +70,127 @@
     font-size: 13px; color: var(--amber); background: rgba(224,167,64,.08);
     border-left: 2px solid var(--amber); padding: 6px 10px; border-radius: 4px; margin-bottom: 12px;
   }
-  .code-wrap {
-    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
-    margin-bottom: 14px; position: relative; overflow: hidden;
+  .error-line {
+    font-size: 13px; color: var(--red); background: rgba(224,87,92,.08);
+    border-left: 2px solid var(--red); padding: 6px 10px; border-radius: 4px; margin-top: 10px;
   }
-  .code-head {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 6px 10px; font-size: 11px; color: var(--text-dim); border-bottom: 1px solid var(--border);
-  }
-  pre.code-body {
-    margin: 0; padding: 12px 14px; font-size: 13px; line-height: 1.55;
-    white-space: pre-wrap; word-break: break-word; overflow-x: auto;
-  }
-  pre.code-body.no-wrap { white-space: pre; word-break: normal; }
-  .wrap-toggle {
-    font-size: 11px; border: 1px solid var(--border); background: var(--panel-2); color: var(--text-dim);
-    border-radius: 999px; padding: 2px 8px; cursor: pointer;
-  }
+  .code-wrap { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
+  .code-head { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; font-size: 11px; color: var(--text-dim); border-bottom: 1px solid var(--border); }
+  pre.code-body { margin: 0; padding: 12px 14px; font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+  pre.code-body.no-wrap { white-space: pre; word-break: normal; overflow-x: auto; }
+  .wrap-toggle { font-size: 11px; border: 1px solid var(--border); background: var(--panel-2); color: var(--text-dim); border-radius: 999px; padding: 2px 8px; cursor: pointer; }
   .wrap-toggle:hover { color: var(--text); }
   .prose p { font-size: 13.5px; line-height: 1.6; color: #cdd2da; margin: 0 0 10px; }
   .cursor { display: inline-block; width: 7px; height: 15px; background: var(--accent); vertical-align: text-bottom; animation: blink 1s step-end infinite; }
   @keyframes blink { 50% { opacity: 0; } }
   .usage-line { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
-  .sync-tag {
-    font-size: 11px; color: var(--accent); background: rgba(91,157,255,.1);
-    display: inline-block; padding: 2px 8px; border-radius: 999px; margin-bottom: 8px;
-    transition: opacity .4s ease;
-  }
-  .interrupted-tag {
-    font-size: 10px; color: var(--text-dim); border: 1px solid var(--border);
-    padding: 1px 6px; border-radius: 999px; margin-left: 8px;
-  }
-  .back-to-live {
-    display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px;
-    background: var(--accent); color: #06111f; border: none; border-radius: 999px;
-    padding: 6px 12px; cursor: pointer; font-weight: 600;
+  .sync-tag { font-size: 11px; color: var(--accent); background: rgba(91,157,255,.1); display: inline-block; padding: 2px 8px; border-radius: 999px; margin-bottom: 8px; }
+  .interrupted-tag { font-size: 10px; color: var(--text-dim); border: 1px solid var(--border); padding: 1px 6px; border-radius: 999px; margin-left: 8px; white-space: nowrap; }
+  .back-to-live { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; background: var(--accent); color: #06111f; border: none; border-radius: 999px; padding: 6px 12px; cursor: pointer; font-weight: 600; }
+
+  .hist-item { padding: 10px 8px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .hist-item:hover { background: var(--panel-2); }
+  .hist-item .t { font-size: 13.5px; font-weight: 600; }
+  .hist-item .m { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+  .fab-abs {
+    position: absolute; bottom: 14px; right: 14px; width: 40px; height: 40px;
+    border-radius: 50%; background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text-dim); display: flex; align-items: center; justify-content: center;
+    font-size: 16px; cursor: pointer; z-index: 5;
   }
 
-  /* ============ VARIANT A — bottom sheet history ============ */
-  #vA { flex: 1; display: flex; flex-direction: column; height: 100%; }
-  #vA .top-bar {
-    padding: 8px 14px; display: flex; justify-content: space-between; align-items: center;
-    background: linear-gradient(180deg, var(--panel-2), var(--panel));
-  }
-  #vA .top-bar .state-label { font-size: 11.5px; }
+  /* ============ A — bottom sheet history (portrait) ============ */
+  #vA { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #vA .top-bar { padding: 8px 14px; display: flex; justify-content: space-between; align-items: center; background: linear-gradient(180deg, var(--panel-2), var(--panel)); }
   #vA .settings-icon { color: var(--text-dim); font-size: 16px; cursor: pointer; }
   #vA .pane { flex: 1; overflow-y: auto; padding: 16px; }
   #vA .always-on-top-note { font-size: 11px; color: var(--text-dim); text-align: center; padding: 10px 20px 4px; }
-  #vA .history-tab {
-    position: absolute; left: 0; right: 0; bottom: 0;
-    background: var(--panel-2); border-top: 1px solid var(--border);
-    padding: 10px 16px; display: flex; justify-content: space-between; align-items: center;
-    cursor: pointer; font-size: 13px;
-  }
-  #vA .sheet {
-    position: absolute; left: 0; right: 0; bottom: 0; height: 0%;
-    background: var(--panel); border-top: 1px solid var(--border);
-    border-radius: 16px 16px 0 0; overflow: hidden; transition: height .28s ease;
-    display: flex; flex-direction: column; box-shadow: 0 -10px 30px rgba(0,0,0,.4);
-  }
+  #vA .history-tab { position: absolute; left: 0; right: 0; bottom: 0; background: var(--panel-2); border-top: 1px solid var(--border); padding: 10px 16px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; font-size: 13px; }
+  #vA .sheet { position: absolute; left: 0; right: 0; bottom: 0; height: 0; background: var(--panel); border-top: 1px solid var(--border); border-radius: 16px 16px 0 0; overflow: hidden; transition: height .28s ease; display: flex; flex-direction: column; box-shadow: 0 -10px 30px rgba(0,0,0,.4); }
   #vA .sheet.open { height: 72%; }
-  #vA .sheet-handle { width: 36px; height: 4px; background: var(--border); border-radius: 999px; margin: 8px auto; }
+  #vA .sheet-handle { width: 36px; height: 4px; background: var(--border); border-radius: 999px; margin: 8px auto; cursor: pointer; }
   #vA .sheet-header { display: flex; justify-content: space-between; padding: 0 16px 8px; font-size: 13px; color: var(--text-dim); }
   #vA .sheet-list { overflow-y: auto; padding: 0 12px 16px; }
-  #vA .hist-item { padding: 10px 8px; border-bottom: 1px solid var(--border); cursor: pointer; }
-  #vA .hist-item:hover { background: var(--panel-2); }
-  #vA .hist-item .t { font-size: 13.5px; font-weight: 600; }
-  #vA .hist-item .m { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
 
-  /* ============ VARIANT B — header stack + overlay ============ */
-  #vB { flex: 1; display: flex; flex-direction: column; height: 100%; }
-  #vB .header {
-    height: 42px; flex: none; display: flex; align-items: center; gap: 10px;
-    padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--panel-2);
-  }
+  /* ============ B — header stack + overlay (portrait) ============ */
+  #vB { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #vB .header { height: 42px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--panel-2); }
   #vB .header .title-trunc { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #vB .header .icon-btn {
-    width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
-    border-radius: 6px; cursor: pointer; color: var(--text-dim); font-size: 15px; flex: none;
-  }
-  #vB .header .icon-btn:hover { background: var(--border); color: var(--text); }
+  #vB .icon-btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 6px; cursor: pointer; color: var(--text-dim); font-size: 15px; flex: none; }
+  #vB .icon-btn:hover { background: var(--border); color: var(--text); }
   #vB .pane { flex: 1; overflow-y: auto; padding: 16px; }
-  #vB .overlay {
-    position: absolute; inset: 0; background: var(--panel);
-    transform: translateX(100%); transition: transform .25s ease; display: flex; flex-direction: column;
-  }
-  #vB .overlay.open { transform: translateX(0); }
-  #vB .overlay-header { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
-  #vB .overlay-header .back { cursor: pointer; color: var(--text-dim); font-size: 15px; }
-  #vB .overlay-body { flex: 1; overflow-y: auto; padding: 8px 14px; }
-  #vB .hist-item { padding: 10px 4px; border-bottom: 1px solid var(--border); cursor: pointer; }
-  #vB .hist-item:hover .t { color: var(--accent); }
-  #vB .hist-item .t { font-size: 13.5px; font-weight: 600; }
-  #vB .hist-item .m { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+  .overlay { position: absolute; inset: 0; background: var(--panel); transform: translateX(100%); transition: transform .25s ease; display: flex; flex-direction: column; z-index: 10; }
+  .overlay.open { transform: translateX(0); }
+  .overlay-header { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); flex: none; }
+  .overlay-header .back { cursor: pointer; color: var(--text-dim); font-size: 15px; }
+  .overlay-body { flex: 1; overflow-y: auto; padding: 8px 14px; }
 
-  /* ============ VARIANT C — continuous log ============ */
-  #vC { flex: 1; overflow-y: auto; padding: 14px 14px 70px; position: relative; }
-  #vC .conn-banner {
-    font-size: 12px; text-align: center; padding: 6px; border-radius: 8px; margin-bottom: 10px;
-    background: rgba(224,167,64,.1); color: var(--amber); border: 1px solid rgba(224,167,64,.3);
-  }
-  #vC .conn-banner.disconnected { background: rgba(224,87,92,.1); color: var(--red); border-color: rgba(224,87,92,.3); }
-  #vC .entry {
-    background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
-    padding: 14px; margin-bottom: 12px;
-  }
-  #vC .entry.live { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(91,157,255,.25); }
-  #vC .entry.collapsed .code-wrap, #vC .entry.collapsed .prose,
-  #vC .entry.collapsed .answer-heading, #vC .entry.collapsed .missing-line,
-  #vC .entry.collapsed .usage-line, #vC .entry.collapsed .sync-tag { display: none; }
-  #vC .entry.collapsed { cursor: pointer; opacity: .82; }
-  #vC .entry.collapsed:hover { opacity: 1; }
-  #vC .entry-top { display: flex; justify-content: space-between; align-items: baseline; }
-  #vC .entry .ts { font-size: 11px; color: var(--text-dim); flex: none; }
-  #vC .fab {
-    position: fixed; bottom: 90px; right: calc(50% - 340px + 20px);
-    width: 42px; height: 42px; border-radius: 50%; background: var(--panel-2);
-    border: 1px solid var(--border); color: var(--text-dim); display: flex;
-    align-items: center; justify-content: center; font-size: 17px; cursor: pointer;
-  }
-  #device.phone-width #vC .fab { right: 30px; }
+  /* ============ C — continuous log (portrait, CHOSEN) ============ */
+  #vC { flex: 1; overflow-y: auto; padding: 14px 14px 70px; min-height: 0; }
+  .conn-banner { font-size: 12px; text-align: center; padding: 6px; border-radius: 8px; margin-bottom: 10px; background: rgba(224,167,64,.1); color: var(--amber); border: 1px solid rgba(224,167,64,.3); }
+  .conn-banner.disconnected { background: rgba(224,87,92,.1); color: var(--red); border-color: rgba(224,87,92,.3); }
+  .entry { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+  .entry.live { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(91,157,255,.25); }
+  .entry.collapsed .code-wrap, .entry.collapsed .prose, .entry.collapsed .answer-heading,
+  .entry.collapsed .missing-line, .entry.collapsed .usage-line, .entry.collapsed .sync-tag,
+  .entry.collapsed .error-line { display: none; }
+  .entry.collapsed { cursor: pointer; opacity: .82; }
+  .entry.collapsed:hover { opacity: 1; }
+  .entry-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .entry .ts { font-size: 11px; color: var(--text-dim); flex: none; }
+
+  /* ============ D — split rail (landscape) ============ */
+  #vD { flex: 1; display: flex; min-height: 0; }
+  #vD .rail { width: 220px; flex: none; border-right: 1px solid var(--border); background: var(--panel-2); display: flex; flex-direction: column; min-height: 0; }
+  #vD .rail-top { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  #vD .rail-list { flex: 1; overflow-y: auto; padding: 6px 8px; }
+  #vD .rail-card { padding: 9px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 6px; border: 1px solid transparent; }
+  #vD .rail-card:hover { background: var(--panel); }
+  #vD .rail-card.active { background: var(--panel); border-color: var(--accent); }
+  #vD .rail-card .t { font-size: 12.5px; font-weight: 600; line-height: 1.35; }
+  #vD .rail-card .m { font-size: 10.5px; color: var(--text-dim); margin-top: 3px; }
+  #vD .rail-card.is-live .t { color: var(--accent); }
+  #vD .main { flex: 1; overflow-y: auto; padding: 16px 18px; min-width: 0; }
+
+  /* ============ E — code | prose columns (landscape) ============ */
+  #vE { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #vE .strip { height: 36px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--panel-2); }
+  #vE .strip .title-trunc { flex: 1; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #vE .icon-btn { width: 26px; height: 26px; display: flex; align-items: center; justify-content: center; border-radius: 6px; cursor: pointer; color: var(--text-dim); font-size: 14px; flex: none; }
+  #vE .icon-btn:hover { background: var(--border); color: var(--text); }
+  #vE .cols { flex: 1; display: flex; min-height: 0; }
+  #vE .col-code { flex: 1.35; min-width: 0; overflow-y: auto; padding: 12px; border-right: 1px solid var(--border); }
+  #vE .col-prose { flex: 1; min-width: 0; overflow-y: auto; padding: 12px 14px; }
+  #vE .col-label { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-dim); margin-bottom: 8px; }
+  #vE .code-wrap { margin-bottom: 0; }
+
+  /* ============ F — horizontal filmstrip (landscape) ============ */
+  #vF { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #vF .strip-top { flex: none; padding: 8px 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); background: var(--panel-2); }
+  #vF .film { flex: 1; display: flex; gap: 12px; overflow-x: auto; overflow-y: hidden; padding: 12px; scroll-snap-type: x mandatory; min-height: 0; }
+  #vF .card { width: 340px; flex: none; scroll-snap-align: start; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 13px; overflow-y: auto; }
+  #device.landscape.wide #vF .card { width: 400px; }
+  #vF .card.live { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(91,157,255,.25); }
+  #vF .card-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+  #vF .card-top .ts { font-size: 10.5px; color: var(--text-dim); flex: none; }
 
   /* prototype chrome — controls + switcher, not part of the design under test */
-  #controls {
-    position: fixed; top: 12px; right: 12px; z-index: 50; background: #000c;
-    border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-size: 11.5px;
-    display: flex; flex-direction: column; gap: 6px; max-width: 190px; backdrop-filter: blur(6px);
-  }
+  #controls { position: fixed; top: 12px; right: 12px; z-index: 50; background: #000c; border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-size: 11.5px; display: flex; flex-direction: column; gap: 6px; max-width: 190px; backdrop-filter: blur(6px); }
   #controls .title { font-weight: 700; letter-spacing: .04em; color: var(--text-dim); margin-bottom: 2px; }
-  #controls button {
-    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
-    border-radius: 6px; padding: 5px 8px; cursor: pointer; font-size: 11px; text-align: left;
-  }
+  #controls button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; cursor: pointer; font-size: 11px; text-align: left; }
   #controls button:hover { border-color: var(--accent); }
-  #switcher {
-    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 50;
-    background: #000c; border: 1px solid var(--border); border-radius: 999px;
-    display: flex; align-items: center; gap: 12px; padding: 8px 16px; backdrop-filter: blur(6px);
-    box-shadow: 0 6px 24px rgba(0,0,0,.4);
-  }
+  #controls .hint { color: var(--text-dim); font-size: 10px; line-height: 1.4; }
+  #switcher { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 50; background: #000c; border: 1px solid var(--border); border-radius: 999px; display: flex; align-items: center; gap: 12px; padding: 8px 16px; backdrop-filter: blur(6px); box-shadow: 0 6px 24px rgba(0,0,0,.4); }
   #switcher button { background: none; border: none; color: var(--text); font-size: 16px; cursor: pointer; padding: 2px 6px; }
-  #switcher .label { font-size: 12.5px; min-width: 220px; text-align: center; }
+  #switcher .label { font-size: 12.5px; min-width: 250px; text-align: center; }
   #switcher .label b { color: var(--accent); }
+  #switcher .orient { font-size: 10px; color: var(--text-dim); }
 </style>
 </head>
 <body>
 
-<div id="device">
-  <div id="frame"></div>
-</div>
+<div id="device"><div id="frame"></div></div>
 
 <div id="controls">
   <div class="title">PROTOTYPE CONTROLS</div>
@@ -232,8 +199,9 @@
   <button data-act="disconnect">Simulate disconnect</button>
   <button data-act="reconnect">Simulate reconnect</button>
   <button data-act="sync">Simulate mid-stream join</button>
-  <button data-act="width">Toggle phone / desktop width</button>
+  <button data-act="width">Toggle phone / desktop size</button>
   <button data-act="reset">Reset</button>
+  <div class="hint">A/B/C are portrait. D/E/F are landscape — the frame changes shape with the variant.</div>
 </div>
 
 <div id="switcher">
@@ -250,7 +218,7 @@ const DEMO = [
     lang: "javascript",
     code: `function sumPositive(numbers) {\n  return numbers.reduce((total, n) => (n > 0 ? total + n : total), 0);\n}`,
     prose: [
-      "A single left-to-right pass, adding each element only when it is positive. `reduce` seeded with `0` also gives the right answer for an empty array and for an array with no positive values, both of which the notes call out.",
+      "A single left-to-right pass, adding each element only when it is positive. reduce seeded with 0 also gives the right answer for an empty array and for an array with no positive values, both of which the notes call out.",
       "O(n) time, O(1) extra space."
     ],
     usage: { input: 342, output: 287 }
@@ -290,86 +258,91 @@ const DEMO = [
 
 /* ---------- state ---------- */
 const S = {
-  variant: "A",
-  phoneWidth: true,
+  variant: "C",
+  wide: false,
   socket: "connected",          // connected | reconnecting | disconnected
   history: [
     { ...DEMO[0], ts: "14 min ago", interrupted: false },
     { ...DEMO[1], ts: "6 min ago", interrupted: true }
   ],
-  live: null,                   // currently streaming/streamed entry
+  live: null,
   paneMode: "live",             // live | history
   historyViewIndex: null,
   sheetOpen: false,
-  overlayOpen: null,            // 'history' | 'settings' | null
+  overlayOpen: null,
   wrapCode: true,
   demoCursor: 2,
   streamTimer: null
 };
 
+const LANDSCAPE = ["D", "E", "F"];
+const ORDER = ["A", "B", "C", "D", "E", "F"];
+const NAMES = {
+  A: "Bottom sheet history", B: "Header + overlay", C: "Continuous log",
+  D: "Split rail", E: "Code | prose columns", F: "Horizontal filmstrip"
+};
+
 const params = new URLSearchParams(location.search);
-S.variant = (params.get("variant") || "A").toUpperCase();
-if (!["A","B","C"].includes(S.variant)) S.variant = "A";
+const requested = (params.get("variant") || "C").toUpperCase();
+if (ORDER.includes(requested)) S.variant = requested;
 
 /* ---------- streaming engine ---------- */
 function stopStream() { if (S.streamTimer) { clearInterval(S.streamTimer); S.streamTimer = null; } }
+
+function fullText(demo) {
+  return (demo.missing || "") + demo.code + demo.prose.join("");
+}
 
 function startAnswer(demo, opts = {}) {
   stopStream();
   if (S.live && (S.live.state === "streaming" || S.live.state === "syncing")) {
     S.history.unshift({ ...S.live, interrupted: true, ts: "just now" });
-  } else if (S.live && S.live.state === "done") {
+  } else if (S.live && (S.live.state === "done" || S.live.state === "error")) {
     S.history.unshift({ ...S.live, interrupted: false, ts: "just now" });
   }
   S.paneMode = "live";
+  S.historyViewIndex = null;
   S.sheetOpen = false;
   S.overlayOpen = null;
 
-  const full = fullText(demo);
-  const startAt = opts.syncFrom ? Math.floor(full.length * opts.syncFrom) : 0;
+  const len = fullText(demo).length;
+  const startAt = opts.syncFrom ? Math.floor(len * opts.syncFrom) : 0;
 
-  S.live = {
-    ...demo,
-    state: opts.syncFrom ? "syncing" : "streaming",
-    revealed: startAt,
-    fullLen: full.length,
-    ts: "just now"
-  };
+  S.live = { ...demo, state: opts.syncFrom ? "syncing" : "streaming", revealed: startAt, fullLen: len, ts: "just now" };
   render();
 
-  if (opts.syncFrom) {
-    setTimeout(() => { if (S.live) { S.live.state = "streaming"; render(); } }, 500);
-  }
+  if (opts.syncFrom) setTimeout(() => { if (S.live) { S.live.state = "streaming"; render(); } }, 600);
 
   S.streamTimer = setInterval(() => {
     if (!S.live) return stopStream();
     S.live.revealed = Math.min(S.live.fullLen, S.live.revealed + 4);
-    if (S.live.revealed >= S.live.fullLen) {
-      S.live.state = "done";
-      stopStream();
-    }
+    if (S.live.revealed >= S.live.fullLen) { S.live.state = "done"; stopStream(); }
     render();
   }, 22);
 }
 
-function fullText(demo) {
-  return (demo.missing || "") + demo.code + demo.prose.join(" ");
-}
-
+/* Split the revealed character count back into the answer's real parts.
+   Paragraphs are tracked by offset so streaming never merges or splits them. */
 function revealedParts(demo, revealed) {
   const missingLen = demo.missing ? demo.missing.length : 0;
   const codeLen = demo.code.length;
   const missingDone = Math.min(revealed, missingLen);
   const codeDone = Math.min(Math.max(revealed - missingLen, 0), codeLen);
-  const proseAvail = Math.max(revealed - missingLen - codeLen, 0);
-  const proseJoined = demo.prose.join(" ");
-  const proseDone = proseJoined.slice(0, Math.min(proseAvail, proseJoined.length));
+
+  let proseAvail = Math.max(revealed - missingLen - codeLen, 0);
+  const proseParas = [];
+  for (const p of demo.prose) {
+    if (proseAvail <= 0) break;
+    proseParas.push(p.slice(0, Math.min(proseAvail, p.length)));
+    proseAvail -= p.length;
+  }
+
   return {
     missing: demo.missing ? demo.missing.slice(0, missingDone) : "",
     missingComplete: missingDone >= missingLen,
     code: demo.code.slice(0, codeDone),
     codeComplete: codeDone >= codeLen,
-    prose: proseDone.split(" ").filter(p => p.length > 0)
+    prose: proseParas
   };
 }
 
@@ -379,10 +352,8 @@ function simulateError() {
   render();
 }
 
-/* ---------- rendering helpers shared across variants ---------- */
-function escapeHtml(s) {
-  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-}
+/* ---------- shared render helpers ---------- */
+function escapeHtml(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
 function connLabel() {
   if (S.paneMode === "history") return { cls: "history", text: "Viewing history — not live" };
@@ -391,56 +362,62 @@ function connLabel() {
   return { cls: "connected", text: "Connected" };
 }
 
-function answerBlockHtml(entry, { wrap, showCursor, interrupted }) {
-  if (!entry) return `<div class="muted" style="font-size:13px;">No answer yet.</div>`;
-  const isStreamed = entry.revealed !== undefined;
-  const parts = isStreamed ? revealedParts(entry, entry.revealed) : {
-    missing: entry.missing || "", missingComplete: true,
-    code: entry.code, codeComplete: true, prose: entry.prose
-  };
-  const showingCursorInCode = showCursor && isStreamed && !parts.missingComplete === false && !parts.codeComplete;
-  const showingCursorInProse = showCursor && isStreamed && parts.codeComplete && entry.state !== "done" && entry.state !== "error";
+function partsOf(entry) {
+  const streamed = entry.revealed !== undefined;
+  return streamed ? revealedParts(entry, entry.revealed)
+    : { missing: entry.missing || "", missingComplete: true, code: entry.code, codeComplete: true, prose: entry.prose };
+}
 
-  let html = `<div class="answer-heading">${escapeHtml(entry.title)}`;
-  if (interrupted) html += `<span class="interrupted-tag">interrupted</span>`;
-  html += `</div>`;
-
-  if (entry.state === "syncing") {
-    html += `<div class="sync-tag">syncing…</div>`;
-  }
-
-  if (parts.missing) {
-    html += `<div class="missing-line"><b>Missing:</b> ${escapeHtml(parts.missing)}${showingCursorInCode && !parts.missingComplete ? '<span class="cursor"></span>' : ''}</div>`;
-  }
-
-  html += `<div class="code-wrap">
+function codeBlockHtml(entry, parts, showCursor) {
+  const cursorInCode = showCursor && entry.revealed !== undefined && !parts.codeComplete;
+  return `<div class="code-wrap">
     <div class="code-head">
       <span>${entry.lang}</span>
-      <span class="wrap-toggle" data-toggle-wrap="1">${wrap ? "wrap: on" : "wrap: off"}</span>
+      <span class="wrap-toggle" data-toggle-wrap="1">${S.wrapCode ? "wrap: on" : "wrap: off"}</span>
     </div>
-    <pre class="code-body ${wrap ? "" : "no-wrap"}">${escapeHtml(parts.code)}${showingCursorInCode ? '<span class="cursor"></span>' : ''}</pre>
+    <pre class="code-body ${S.wrapCode ? "" : "no-wrap"}">${escapeHtml(parts.code)}${cursorInCode ? '<span class="cursor"></span>' : ''}</pre>
   </div>`;
+}
 
-  if (parts.prose.length) {
-    html += `<div class="prose">` + parts.prose.map((p,i) =>
-      `<p>${escapeHtml(p)}${showingCursorInProse && i === parts.prose.length - 1 ? '<span class="cursor"></span>' : ''}</p>`
-    ).join("") + `</div>`;
-  } else if (showingCursorInProse) {
-    html += `<div class="prose"><p><span class="cursor"></span></p></div>`;
-  }
+function proseHtml(entry, parts, showCursor) {
+  const streaming = entry.revealed !== undefined && entry.state !== "done" && entry.state !== "error";
+  const cursorInProse = showCursor && streaming && parts.codeComplete;
+  if (!parts.prose.length) return cursorInProse ? `<div class="prose"><p><span class="cursor"></span></p></div>` : "";
+  return `<div class="prose">` + parts.prose.map((p, i) =>
+    `<p>${escapeHtml(p)}${cursorInProse && i === parts.prose.length - 1 ? '<span class="cursor"></span>' : ''}</p>`
+  ).join("") + `</div>`;
+}
 
+function tailHtml(entry) {
   if (entry.state === "error") {
-    html += `<div class="missing-line" style="color:var(--red); border-color:var(--red); background:rgba(224,87,92,.08);">
-      <b>error:</b> ${entry.errorKind || "unknown"} — the model call failed mid-stream. Partial answer above is preserved.
-    </div>`;
-  } else if (entry.state === "done") {
-    html += `<div class="usage-line">${entry.usage.input} in · ${entry.usage.output} out</div>`;
+    return `<div class="error-line"><b>error:</b> ${entry.errorKind || "unknown"} — the call failed mid-stream. Partial answer above is preserved.</div>`;
   }
+  if (entry.state === "done" || entry.revealed === undefined) {
+    return `<div class="usage-line">${entry.usage.input} in · ${entry.usage.output} out</div>`;
+  }
+  return "";
+}
 
+/* full answer, stacked — used by A, B, C, D, F */
+function answerBlockHtml(entry, { showCursor, interrupted, showHeading = true }) {
+  if (!entry) return `<div class="muted" style="font-size:13px;">No answer yet.</div>`;
+  const parts = partsOf(entry);
+  let html = "";
+  if (showHeading) {
+    html += `<div class="answer-heading">${escapeHtml(entry.title)}${interrupted ? '<span class="interrupted-tag">interrupted</span>' : ''}</div>`;
+  }
+  if (entry.state === "syncing") html += `<div class="sync-tag">syncing…</div>`;
+  if (parts.missing) {
+    const c = showCursor && entry.revealed !== undefined && !parts.missingComplete;
+    html += `<div class="missing-line"><b>Missing:</b> ${escapeHtml(parts.missing)}${c ? '<span class="cursor"></span>' : ''}</div>`;
+  }
+  html += codeBlockHtml(entry, parts, showCursor);
+  html += proseHtml(entry, parts, showCursor);
+  html += tailHtml(entry);
   return html;
 }
 
-function historyRowHtml(entry, i, cls) {
+function historyRowHtml(entry, i) {
   return `<div class="hist-item" data-open-history="${i}">
     <div class="t">${escapeHtml(entry.title)}${entry.interrupted ? '<span class="interrupted-tag">interrupted</span>' : ''}</div>
     <div class="m">${entry.ts} · ${entry.usage.input + entry.usage.output} tok</div>
@@ -452,19 +429,16 @@ function currentDisplayEntry() {
   return S.live;
 }
 
-/* ---------- variant A: bottom sheet history ---------- */
+/* ---------- A: bottom sheet history (portrait) ---------- */
 function renderA() {
-  const conn = connLabel();
-  const entry = currentDisplayEntry();
-  const isLive = S.paneMode === "live";
-  return `
-  <div id="vA">
+  const conn = connLabel(), entry = currentDisplayEntry(), isLive = S.paneMode === "live";
+  return `<div id="vA">
     <div class="top-bar">
-      <span class="pill state-label"><span class="dot ${conn.cls}"></span>${conn.text}</span>
+      <span class="pill"><span class="dot ${conn.cls}"></span>${conn.text}</span>
       <span class="settings-icon" data-open-settings="1">⚙</span>
     </div>
     <div class="pane">
-      ${answerBlockHtml(entry, { wrap: S.wrapCode, showCursor: isLive, interrupted: !isLive && entry && entry.interrupted })}
+      ${answerBlockHtml(entry, { showCursor: isLive, interrupted: !isLive && entry && entry.interrupted })}
       ${!isLive ? `<button class="back-to-live" data-back-live="1">↩ Back to live</button>` : ""}
       ${isLive ? `<div class="always-on-top-note">No pin here — a second open tab or your phone <i>is</i> the always-on-top.</div>` : ""}
     </div>
@@ -474,20 +448,15 @@ function renderA() {
     <div class="sheet ${S.sheetOpen ? "open" : ""}">
       <div class="sheet-handle" data-toggle-sheet="1"></div>
       <div class="sheet-header"><span>History</span><span data-toggle-sheet="1" style="cursor:pointer;">▼ close</span></div>
-      <div class="sheet-list">
-        ${S.history.map((h,i) => historyRowHtml(h,i)).join("") || '<div class="muted" style="padding:8px;">No past answers yet.</div>'}
-      </div>
+      <div class="sheet-list">${S.history.map(historyRowHtml).join("") || '<div class="muted" style="padding:8px;">No past answers yet.</div>'}</div>
     </div>
   </div>`;
 }
 
-/* ---------- variant B: header stack + overlay ---------- */
+/* ---------- B: header stack + overlay (portrait) ---------- */
 function renderB() {
-  const conn = connLabel();
-  const entry = currentDisplayEntry();
-  const isLive = S.paneMode === "live";
-  return `
-  <div id="vB">
+  const conn = connLabel(), entry = currentDisplayEntry(), isLive = S.paneMode === "live";
+  return `<div id="vB">
     <div class="header">
       <span class="dot ${conn.cls}" title="${conn.text}"></span>
       <span class="title-trunc">${entry ? escapeHtml(entry.title) : "Screen Solver"}</span>
@@ -495,117 +464,181 @@ function renderB() {
       <span class="icon-btn" data-overlay="settings">⚙</span>
     </div>
     <div class="pane">
-      ${answerBlockHtml(entry, { wrap: S.wrapCode, showCursor: isLive, interrupted: !isLive && entry && entry.interrupted })}
+      ${answerBlockHtml(entry, { showCursor: isLive, interrupted: !isLive && entry && entry.interrupted })}
       ${!isLive ? `<button class="back-to-live" data-back-live="1">↩ Back to live</button>` : ""}
     </div>
-    <div class="overlay ${S.overlayOpen === 'history' ? 'open' : ''}">
-      <div class="overlay-header"><span class="back" data-close-overlay="1">←</span><span>History</span></div>
-      <div class="overlay-body">
-        ${S.history.map((h,i) => historyRowHtml(h,i)).join("") || '<div class="muted">No past answers yet.</div>'}
-      </div>
-    </div>
-    <div class="overlay ${S.overlayOpen === 'settings' ? 'open' : ''}">
-      <div class="overlay-header"><span class="back" data-close-overlay="1">←</span><span>Settings</span></div>
-      <div class="overlay-body">
-        <p class="muted" style="font-size:12.5px;">Target window, provider/model — out of this ticket's scope, placeholder only.</p>
-      </div>
-    </div>
+    ${overlaysHtml()}
   </div>`;
 }
 
-/* ---------- variant C: continuous log ---------- */
+function overlaysHtml() {
+  return `<div class="overlay ${S.overlayOpen === 'history' ? 'open' : ''}">
+      <div class="overlay-header"><span class="back" data-close-overlay="1">←</span><span>History</span></div>
+      <div class="overlay-body">${S.history.map(historyRowHtml).join("") || '<div class="muted">No past answers yet.</div>'}</div>
+    </div>
+    <div class="overlay ${S.overlayOpen === 'settings' ? 'open' : ''}">
+      <div class="overlay-header"><span class="back" data-close-overlay="1">←</span><span>Settings</span></div>
+      <div class="overlay-body"><p class="muted" style="font-size:12.5px;">Target window, provider/model — out of this ticket's scope, placeholder only.</p></div>
+    </div>`;
+}
+
+/* ---------- C: continuous log (portrait, CHOSEN) ---------- */
 function renderC() {
-  const conn = connLabel();
-  const rows = [];
+  const conn = connLabel(), rows = [];
   if (S.socket !== "connected") {
     rows.push(`<div class="conn-banner ${S.socket === 'disconnected' ? 'disconnected' : ''}">
-      ${S.socket === 'reconnecting' ? '⟳ reconnecting…' : '⚠ disconnected — showing last known state'}
-    </div>`);
+      ${S.socket === 'reconnecting' ? '⟳ reconnecting…' : '⚠ disconnected — showing last known state'}</div>`);
   }
   if (S.live) {
     rows.push(`<div class="entry live">
-      <div class="entry-top"><span class="pill"><span class="dot ${conn.cls}"></span>${S.paneMode === 'live' ? 'live' : 'live (background)'}</span><span class="ts">${S.live.ts}</span></div>
-      ${answerBlockHtml(S.live, { wrap: S.wrapCode, showCursor: true, interrupted: false })}
+      <div class="entry-top"><span class="pill"><span class="dot ${conn.cls}"></span>live</span><span class="ts">${S.live.ts}</span></div>
+      ${answerBlockHtml(S.live, { showCursor: true, interrupted: false })}
     </div>`);
   }
   S.history.forEach((h, i) => {
-    const collapsed = true;
-    rows.push(`<div class="entry ${collapsed ? 'collapsed' : ''}" data-expand="${i}">
+    const expanded = S.historyViewIndex === i;
+    rows.push(`<div class="entry ${expanded ? '' : 'collapsed'}" data-expand="${i}">
       <div class="entry-top"><span style="font-size:13.5px; font-weight:600;">${escapeHtml(h.title)}${h.interrupted ? '<span class="interrupted-tag">interrupted</span>' : ''}</span><span class="ts">${h.ts}</span></div>
-      ${answerBlockHtml(h, { wrap: S.wrapCode, showCursor: false, interrupted: h.interrupted })}
+      ${answerBlockHtml(h, { showCursor: false, interrupted: false, showHeading: false })}
     </div>`);
   });
-  return `<div id="vC">${rows.join("")}<div class="fab" data-open-settings="1">⚙</div></div>`;
+  return `<div id="vC">${rows.join("")}</div><div class="fab-abs" data-open-settings="1">⚙</div>${overlaysHtml()}`;
+}
+
+/* ---------- D: split rail (landscape) ---------- */
+function renderD() {
+  const conn = connLabel(), entry = currentDisplayEntry(), isLive = S.paneMode === "live";
+  const cards = [];
+  if (S.live) {
+    cards.push(`<div class="rail-card is-live ${isLive ? 'active' : ''}" data-back-live="1">
+      <div class="t">${escapeHtml(S.live.title)}</div>
+      <div class="m">${S.live.state === 'done' ? 'latest' : S.live.state} · ${S.live.ts}</div>
+    </div>`);
+  }
+  S.history.forEach((h, i) => {
+    cards.push(`<div class="rail-card ${!isLive && S.historyViewIndex === i ? 'active' : ''}" data-open-history="${i}">
+      <div class="t">${escapeHtml(h.title)}${h.interrupted ? '<span class="interrupted-tag">int.</span>' : ''}</div>
+      <div class="m">${h.ts}</div>
+    </div>`);
+  });
+  return `<div id="vD">
+    <div class="rail">
+      <div class="rail-top"><span class="pill" style="padding-left:0;"><span class="dot ${conn.cls}"></span>${S.paneMode === 'history' ? 'history' : (S.socket === 'connected' ? 'live' : S.socket)}</span>
+        <span class="icon-btn" data-open-settings="1" style="color:var(--text-dim);cursor:pointer;">⚙</span></div>
+      <div class="rail-list">${cards.join("")}</div>
+    </div>
+    <div class="main">${answerBlockHtml(entry, { showCursor: isLive, interrupted: !isLive && entry && entry.interrupted })}</div>
+    ${overlaysHtml()}
+  </div>`;
+}
+
+/* ---------- E: code | prose columns (landscape) ---------- */
+function renderE() {
+  const conn = connLabel(), entry = currentDisplayEntry(), isLive = S.paneMode === "live";
+  if (!entry) return `<div id="vE"><div class="strip"><span class="title-trunc">Screen Solver</span></div><div class="cols"><div class="col-code muted" style="font-size:13px;">No answer yet.</div></div></div>`;
+  const parts = partsOf(entry);
+  return `<div id="vE">
+    <div class="strip">
+      <span class="dot ${conn.cls}" title="${conn.text}"></span>
+      <span class="title-trunc">${escapeHtml(entry.title)}${!isLive && entry.interrupted ? '<span class="interrupted-tag">interrupted</span>' : ''}</span>
+      ${!isLive ? `<span class="icon-btn" data-back-live="1" title="Back to live">↩</span>` : ""}
+      <span class="icon-btn" data-overlay="history">☰</span>
+      <span class="icon-btn" data-open-settings="1">⚙</span>
+    </div>
+    <div class="cols">
+      <div class="col-code">
+        <div class="col-label">Solution</div>
+        ${entry.state === "syncing" ? '<div class="sync-tag">syncing…</div>' : ''}
+        ${parts.missing ? `<div class="missing-line"><b>Missing:</b> ${escapeHtml(parts.missing)}</div>` : ''}
+        ${codeBlockHtml(entry, parts, isLive)}
+      </div>
+      <div class="col-prose">
+        <div class="col-label">Explanation</div>
+        ${proseHtml(entry, parts, isLive) || '<div class="muted" style="font-size:12.5px;">…</div>'}
+        ${tailHtml(entry)}
+      </div>
+    </div>
+    ${overlaysHtml()}
+  </div>`;
+}
+
+/* ---------- F: horizontal filmstrip (landscape) ---------- */
+function renderF() {
+  const conn = connLabel(), cards = [];
+  if (S.live) {
+    cards.push(`<div class="card live">
+      <div class="card-top"><span class="pill" style="padding-left:0;"><span class="dot ${conn.cls}"></span>live</span><span class="ts">${S.live.ts}</span></div>
+      ${answerBlockHtml(S.live, { showCursor: true, interrupted: false })}
+    </div>`);
+  }
+  S.history.forEach((h) => {
+    cards.push(`<div class="card">
+      <div class="card-top"><span class="ts">${h.ts}</span>${h.interrupted ? '<span class="interrupted-tag">interrupted</span>' : ''}</div>
+      ${answerBlockHtml(h, { showCursor: false, interrupted: false })}
+    </div>`);
+  });
+  return `<div id="vF">
+    <div class="strip-top">
+      <span style="font-size:12px; color:var(--text-dim);">← newest · scroll for older →</span>
+      ${S.socket !== 'connected' ? `<span class="pill" style="color:${S.socket === 'disconnected' ? 'var(--red)' : 'var(--amber)'};"><span class="dot ${conn.cls}"></span>${S.socket}</span>` : ''}
+      <span class="icon-btn" data-open-settings="1" style="color:var(--text-dim);cursor:pointer;font-size:14px;">⚙</span>
+    </div>
+    <div class="film">${cards.join("")}</div>
+    ${overlaysHtml()}
+  </div>`;
 }
 
 /* ---------- top-level render ---------- */
 function render() {
   const frame = document.getElementById("frame");
-  if (S.variant === "A") frame.innerHTML = renderA();
-  else if (S.variant === "B") frame.innerHTML = renderB();
-  else frame.innerHTML = renderC();
+  const fns = { A: renderA, B: renderB, C: renderC, D: renderD, E: renderE, F: renderF };
+  frame.innerHTML = fns[S.variant]();
 
-  document.getElementById("device").classList.toggle("phone-width", S.phoneWidth);
+  const isLandscape = LANDSCAPE.includes(S.variant);
+  const device = document.getElementById("device");
+  device.className = (isLandscape ? "landscape " : "portrait ") + (S.wide ? "wide" : "phone");
 
-  const names = { A: "Bottom sheet history", B: "Header + overlay", C: "Continuous log" };
-  document.getElementById("switcher-label").innerHTML = `<b>${S.variant}</b> — ${names[S.variant]}`;
+  document.getElementById("switcher-label").innerHTML =
+    `<b>${S.variant}</b> — ${NAMES[S.variant]} <span class="orient">${isLandscape ? "· landscape" : "· portrait"}</span>`;
 
   wireDynamicHandlers();
 }
 
 function wireDynamicHandlers() {
-  document.querySelectorAll("[data-toggle-sheet]").forEach(el =>
-    el.onclick = () => { S.sheetOpen = !S.sheetOpen; render(); });
-  document.querySelectorAll("[data-overlay]").forEach(el =>
-    el.onclick = () => { S.overlayOpen = el.dataset.overlay; render(); });
-  document.querySelectorAll("[data-close-overlay]").forEach(el =>
-    el.onclick = () => { S.overlayOpen = null; render(); });
-  document.querySelectorAll("[data-open-settings]").forEach(el =>
-    el.onclick = () => { S.overlayOpen = "settings"; render(); });
-  document.querySelectorAll("[data-open-history]").forEach(el =>
-    el.onclick = () => {
-      S.historyViewIndex = parseInt(el.dataset.openHistory, 10);
-      S.paneMode = "history"; S.sheetOpen = false; S.overlayOpen = null; render();
-    });
-  document.querySelectorAll("[data-expand]").forEach(el =>
-    el.onclick = (e) => {
-      if (e.target.closest("[data-toggle-wrap]")) return;
-      S.historyViewIndex = parseInt(el.dataset.expand, 10);
-      S.paneMode = "history"; render();
-    });
-  document.querySelectorAll("[data-back-live]").forEach(el =>
-    el.onclick = () => { S.paneMode = "live"; S.historyViewIndex = null; render(); });
-  document.querySelectorAll("[data-toggle-wrap]").forEach(el =>
-    el.onclick = (e) => { e.stopPropagation(); S.wrapCode = !S.wrapCode; render(); });
+  const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => el.onclick = (e) => fn(el, e));
+  on("[data-toggle-sheet]", () => { S.sheetOpen = !S.sheetOpen; render(); });
+  on("[data-overlay]", (el) => { S.overlayOpen = el.dataset.overlay; render(); });
+  on("[data-close-overlay]", () => { S.overlayOpen = null; render(); });
+  on("[data-open-settings]", () => { S.overlayOpen = "settings"; render(); });
+  on("[data-open-history]", (el) => {
+    S.historyViewIndex = parseInt(el.dataset.openHistory, 10);
+    S.paneMode = "history"; S.sheetOpen = false; S.overlayOpen = null; render();
+  });
+  on("[data-expand]", (el, e) => {
+    if (e.target.closest("[data-toggle-wrap]")) return;
+    const i = parseInt(el.dataset.expand, 10);
+    S.historyViewIndex = S.historyViewIndex === i ? null : i;
+    render();
+  });
+  on("[data-back-live]", () => { S.paneMode = "live"; S.historyViewIndex = null; render(); });
+  on("[data-toggle-wrap]", (el, e) => { e.stopPropagation(); S.wrapCode = !S.wrapCode; render(); });
 }
 
 /* ---------- prototype control panel ---------- */
 document.querySelectorAll("#controls [data-act]").forEach(btn => {
   btn.addEventListener("click", () => {
     const act = btn.dataset.act;
-    if (act === "new") {
-      S.demoCursor = (S.demoCursor + 1) % DEMO.length;
-      startAnswer(DEMO[S.demoCursor]);
-    } else if (act === "error") {
-      simulateError();
-    } else if (act === "disconnect") {
-      S.socket = "disconnected"; render();
-    } else if (act === "reconnect") {
-      S.socket = "reconnecting"; render();
-      setTimeout(() => { S.socket = "connected"; render(); }, 1400);
-    } else if (act === "sync") {
-      S.demoCursor = (S.demoCursor + 1) % DEMO.length;
-      startAnswer(DEMO[S.demoCursor], { syncFrom: 0.55 });
-    } else if (act === "width") {
-      S.phoneWidth = !S.phoneWidth; render();
-    } else if (act === "reset") {
-      location.reload();
-    }
+    if (act === "new") { S.demoCursor = (S.demoCursor + 1) % DEMO.length; startAnswer(DEMO[S.demoCursor]); }
+    else if (act === "error") simulateError();
+    else if (act === "disconnect") { S.socket = "disconnected"; render(); }
+    else if (act === "reconnect") { S.socket = "reconnecting"; render(); setTimeout(() => { S.socket = "connected"; render(); }, 1400); }
+    else if (act === "sync") { S.demoCursor = (S.demoCursor + 1) % DEMO.length; startAnswer(DEMO[S.demoCursor], { syncFrom: 0.55 }); }
+    else if (act === "width") { S.wide = !S.wide; render(); }
+    else if (act === "reset") location.reload();
   });
 });
 
 /* ---------- variant switcher ---------- */
-const ORDER = ["A", "B", "C"];
 function setVariant(v) {
   S.variant = v;
   const url = new URL(location.href);
@@ -616,13 +649,12 @@ function setVariant(v) {
 document.querySelectorAll("#switcher [data-nav]").forEach(btn => {
   btn.addEventListener("click", () => {
     const dir = parseInt(btn.dataset.nav, 10);
-    const idx = ORDER.indexOf(S.variant);
-    setVariant(ORDER[(idx + dir + ORDER.length) % ORDER.length]);
+    setVariant(ORDER[(ORDER.indexOf(S.variant) + dir + ORDER.length) % ORDER.length]);
   });
 });
 document.addEventListener("keydown", (e) => {
-  const active = document.activeElement;
-  if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable)) return;
+  const a = document.activeElement;
+  if (a && (a.tagName === "INPUT" || a.tagName === "TEXTAREA" || a.isContentEditable)) return;
   if (e.key === "ArrowLeft") document.querySelector('#switcher [data-nav="-1"]').click();
   if (e.key === "ArrowRight") document.querySelector('#switcher [data-nav="1"]').click();
 });
