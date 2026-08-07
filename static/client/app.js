@@ -4,12 +4,12 @@
 // convention -- see AGENTS.md's "Product code: toolchain and layout".
 //
 // Talks to the wire contract built by #28/#29/#31/#32/#33:
-//   GET  /config          -> { targetWindow }            (#33)
+//   GET  /config          -> { targetWindow, revision }    (#33)
 //   GET  /windows          -> WindowInfo[]                 (#33)
-//   POST /config/target    -> { targetWindow }             (#33)
+//   POST /config/target    -> { targetWindow, revision }   (#33)
 //   GET  /answers          -> AnswerLogEntry[]              (#31)
 //   POST /solve             -> 202/400/503                   (#29)
-//   GET  /events (SSE)      -> start/delta/done/error/sync/status/config
+//   GET  /events (SSE)      -> start/delta/done/error/sync/status/config{,revision}
 
 (() => {
   'use strict';
@@ -44,17 +44,36 @@
   // (history) state a live frame had already applied -- silently reverting
   // to stale data with nothing to trigger a re-render.
   //
-  // `liveConfigApplied` makes the live path latch permanently authoritative:
-  // once any `config` frame (or a `POST /config/target` response, which is
-  // just as fresh) has been applied, the slower `GET /config` snapshot is
-  // known-stale by the time it arrives and is discarded rather than applied.
-  let liveConfigApplied = false;
-  // History has no single "current value" to overwrite, so it uses a queue
-  // instead of a latch: a `done` completion that lands before `GET /answers`
-  // resolves is held here and replayed *after* the snapshot renders, instead
-  // of being added straight to a DOM the snapshot is about to clear.
+  // A first attempt at the config half latched "the live path always wins"
+  // on a plain boolean -- wrong, because arrival order between two
+  // independent connections (this fetch vs. the SSE socket) says nothing
+  // about which one actually describes more current server state; a slow
+  // `GET /config` response can easily describe a *later* change than an
+  // SSE frame the client already applied. `latestConfigRevision` compares
+  // `broadcaster.ts`'s own monotonic revision counter instead (present on
+  // every `config` SSE frame, `GET /config`, and a `POST /config/target`
+  // response), so whichever source reports the higher revision wins,
+  // regardless of which happened to arrive first. `-1` sorts below every
+  // real revision (`broadcaster.ts` starts counting at `1`), so the very
+  // first thing to arrive -- through either path -- is always applied.
+  let latestConfigRevision = -1;
+  // History has no single "current value" to compare a revision against, so
+  // it uses a queue instead: a `done` completion that lands before
+  // `GET /answers` resolves is held here and replayed *after* the snapshot
+  // renders (instead of being added straight to a DOM the snapshot is about
+  // to clear), then filtered against what the snapshot already contains --
+  // the recorder's JSONL write can complete before this client's own
+  // `GET /answers` does, so the same answer can legitimately show up in
+  // both the snapshot and the queue.
   let historySnapshotLoaded = false;
   const queuedLiveHistoryEntries = [];
+
+  /** Applies `targetWindow` only if `revision` is at least as new as the last one actually applied, updating the latch either way it's compared against next time. Shared by all three sources of a target (`GET /config`, `POST /config/target`, the `config` SSE frame) so they can't disagree about ordering. */
+  function applyConfigIfNewer(targetWindow, revision) {
+    if (revision < latestConfigRevision) return;
+    latestConfigRevision = revision;
+    applyConfig(targetWindow);
+  }
 
   function parseAnswerTitle(text) {
     const match = /^#[ \t]+(.+)$/m.exec(text);
@@ -66,7 +85,7 @@
     return `${target.title} — ${target.processName}`;
   }
 
-  /** The single place that flips between the picker and the answer pane -- driven by an initial GET /config, a successful POST /config/target, and a live `config` SSE frame, all funneled through here so the three paths can't disagree. */
+  /** The single place that flips between the picker and the answer pane. Reached only through {@link applyConfigIfNewer}, which all three sources of a target (an initial `GET /config`, a successful `POST /config/target`, a live `config` SSE frame) are funneled through, so this never has to arbitrate ordering itself. */
   function applyConfig(targetWindow) {
     currentTarget = targetWindow;
     solveButton.disabled = targetWindow === null;
@@ -87,10 +106,7 @@
       const res = await fetch('/config');
       if (!res.ok) return;
       const body = await res.json();
-      // A live `config` frame (or this client's own `POST /config/target`)
-      // may have already landed while this fetch was in flight -- that's
-      // strictly newer information than this snapshot, so don't clobber it.
-      if (!liveConfigApplied) applyConfig(body.targetWindow);
+      applyConfigIfNewer(body.targetWindow, body.revision);
     } catch {
       // Left on the initial "no target" default (picker shown, empty list);
       // `loadWindows()`'s own error path reports the underlying failure.
@@ -149,11 +165,10 @@
       if (!res.ok) throw new Error(`POST /config/target -> ${res.status}`);
       const body = await res.json();
       // The `config` SSE frame will also arrive shortly and call this again
-      // with the same value -- `applyConfig` is idempotent, so that's a
-      // harmless no-op re-render, not double state. Latched the same as a
-      // live SSE frame: this response is at least as fresh as one.
-      liveConfigApplied = true;
-      applyConfig(body.targetWindow);
+      // with the same revision -- `applyConfigIfNewer` is idempotent on a
+      // repeated revision, so that's a harmless no-op re-render, not double
+      // state.
+      applyConfigIfNewer(body.targetWindow, body.revision);
     } catch (err) {
       pickerError.hidden = false;
       pickerError.textContent = `Could not set the target window: ${err.message}`;
@@ -232,31 +247,40 @@
   }
 
   async function loadHistory() {
+    let entries = [];
     try {
       const res = await fetch('/answers');
-      if (!res.ok) return;
-      const entries = await res.json();
-      historyList.innerHTML = '';
-      // Oldest first is appended first, so it ends up at the bottom -- the
-      // newest logged entry lands on top, matching where `addHistoryEntry`
-      // (called live, on a fresh `done`) always inserts.
-      for (const entry of entries) addHistoryEntry(entry);
-      if (entries.length === 0 && queuedLiveHistoryEntries.length === 0) {
-        historyList.appendChild(emptyHint('No answers yet.'));
-      }
+      if (res.ok) entries = await res.json();
     } catch {
-      // Best-effort: a failed load just leaves the list empty rather than
-      // blocking the rest of the page.
-    } finally {
-      // Whether the fetch succeeded or not, the snapshot phase is over --
-      // any `done` completion that arrived while it was in flight was queued
-      // rather than rendered (it would have been wiped by `innerHTML = ''`
-      // above, or by a future retry); replay it now, on top of whatever the
-      // snapshot just rendered.
-      historySnapshotLoaded = true;
-      for (const entry of queuedLiveHistoryEntries) addHistoryEntry(entry);
-      queuedLiveHistoryEntries.length = 0;
+      // Best-effort: a failed load just leaves the snapshot half empty
+      // rather than blocking the rest of the page -- the `finally` below
+      // still runs, so any queued live completion is not lost either way.
     }
+
+    historyList.innerHTML = '';
+    // Oldest first is appended first, so it ends up at the bottom -- the
+    // newest logged entry lands on top, matching where `addHistoryEntry`
+    // (called live, on a fresh `done`) always inserts.
+    for (const entry of entries) addHistoryEntry(entry);
+
+    // Whether the fetch succeeded or not, the snapshot phase is over -- any
+    // `done` completion that arrived while it was in flight was queued
+    // rather than rendered (it would have been wiped by `innerHTML = ''`
+    // above). Replay it now, on top of what the snapshot just rendered --
+    // except when the recorder's JSONL write already landed before this
+    // fetch ran, in which case the snapshot above already contains it and
+    // replaying would duplicate the row. `text` (the full accumulated
+    // answer) is compared rather than `timestamp`, since the queued entry's
+    // client-generated timestamp and the snapshot's server-recorded one for
+    // the same answer are never exactly equal.
+    historySnapshotLoaded = true;
+    const alreadyPersisted = new Set(entries.map((entry) => entry.text));
+    for (const queued of queuedLiveHistoryEntries) {
+      if (!alreadyPersisted.has(queued.text)) addHistoryEntry(queued);
+    }
+    queuedLiveHistoryEntries.length = 0;
+
+    if (historyList.children.length === 0) historyList.appendChild(emptyHint('No answers yet.'));
   }
 
   function setStatusPill(level, kind) {
@@ -345,8 +369,7 @@
     // through the same `applyConfig` the picker's own POST response uses.
     source.addEventListener('config', (event) => {
       const data = JSON.parse(event.data);
-      liveConfigApplied = true;
-      applyConfig(data.target);
+      applyConfigIfNewer(data.target, data.revision);
     });
   }
 

@@ -163,7 +163,11 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
       // frame has ever been broadcast. Kept deliberately narrow (just the
       // field the picker cares about) rather than exposing the whole
       // `ScreenSolverConfig`, since `provider` is reserved and unused by any
-      // ticket through #33.
+      // ticket through #33. `revision` is `broadcaster.ts`'s own counter --
+      // see its doc comment on `SseEvent`'s `config` variant -- so a client
+      // can tell whether this snapshot is newer or older than a `config` SSE
+      // frame it may have already received, rather than just trusting
+      // whichever happened to arrive first over its own separate connection.
       method: 'GET',
       path: '/config',
       handle: ({ res }) => {
@@ -171,7 +175,10 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
           sendJson(res, 503, { error: 'not_ready' });
           return;
         }
-        sendJson(res, 200, { targetWindow: configStore.get().targetWindow });
+        sendJson(res, 200, {
+          targetWindow: configStore.get().targetWindow,
+          revision: broadcaster.currentConfigRevision(),
+        });
       },
     },
     {
@@ -224,7 +231,11 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
         }
 
         await configStore.setTargetWindow(target);
-        sendJson(res, 200, { targetWindow: target });
+        // `setTargetWindow` above has already driven the `onChange`
+        // subscription (below) synchronously, so `currentConfigRevision()`
+        // here is exactly the revision the resulting `config` SSE frame
+        // carried -- this response is just as fresh as that frame.
+        sendJson(res, 200, { targetWindow: target, revision: broadcaster.currentConfigRevision() });
       },
     },
   ];

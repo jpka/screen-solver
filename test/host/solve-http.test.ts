@@ -606,7 +606,8 @@ describe('POST /solve + GET /events', () => {
     // connected client learns about the fallback live instead of the picker
     // only reappearing on a manual reload.
     const [frame] = await events.take(1);
-    assert.deepEqual(frame, { type: 'config', target: null });
+    assert.equal(frame?.type, 'config');
+    assert.equal(frame?.target, null);
   });
 
   it('delivers a provider error{kind} to the wire as a terminal event', async (t) => {

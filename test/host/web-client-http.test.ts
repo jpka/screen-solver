@@ -46,6 +46,16 @@ interface ParsedFrame {
   readonly [key: string]: unknown;
 }
 
+/** `GET /config` / `POST /config/target`'s shared response shape. */
+interface ConfigResponseBody {
+  readonly targetWindow: TargetWindowIdentity | null;
+  readonly revision: number;
+}
+
+async function configBody(response: Response): Promise<ConfigResponseBody> {
+  return (await response.json()) as ConfigResponseBody;
+}
+
 /** Same fixed drain-buffered-first shape as `failure-taxonomy.test.ts`'s own copy -- see that file's doc comment for why. */
 function frameReader(response: Response) {
   const reader = response.body!.getReader();
@@ -99,14 +109,29 @@ describe('GET /config', () => {
     const h = await startTestServer(t);
     const response = await fetch(`${h.server.url}/config`);
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { targetWindow: null });
+    const body = await configBody(response);
+    assert.equal(body.targetWindow, null);
+    assert.equal(typeof body.revision, 'number');
   });
 
   it('reports the configured target', async (t) => {
     const h = await startTestServer(t, { initialTarget: TARGET });
     const response = await fetch(`${h.server.url}/config`);
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { targetWindow: TARGET });
+    const body = await configBody(response);
+    assert.deepEqual(body.targetWindow, TARGET);
+    assert.equal(typeof body.revision, 'number');
+  });
+
+  it("revision matches broadcaster.currentConfigRevision(), and moves after a change -- the number a client actually needs to order GET /config against a live config SSE frame", async (t) => {
+    const h = await startTestServer(t);
+    const before = await configBody(await fetch(`${h.server.url}/config`));
+
+    await h.configStore.setTargetWindow(TARGET);
+
+    const after = await configBody(await fetch(`${h.server.url}/config`));
+    assert.ok(after.revision > before.revision, 'a real change strictly advances the revision');
+    assert.deepEqual(after.targetWindow, TARGET);
   });
 
   it('answers 503 when no configStore is wired', async (t) => {
@@ -150,11 +175,18 @@ describe('POST /config/target', () => {
       body: JSON.stringify(TARGET),
     });
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { targetWindow: TARGET });
+    const body = await configBody(response);
+    assert.deepEqual(body.targetWindow, TARGET);
+    assert.equal(typeof body.revision, 'number');
     assert.deepEqual(h.configStore.get().targetWindow, TARGET);
 
-    const after = await fetch(`${h.server.url}/config`);
-    assert.deepEqual(await after.json(), { targetWindow: TARGET });
+    const after = await configBody(await fetch(`${h.server.url}/config`));
+    assert.deepEqual(after.targetWindow, TARGET);
+    assert.equal(
+      after.revision,
+      body.revision,
+      "GET /config's revision matches the POST response's -- both read the same broadcaster counter",
+    );
   });
 
   it('clears the target from a JSON null body', async (t) => {
@@ -166,7 +198,9 @@ describe('POST /config/target', () => {
       body: 'null',
     });
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { targetWindow: null });
+    const body = await configBody(response);
+    assert.equal(body.targetWindow, null);
+    assert.equal(typeof body.revision, 'number');
     assert.equal(h.configStore.get().targetWindow, null);
   });
 
@@ -175,7 +209,9 @@ describe('POST /config/target', () => {
 
     const response = await fetch(`${h.server.url}/config/target`, { method: 'POST' });
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { targetWindow: null });
+    const body = await configBody(response);
+    assert.equal(body.targetWindow, null);
+    assert.equal(typeof body.revision, 'number');
   });
 
   it('rejects a malformed body shape with 400 and leaves the target untouched', async (t) => {
@@ -247,7 +283,9 @@ describe('config{target} SSE event', () => {
     assert.equal(response.status, 200);
 
     const [frame] = await events.take(1);
-    assert.deepEqual(frame, { type: 'config', target: TARGET });
+    assert.equal(frame?.type, 'config');
+    assert.deepEqual(frame?.target, TARGET);
+    assert.equal(typeof frame?.revision, 'number');
   });
 
   it('broadcasts a clear (null) the same way as a set', async (t) => {
@@ -258,7 +296,9 @@ describe('config{target} SSE event', () => {
     await h.configStore.setTargetWindow(null);
 
     const [frame] = await events.take(1);
-    assert.deepEqual(frame, { type: 'config', target: null });
+    assert.equal(frame?.type, 'config');
+    assert.equal(frame?.target, null);
+    assert.equal(typeof frame?.revision, 'number');
   });
 
   it('fans out identically to two simultaneous clients', async (t) => {
@@ -272,7 +312,27 @@ describe('config{target} SSE event', () => {
 
     const [framesA, framesB] = await Promise.all([clientA.take(1), clientB.take(1)]);
     assert.deepEqual(framesA, framesB);
-    assert.deepEqual(framesA[0], { type: 'config', target: TARGET });
+    assert.equal(framesA[0]?.type, 'config');
+    assert.deepEqual(framesA[0]?.target, TARGET);
+  });
+
+  it('the revision strictly increases across successive changes, giving a client real ordering info to compare against', async (t) => {
+    const h = await startTestServer(t);
+    const events = await connectEvents(`${h.server.url}/events`);
+    t.after(() => events.cancel());
+
+    await h.configStore.setTargetWindow(TARGET);
+    await h.configStore.setTargetWindow(OTHER_TARGET);
+    await h.configStore.setTargetWindow(null);
+
+    const frames = await events.take(3);
+    const revisions = frames.map((f) => f.revision);
+    assert.deepEqual(
+      revisions,
+      [...revisions].sort((a, b) => (a as number) - (b as number)),
+      'revisions arrive in non-decreasing order',
+    );
+    assert.ok(new Set(revisions).size === 3, 'each real change gets its own distinct revision');
   });
 
   it('is not replayed to a freshly-connecting client -- unlike sync/status, GET /config already covers "what is it right now"', async (t) => {

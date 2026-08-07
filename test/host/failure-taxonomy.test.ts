@@ -500,7 +500,8 @@ describe('#32 failure taxonomy: mid-run target loss', () => {
     // a connected client learns about this fallback live -- "not SSE
     // traffic" no longer holds now that a client actually exists to tell.
     const [frame] = await events.take(1);
-    assert.deepEqual(frame, { type: 'config', target: null });
+    assert.equal(frame?.type, 'config');
+    assert.equal(frame?.target, null);
   });
 
   it('a re-resolved target (vanished once, found again) proceeds silently -- no fallback, the solve still happens', async (t) => {
