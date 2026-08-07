@@ -244,29 +244,49 @@ interface ParsedFrame {
   readonly [key: string]: unknown;
 }
 
-/** Reads SSE frames off an already-open `fetch` response body, one `data:` payload per frame. Same helper as `solve-http.test.ts`. */
+/**
+ * Reads SSE frames off an already-open `fetch` response body, one `data:`
+ * payload per frame.
+ *
+ * Drains whatever is already buffered *before* blocking on a fresh
+ * `reader.read()` -- `answer-usage-logs.test.ts`'s own copy of this helper
+ * (see its doc comment) found the same gap `solve-http.test.ts`'s original
+ * version has: a single physical chunk can carry several frames at once, and
+ * consuming only the first `count` of them left the rest sitting unparsed in
+ * `buffer` for a *later*, separate `take()` call to find -- except that call
+ * always issued a fresh `reader.read()` first, so it blocked forever waiting
+ * on network bytes that were never coming, since the real data was already
+ * sitting in memory. This suite hits that gap directly: a sticky transition
+ * broadcasts `error` then `status` back-to-back with no work in between, so
+ * a test that wants to consume them across two separate `take()` calls (one
+ * per solve, in a multi-solve test) needs this fix to not hang.
+ */
 function frameReader(response: Response) {
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
 
+  function drainBuffered(events: ParsedFrame[], count: number): void {
+    let idx: number;
+    while (events.length < count && (idx = buffer.indexOf('\n\n')) !== -1) {
+      const chunk = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      const dataLine = chunk.split('\n').find((line) => line.startsWith('data: '));
+      if (dataLine !== undefined) {
+        events.push(JSON.parse(dataLine.slice('data: '.length)) as ParsedFrame);
+      }
+    }
+  }
+
   return {
     async take(count: number): Promise<ParsedFrame[]> {
       const events: ParsedFrame[] = [];
+      drainBuffered(events, count);
       while (events.length < count) {
         const { value, done } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
-        let idx: number;
-        while ((idx = buffer.indexOf('\n\n')) !== -1) {
-          const chunk = buffer.slice(0, idx);
-          buffer = buffer.slice(idx + 2);
-          const dataLine = chunk.split('\n').find((line) => line.startsWith('data: '));
-          if (dataLine !== undefined) {
-            events.push(JSON.parse(dataLine.slice('data: '.length)) as ParsedFrame);
-            if (events.length >= count) break;
-          }
-        }
+        drainBuffered(events, count);
       }
       return events;
     },
@@ -324,12 +344,13 @@ describe('#32 failure taxonomy: standing status pill', () => {
     await fetch(`${h.server.url}/solve`, { method: 'POST' });
     const call1 = await h.fakeProvider.waitForCall(1);
     call1.push({ type: 'error', kind: 'auth', message: 'key revoked' });
-    // Consumed in one `take()`, not two -- `frameReader.take()` (like
-    // `solve-http.test.ts`'s own copy) always issues at least one fresh
-    // `reader.read()` before looking at whatever it already buffered, so a
-    // second, separate `take()` call right after this one would block
-    // waiting on network bytes that were already sitting in its buffer.
-    await events.take(3); // start, error, status{sticky}
+    // Two separate `take()` calls back-to-back on purpose: this is exactly
+    // the gap `frameReader`'s own doc comment above describes -- `error` and
+    // `status` land in the same physical chunk, so the second call must find
+    // `status` already buffered rather than blocking on a `reader.read()`
+    // that will never come.
+    await events.take(2); // start, error
+    await events.take(1); // status{sticky}
 
     await fetch(`${h.server.url}/solve`, { method: 'POST' });
     const call2 = await h.fakeProvider.waitForCall(2);
