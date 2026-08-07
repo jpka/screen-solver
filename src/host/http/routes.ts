@@ -6,7 +6,7 @@ import type { AnswerLog } from '../logs/answer-log.ts';
 import type { Logger } from '../logger.ts';
 import type { Provider } from '../provider/types.ts';
 import { createEventBroadcaster } from '../solve/broadcaster.ts';
-import { startSolveLoop } from '../solve/loop.ts';
+import { startSolveLoop, type SolveLoop } from '../solve/loop.ts';
 import type { SolveOutcomeEvent } from '../solve/types.ts';
 import { sendJson, type Route } from './router.ts';
 
@@ -28,6 +28,19 @@ export interface HostRoutesDeps {
   readonly logger?: Logger;
 }
 
+export interface HostRoutes {
+  readonly routes: readonly Route[];
+  /**
+   * The solve loop backing `POST /solve`, `null` when `configStore`/
+   * `captureSessionCoordinator`/`provider` weren't all supplied (the same
+   * condition that makes `POST /solve` answer `503` below). `bootstrap.ts`
+   * awaits `.settled()` on shutdown so the in-flight attempt's outcome --
+   * and #31's persistence of it -- finishes before the process exits,
+   * instead of being silently abandoned mid-write.
+   */
+  readonly solveLoop: SolveLoop | null;
+}
+
 /**
  * The routes the host serves.
  *
@@ -41,7 +54,7 @@ export interface HostRoutesDeps {
  * branch exists for routes constructed directly, the way a route-level test
  * does.
  */
-export function createHostRoutes(deps: HostRoutesDeps = {}): Route[] {
+export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
   const broadcaster = createEventBroadcaster();
   const { configStore, captureSessionCoordinator, provider } = deps;
 
@@ -59,7 +72,7 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): Route[] {
         })
       : null;
 
-  return [
+  const routes: Route[] = [
     {
       method: 'GET',
       path: '/health',
@@ -112,4 +125,6 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): Route[] {
       },
     },
   ];
+
+  return { routes, solveLoop };
 }

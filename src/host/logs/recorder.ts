@@ -25,6 +25,14 @@ const UNKNOWN_USAGE: Usage = {
 export interface SolveLogRecorder {
   /** Persists one attempted call's outcome -- always to `usage.jsonl`, and to `answers.jsonl` too when the dispatch table below says so. */
   record(event: SolveOutcomeEvent): Promise<void>;
+  /**
+   * Resolves once every `record()` call made so far -- including ones queued
+   * behind it in the internal chain, e.g. a superseded attempt's `interrupted`
+   * write that was still in flight -- has finished. For shutdown: called
+   * after the caller has already awaited the last `record()` it knows about,
+   * so this is the belt to that call's suspenders, not a substitute for it.
+   */
+  drain(): Promise<void>;
 }
 
 export interface SolveLogRecorderDeps {
@@ -89,6 +97,7 @@ export function createSolveLogRecorder(deps: SolveLogRecorderDeps): SolveLogReco
       chain = next.catch(() => {});
       return next;
     },
+    drain: () => chain,
   };
 
   async function recordOne(event: SolveOutcomeEvent): Promise<void> {

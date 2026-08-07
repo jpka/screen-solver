@@ -156,7 +156,7 @@ async function startTestServer(
 
   const captureSessionCoordinator = fakeCaptureCoordinator(async () => frame);
 
-  const routes = createHostRoutes({
+  const { routes } = createHostRoutes({
     configStore,
     captureSessionCoordinator,
     provider: provider.provider,
@@ -256,7 +256,7 @@ describe('POST /solve + GET /events', () => {
   });
 
   it('answers 503 when the routes were constructed without solve-loop dependencies wired', async (t) => {
-    const routes = createHostRoutes();
+    const { routes } = createHostRoutes();
     const server = await startHttpServer({
       binding: { host: '127.0.0.1', port: 0 },
       routes,

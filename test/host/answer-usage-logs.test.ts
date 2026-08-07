@@ -227,7 +227,7 @@ async function startTestServer(
     }
   };
 
-  const routes = createHostRoutes({
+  const { routes } = createHostRoutes({
     configStore,
     captureSessionCoordinator,
     provider: provider.provider,

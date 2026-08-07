@@ -159,12 +159,13 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
     logger,
   });
 
-  const startServer = runtime.startHttpServer ?? defaultStartHttpServer;
-  const server = await startServer({
-    binding,
-    routes:
-      runtime.routes ??
-      createHostRoutes({
+  // `solveLoop` is `null` when `runtime.routes` was injected directly (tests
+  // that bypass `createHostRoutes` entirely) -- shutdown then has no attempt
+  // to await, the same "nothing to do" shape `solveLogRecorder.drain()` has
+  // when nothing was ever recorded.
+  const { routes, solveLoop } = runtime.routes
+    ? { routes: runtime.routes, solveLoop: null }
+    : createHostRoutes({
         configStore,
         captureSessionCoordinator,
         provider,
@@ -173,9 +174,10 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
         onOutcome: (event) => solveLogRecorder.record(event),
         answerLog,
         logger,
-      }),
-    logger,
-  });
+      });
+
+  const startServer = runtime.startHttpServer ?? defaultStartHttpServer;
+  const server = await startServer({ binding, routes, logger });
 
   logger.info(`Screen Solver state root: ${stateRoot}`);
   logger.info(`Screen Solver listening on ${server.url} (bound ${server.host}:${server.port})`);
@@ -190,6 +192,16 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
       configStore,
       captureSessionCoordinator,
       shutdown: async () => {
+        // Let whatever solve attempt is currently in flight reach a terminal
+        // outcome -- and #31's persistence of it -- before tearing anything
+        // down; `settled()` doesn't resolve until `onOutcome` (which writes
+        // the JSONL lines) has already been awaited (`solve/loop.ts`).
+        // `solveLogRecorder.drain()` is the belt to that suspenders: it also
+        // waits out a *superseded* attempt's write still queued behind it,
+        // which `settled()` alone wouldn't catch since it only tracks the
+        // most recently triggered attempt.
+        await solveLoop?.settled();
+        await solveLogRecorder.drain();
         await captureSessionCoordinator.stop();
         await server.close();
       },
