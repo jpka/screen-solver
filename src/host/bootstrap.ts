@@ -1,5 +1,7 @@
 import { API_KEY_ENV_VAR, takeApiKey } from './api-key.ts';
 import { readHttpBinding, type HttpBinding } from './binding.ts';
+import { loadConfigStore, type ConfigStore } from './config/store.ts';
+import type { EnumerateWindows } from './config/types.ts';
 import { createHostRoutes } from './http/routes.ts';
 import type { Route } from './http/router.ts';
 import {
@@ -33,6 +35,14 @@ export interface HostRuntime {
   readonly logger: Logger;
   readonly startHttpServer?: StartHttpServer;
   readonly routes?: readonly Route[];
+  /**
+   * Lists the windows a user could target (#28). Electron supplies the real
+   * implementation (`src/main/window-enumeration.ts`); tests supply a fixed
+   * fake list. Left unset, a saved target window always falls back to "no
+   * target configured" on startup — safe for tests that don't care about
+   * config.
+   */
+  readonly enumerateWindows?: EnumerateWindows;
 }
 
 /** The state the app lives in for the rest of its life. */
@@ -42,6 +52,8 @@ export interface StartedHost {
   readonly apiKey: Secret;
   readonly binding: HttpBinding;
   readonly server: ListeningHttpServer;
+  /** #28's config surface: target window plus (reserved) provider selection, live-reloadable with no restart. */
+  readonly configStore: ConfigStore;
   shutdown(): Promise<void>;
 }
 
@@ -75,6 +87,10 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   const binding = readHttpBinding(env);
 
   const stateRoot = await ensureStateRoot(runtime.stateRoot);
+  const configStore = await loadConfigStore({
+    stateRoot,
+    enumerateWindows: runtime.enumerateWindows,
+  });
 
   const startServer = runtime.startHttpServer ?? defaultStartHttpServer;
   const server = await startServer({
@@ -93,6 +109,7 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
       apiKey,
       binding: { host: server.host, port: server.port },
       server,
+      configStore,
       shutdown: () => server.close(),
     },
   };

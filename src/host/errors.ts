@@ -9,7 +9,8 @@ export type StartupFailureKind =
   | 'missing-api-key'
   | 'invalid-binding'
   | 'state-root-unwritable'
-  | 'port-unavailable';
+  | 'port-unavailable'
+  | 'config-invalid';
 
 /**
  * A refusal to start, carrying a machine-readable `kind` alongside a message
