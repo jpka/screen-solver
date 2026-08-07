@@ -36,6 +36,26 @@
   let currentTarget = null;
   let liveText = '';
 
+  // Startup snapshot-vs-stream ordering (Greptile review on #33's PR): the
+  // initial `GET /config` and `GET /answers` fetches race the `GET /events`
+  // SSE connection opening alongside them. A `config`/`done` frame can land
+  // *before* its slower snapshot sibling resolves, and without guarding
+  // against it the snapshot's `.then()` would overwrite (config) or wipe
+  // (history) state a live frame had already applied -- silently reverting
+  // to stale data with nothing to trigger a re-render.
+  //
+  // `liveConfigApplied` makes the live path latch permanently authoritative:
+  // once any `config` frame (or a `POST /config/target` response, which is
+  // just as fresh) has been applied, the slower `GET /config` snapshot is
+  // known-stale by the time it arrives and is discarded rather than applied.
+  let liveConfigApplied = false;
+  // History has no single "current value" to overwrite, so it uses a queue
+  // instead of a latch: a `done` completion that lands before `GET /answers`
+  // resolves is held here and replayed *after* the snapshot renders, instead
+  // of being added straight to a DOM the snapshot is about to clear.
+  let historySnapshotLoaded = false;
+  const queuedLiveHistoryEntries = [];
+
   function parseAnswerTitle(text) {
     const match = /^#[ \t]+(.+)$/m.exec(text);
     return match ? match[1].trim() : null;
@@ -67,7 +87,10 @@
       const res = await fetch('/config');
       if (!res.ok) return;
       const body = await res.json();
-      applyConfig(body.targetWindow);
+      // A live `config` frame (or this client's own `POST /config/target`)
+      // may have already landed while this fetch was in flight -- that's
+      // strictly newer information than this snapshot, so don't clobber it.
+      if (!liveConfigApplied) applyConfig(body.targetWindow);
     } catch {
       // Left on the initial "no target" default (picker shown, empty list);
       // `loadWindows()`'s own error path reports the underlying failure.
@@ -127,7 +150,9 @@
       const body = await res.json();
       // The `config` SSE frame will also arrive shortly and call this again
       // with the same value -- `applyConfig` is idempotent, so that's a
-      // harmless no-op re-render, not double state.
+      // harmless no-op re-render, not double state. Latched the same as a
+      // live SSE frame: this response is at least as fresh as one.
+      liveConfigApplied = true;
       applyConfig(body.targetWindow);
     } catch (err) {
       pickerError.hidden = false;
@@ -216,10 +241,21 @@
       // newest logged entry lands on top, matching where `addHistoryEntry`
       // (called live, on a fresh `done`) always inserts.
       for (const entry of entries) addHistoryEntry(entry);
-      if (entries.length === 0) historyList.appendChild(emptyHint('No answers yet.'));
+      if (entries.length === 0 && queuedLiveHistoryEntries.length === 0) {
+        historyList.appendChild(emptyHint('No answers yet.'));
+      }
     } catch {
       // Best-effort: a failed load just leaves the list empty rather than
       // blocking the rest of the page.
+    } finally {
+      // Whether the fetch succeeded or not, the snapshot phase is over --
+      // any `done` completion that arrived while it was in flight was queued
+      // rather than rendered (it would have been wiped by `innerHTML = ''`
+      // above, or by a future retry); replay it now, on top of whatever the
+      // snapshot just rendered.
+      historySnapshotLoaded = true;
+      for (const entry of queuedLiveHistoryEntries) addHistoryEntry(entry);
+      queuedLiveHistoryEntries.length = 0;
     }
   }
 
@@ -268,14 +304,20 @@
       // non-null here: `start` (and so `done`) can only follow a `POST
       // /solve` that itself required a configured target.
       if (!isBail && currentTarget !== null) {
-        addHistoryEntry({
+        const entry = {
           title,
           text: liveText,
           timestamp: new Date().toISOString(),
           model: '',
           usage: data.usage,
           target: currentTarget,
-        });
+        };
+        // If the initial `GET /answers` snapshot hasn't rendered yet,
+        // adding straight to the DOM here would just be wiped out by its
+        // `innerHTML = ''` once it resolves -- queue it and `loadHistory()`
+        // replays the queue right after rendering the snapshot instead.
+        if (historySnapshotLoaded) addHistoryEntry(entry);
+        else queuedLiveHistoryEntries.push(entry);
       }
     });
 
@@ -303,6 +345,7 @@
     // through the same `applyConfig` the picker's own POST response uses.
     source.addEventListener('config', (event) => {
       const data = JSON.parse(event.data);
+      liveConfigApplied = true;
       applyConfig(data.target);
     });
   }

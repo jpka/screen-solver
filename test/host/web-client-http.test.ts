@@ -203,6 +203,24 @@ describe('POST /config/target', () => {
     assert.deepEqual(await response.json(), { error: 'bad_request' });
   });
 
+  it('rejects an oversized body with 413 and leaves the target untouched (review fix: readJsonBody was previously unbounded)', async (t) => {
+    const h = await startTestServer(t, { initialTarget: TARGET });
+
+    // Comfortably over `MAX_JSON_BODY_BYTES` (64 KiB) -- a real
+    // `{processName, title}` payload is a few dozen bytes, so this is purely
+    // an attacker-shaped body, not a realistic client request.
+    const oversized = JSON.stringify({ processName: 'chrome.exe', title: 'x'.repeat(200_000) });
+
+    const response = await fetch(`${h.server.url}/config/target`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: oversized,
+    });
+    assert.equal(response.status, 413);
+    assert.deepEqual(await response.json(), { error: 'payload_too_large' });
+    assert.deepEqual(h.configStore.get().targetWindow, TARGET, 'the prior target survives a rejected update');
+  });
+
   it('answers 503 when no configStore is wired', async (t) => {
     const h = await startTestServer(t, { withConfigStore: false });
     const response = await fetch(`${h.server.url}/config/target`, {

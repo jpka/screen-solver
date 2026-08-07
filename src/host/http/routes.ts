@@ -9,7 +9,7 @@ import type { Provider } from '../provider/types.ts';
 import { createEventBroadcaster } from '../solve/broadcaster.ts';
 import { startSolveLoop, type SolveLoop } from '../solve/loop.ts';
 import type { SolveOutcomeEvent } from '../solve/types.ts';
-import { readJsonBody, sendJson, type Route } from './router.ts';
+import { PayloadTooLargeError, readJsonBody, sendJson, type Route } from './router.ts';
 
 export interface HostRoutesDeps {
   /**
@@ -193,8 +193,10 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
       // #33: the picker's "commit a choice" action. A JSON body of
       // `{processName, title}` sets the target; an explicit `null` body (or
       // no body at all -- `readJsonBody`'s own empty-body default) clears it.
-      // Anything else is `400`, same status `router.ts`'s own bad-URL guard
-      // already uses for "this request doesn't make sense".
+      // A malformed body (bad shape or bad JSON) is `400`, same status
+      // `router.ts`'s own bad-URL guard already uses for "this request
+      // doesn't make sense"; a body over `readJsonBody`'s own byte cap is
+      // `413`.
       method: 'POST',
       path: '/config/target',
       handle: async ({ req, res }) => {
@@ -206,8 +208,12 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
         let body: unknown;
         try {
           body = await readJsonBody(req);
-        } catch {
-          sendJson(res, 400, { error: 'bad_request' });
+        } catch (error) {
+          if (error instanceof PayloadTooLargeError) {
+            sendJson(res, 413, { error: 'payload_too_large' });
+          } else {
+            sendJson(res, 400, { error: 'bad_request' });
+          }
           return;
         }
 
