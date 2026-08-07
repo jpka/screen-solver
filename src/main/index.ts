@@ -1,7 +1,8 @@
-import { app } from 'electron';
+import { app, type BrowserWindow } from 'electron';
 import { bootstrapHost, type StartedHost } from '../host/bootstrap.ts';
 import { isStartupError } from '../host/errors.ts';
 import { consoleLogger } from '../host/logger.ts';
+import { createRealCaptureSessionOpener } from './capture-session.ts';
 import { createHiddenWindow } from './hidden-window.ts';
 import { enumerateOpenWindows } from './window-enumeration.ts';
 
@@ -28,12 +29,24 @@ app.setName('screen-solver');
  * start into a message and an exit code.
  */
 async function main(): Promise<void> {
+  // Resolved once the hidden renderer actually exists (below, after
+  // `app.whenReady()`). `bootstrapHost` may start a capture session before
+  // that point if a target is already configured (#30's "open at startup"
+  // rule) -- `createRealCaptureSessionOpener` awaits this rather than
+  // requiring the window up front, so that doesn't deadlock or force the
+  // window to be created before the API key is out of `process.env`.
+  let hiddenWindowCreated: (window: BrowserWindow) => void;
+  const hiddenWindowReady = new Promise<BrowserWindow>((resolve) => {
+    hiddenWindowCreated = resolve;
+  });
+
   const result = await bootstrapHost({
     env: process.env,
     stateRoot: app.getPath('userData'),
     acquireInstanceLock: () => app.requestSingleInstanceLock(),
     logger: consoleLogger,
     enumerateWindows: enumerateOpenWindows,
+    openCaptureSession: createRealCaptureSessionOpener(hiddenWindowReady),
   });
 
   if (result.status === 'already-running') {
@@ -64,7 +77,7 @@ async function main(): Promise<void> {
   });
 
   await app.whenReady();
-  await createHiddenWindow();
+  hiddenWindowCreated!(await createHiddenWindow());
 }
 
 main().catch((error: unknown) => {

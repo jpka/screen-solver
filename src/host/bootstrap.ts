@@ -1,5 +1,10 @@
 import { API_KEY_ENV_VAR, takeApiKey } from './api-key.ts';
 import { readHttpBinding, type HttpBinding } from './binding.ts';
+import {
+  startCaptureSessionCoordinator,
+  type CaptureSessionCoordinator,
+} from './capture/session-coordinator.ts';
+import type { OpenCaptureSession } from './capture/types.ts';
 import { loadConfigStore, type ConfigStore } from './config/store.ts';
 import type { EnumerateWindows } from './config/types.ts';
 import { createHostRoutes } from './http/routes.ts';
@@ -12,6 +17,9 @@ import {
 import type { Logger } from './logger.ts';
 import type { Secret } from './secret.ts';
 import { ensureStateRoot } from './state-root.ts';
+
+/** No opener was injected. Nothing ever opens, which is a safe default for tests that don't care about capture. */
+const NEVER_OPENS: OpenCaptureSession = () => Promise.reject(new Error('No capture session opener configured.'));
 
 /**
  * Everything the startup sequence needs from the outside world.
@@ -43,6 +51,14 @@ export interface HostRuntime {
    * config.
    */
   readonly enumerateWindows?: EnumerateWindows;
+  /**
+   * Opens a live capture session for one target window (#30). Electron
+   * supplies the real implementation (`src/main/capture-session.ts`); tests
+   * supply a fake. Left unset, the capture session coordinator is
+   * constructed but never actually opens anything — the same "safe default"
+   * shape as `enumerateWindows`.
+   */
+  readonly openCaptureSession?: OpenCaptureSession;
 }
 
 /** The state the app lives in for the rest of its life. */
@@ -54,6 +70,8 @@ export interface StartedHost {
   readonly server: ListeningHttpServer;
   /** #28's config surface: target window plus (reserved) provider selection, live-reloadable with no restart. */
   readonly configStore: ConfigStore;
+  /** #30's capture session lifecycle: one session held open for the current target, reopened on every change. */
+  readonly captureSessionCoordinator: CaptureSessionCoordinator;
   shutdown(): Promise<void>;
 }
 
@@ -92,6 +110,17 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
     enumerateWindows: runtime.enumerateWindows,
   });
 
+  // Not awaited: opening a session can take a moment (in production it waits
+  // on the hidden renderer), and there is no reason to hold the HTTP bind
+  // hostage to it. It's still "opened at startup" in the sense the spec
+  // means -- kicked off here, before the first client can ever connect.
+  const captureSessionCoordinator = startCaptureSessionCoordinator({
+    initialTarget: configStore.get().targetWindow,
+    onChange: configStore.onChange,
+    openSession: runtime.openCaptureSession ?? NEVER_OPENS,
+    logger,
+  });
+
   const startServer = runtime.startHttpServer ?? defaultStartHttpServer;
   const server = await startServer({
     binding,
@@ -110,7 +139,11 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
       binding: { host: server.host, port: server.port },
       server,
       configStore,
-      shutdown: () => server.close(),
+      captureSessionCoordinator,
+      shutdown: async () => {
+        await captureSessionCoordinator.stop();
+        await server.close();
+      },
     },
   };
 }

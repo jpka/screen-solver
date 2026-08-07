@@ -1,7 +1,7 @@
 import { desktopCapturer } from 'electron';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { EnumerateWindows, WindowInfo } from '../host/config/types.ts';
+import type { EnumerateWindows, TargetWindowIdentity, WindowInfo } from '../host/config/types.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -42,6 +42,33 @@ export const enumerateOpenWindows: EnumerateWindows = async () => {
   }
   return windows;
 };
+
+/**
+ * Finds the `desktopCapturer` source id for one target window (#30's capture
+ * session needs this; enumeration alone only ever hands back process
+ * name + title, never the opaque source id `getUserMedia` requires).
+ *
+ * Reuses the exact same title-then-process pairing {@link enumerateOpenWindows}
+ * uses, just narrowed to one identity instead of listing everything — so the
+ * two stay consistent by construction rather than by two independently
+ * maintained matching rules. Returns `null` if nothing currently matches both
+ * fields (the window may have closed, moved desktops, or changed title since
+ * it was last enumerated).
+ */
+export async function findCaptureSourceId(target: TargetWindowIdentity): Promise<string | null> {
+  const [sources, processTitles] = await Promise.all([
+    desktopCapturer.getSources({ types: ['window'] }),
+    listProcessWindowTitles(),
+  ]);
+
+  for (const source of sources) {
+    const title = source.name.trim();
+    if (title !== target.title) continue;
+    if (processTitles.get(title) !== target.processName) continue;
+    return source.id;
+  }
+  return null;
+}
 
 interface ProcessWindowRow {
   readonly ProcessName: string;
