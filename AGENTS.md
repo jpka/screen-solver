@@ -44,6 +44,8 @@ constructor parameter properties.
 ```
 src/host/     plain Node. Imports Electron nowhere. All decision logic.
 src/host/provider/  the model call, behind one swappable seam (#27).
+src/host/config/    config.json + target-window resolution, behind an
+                    injected enumerator seam (#28).
 src/main/     Electron main: thin. userData path, single-instance lock,
               the one hidden BrowserWindow, exit codes. Nothing to decide here.
 static/       assets loaded/served as-is; not compiled, not copied by the build.
@@ -67,6 +69,20 @@ is domain logic that never touches the network, and the suite drives real
 streams and real failure shapes through both with no server and no fixtures.
 Reach for an SDK only when the protocol is genuinely more than request/response,
 and say why in the PR.
+
+**OS-specific capabilities** (established by #28). Some capabilities (window
+enumeration; capture later) only exist through Electron/Windows APIs. Same
+seam as everything else in `src/host`: define the capability as an injected
+function type in `src/host` (`EnumerateWindows` in
+`src/host/config/types.ts`), give tests a fixed fake, and put the one real
+implementation in `src/main`, wired into `bootstrapHost`'s caller
+(`src/main/index.ts`) alongside `acquireInstanceLock`. `config.json`'s
+`targetWindow` is identified by process name + title rather than a handle,
+since handles don't survive a restart; `src/main/window-enumeration.ts` is the
+worked example of what that costs — `desktopCapturer` lists windows but not
+their owning process, so it's paired with a separate `Get-Process` query by
+title. Like the WGC capture mechanism, this needs a real composited desktop
+and stays manual/E2E-verified rather than unit-tested.
 
 ### Environment setup
 

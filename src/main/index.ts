@@ -3,6 +3,7 @@ import { bootstrapHost, type StartedHost } from '../host/bootstrap.ts';
 import { isStartupError } from '../host/errors.ts';
 import { consoleLogger } from '../host/logger.ts';
 import { createHiddenWindow } from './hidden-window.ts';
+import { enumerateOpenWindows } from './window-enumeration.ts';
 
 const EXIT_OK = 0;
 const EXIT_REFUSED_TO_START = 1;
@@ -32,6 +33,7 @@ async function main(): Promise<void> {
     stateRoot: app.getPath('userData'),
     acquireInstanceLock: () => app.requestSingleInstanceLock(),
     logger: consoleLogger,
+    enumerateWindows: enumerateOpenWindows,
   });
 
   if (result.status === 'already-running') {
