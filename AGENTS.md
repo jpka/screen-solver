@@ -157,22 +157,43 @@ interrupt-and-replace means two outcomes can genuinely be in flight at once,
 and unserialized concurrent `fs.appendFile` calls race on disk-completion
 order rather than preserving call order.
 
-**Shutdown ordering** (established by #31, tightened in review). Anything that
-persists on its way out has to be drained by `StartedHost.shutdown()`
-(`bootstrap.ts`) *before* the resources it depends on are torn down, and the
-drain itself has to be bounded. The worked example is the solve loop:
-`SolveLoop.stop()` aborts the in-flight attempt (rather than politely waiting
-out a model that may keep talking for another minute), awaits the
-`interrupted` outcome's write, and latches the loop closed so `trigger()`
-returns `false` — `POST /solve` answers `503 shutting_down` for the moment the
-server is still listening but nothing is left to run the work. Then
-`SolveLogRecorder.drain()` catches any superseded attempt's write still queued
-behind it. The whole phase races `SOLVE_DRAIN_TIMEOUT_MS`, because abort is
-cooperative: a provider ignoring its signal, or a hung `fs.appendFile`, must
-not keep the process alive after the user quit. Losing the last line is the
-lesser failure, and it's logged when it happens. A future subsystem with the
-same shape belongs in the same bounded phase, not in a second unbounded await
+**Shutdown ordering** (established by #31, tightened across three rounds of
+review). Anything that persists on its way out has to be drained by
+`StartedHost.shutdown()` (`bootstrap.ts`) *before* the resources it depends on
+are torn down, and the drain itself has to be bounded. The worked example is
+the solve loop: `SolveLoop.stop()` aborts the in-flight attempt (rather than
+politely waiting out a model that may keep talking for another minute),
+awaits *every* attempt still unwinding (not only the most recently triggered
+one -- see below), and latches the loop closed so `trigger()` returns `false`
+— `POST /solve` answers `503 shutting_down` for the moment the server is
+still listening but nothing is left to run the work. Then
+`SolveLogRecorder.drain()` catches any write still queued behind those.
+The whole phase races `SOLVE_DRAIN_TIMEOUT_MS`, because abort is cooperative:
+a provider ignoring its signal, or a hung `fs.appendFile`, must not keep the
+process alive after the user quit. Losing the last line is the lesser
+failure, and it's logged when it happens. A future subsystem with the same
+shape belongs in the same bounded phase, not in a second unbounded await
 appended after it.
+
+**Track every in-flight unit of work a shutdown must wait for, not just the
+newest one.** `SolveLoop`'s internal state used to hold a single `attempt`
+slot, overwritten on every `trigger()` -- correct for `settled()` (a test
+convenience that only ever cares about the latest call) but wrong for
+shutdown: a target change supersedes the previous attempt by aborting it, but
+that old attempt keeps running until *it* notices the abort and unwinds,
+which can still be in flight when a second change supersedes the new one too.
+`stop()` awaiting only the newest slot could resolve while an older,
+already-superseded attempt was mid-unwind and about to persist its own
+`interrupted` outcome -- silently losing it, a failure `SolveLogRecorder.drain()`
+can't catch either, since it only awaits writes already enqueued into its
+chain, not ones a still-running attempt hasn't gotten to yet. Fixed by
+tracking every triggered attempt in a `Set`, self-removing on settle, and
+having `stop()` await the whole set. The general lesson for anything shaped
+like "the latest one supersedes the previous one, and shutdown needs to
+observe all of it": a single mutable slot naturally answers "what should
+`trigger()` return next", but shutdown's question is "what is still
+outstanding", and those are different questions once more than one thing can
+be in flight at once.
 
 The bound on `bootstrapHost`'s own promise isn't the end of the story in
 Electron, though (`src/main/index.ts`, tightened in review): `settlesWithin`

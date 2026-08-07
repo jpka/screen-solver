@@ -309,6 +309,143 @@ describe('POST /solve + GET /events', () => {
     assert.deepEqual(h.outcomes, [{ type: 'interrupted', text: '# Two Sum\npartial' }]);
   });
 
+  it(
+    "stop() waits for a superseded attempt still unwinding after abort, not just the latest one " +
+      '(#40 review fix: superseded persistence escapes shutdown)',
+    async (t) => {
+      // A target change supersedes the previous attempt by aborting it and
+      // starting a new one -- but the old attempt keeps running until *it*
+      // notices the abort. This provider's first call is built to notice on
+      // command (`finishUnwind()`) rather than the instant it's aborted, so
+      // the test can force the exact ordering the review flagged: the second,
+      // superseding attempt finishes completely -- onOutcome write and all --
+      // while the first is still stuck mid-unwind.
+      interface ManualCall {
+        readonly signal: AbortSignal | undefined;
+        push(event: SolveEvent): void;
+        finishUnwind(): void;
+      }
+
+      function manualAbortProvider(): {
+        provider: Provider;
+        calls: ManualCall[];
+        waitForCall(n: number): Promise<ManualCall>;
+      } {
+        const calls: ManualCall[] = [];
+        const waiters = new Map<number, (call: ManualCall) => void>();
+
+        const provider: Provider = {
+          model: 'fake-model',
+          solve(_image, options) {
+            const queue: SolveEvent[] = [];
+            let notify: (() => void) | null = null;
+            let readyToUnwind = false;
+
+            const call: ManualCall = {
+              signal: options?.signal,
+              push(event) {
+                queue.push(event);
+                const wake = notify;
+                notify = null;
+                wake?.();
+              },
+              finishUnwind() {
+                readyToUnwind = true;
+                const wake = notify;
+                notify = null;
+                wake?.();
+              },
+            };
+            calls.push(call);
+            waiters.get(calls.length)?.(call);
+
+            return {
+              [Symbol.asyncIterator]() {
+                return {
+                  async next(): Promise<IteratorResult<SolveEvent>> {
+                    for (;;) {
+                      if (queue.length > 0) {
+                        return { value: queue.shift() as SolveEvent, done: false };
+                      }
+                      if (options?.signal?.aborted === true && readyToUnwind) {
+                        return { value: undefined, done: true };
+                      }
+                      await new Promise<void>((resolve) => {
+                        notify = resolve;
+                      });
+                    }
+                  },
+                };
+              },
+            };
+          },
+        };
+
+        return {
+          provider,
+          calls,
+          waitForCall(n) {
+            const existing = calls[n - 1];
+            if (existing !== undefined) return Promise.resolve(existing);
+            return new Promise((resolve) => waiters.set(n, resolve));
+          },
+        };
+      }
+
+      const manual = manualAbortProvider();
+      const h = await startTestServer(t, { provider: manual.provider });
+
+      const first = await fetch(`${h.server.url}/solve`, { method: 'POST' });
+      assert.equal(first.status, 202);
+      const call1 = await manual.waitForCall(1);
+      call1.push({ type: 'delta', text: 'stale partial' });
+      await flush();
+
+      const second = await fetch(`${h.server.url}/solve`, { method: 'POST' });
+      assert.equal(second.status, 202);
+      const call2 = await manual.waitForCall(2);
+      assert.equal(call1.signal?.aborted, true, 'the first attempt was aborted by the second');
+
+      call2.push({
+        type: 'done',
+        usage: { inputTokens: 1, outputTokens: 1, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+        stopReason: 'end_turn',
+      });
+      await flush();
+      assert.deepEqual(
+        h.outcomes.map((o) => o.type),
+        ['done'],
+        'precondition: the superseding attempt has already fully settled, including its own onOutcome write',
+      );
+
+      let stopSettled = false;
+      const stopPromise = h.solveLoop.stop().then(() => {
+        stopSettled = true;
+      });
+      await flush();
+      assert.equal(
+        stopSettled,
+        false,
+        'stop() must not resolve while the superseded first attempt is still unwinding -- its onOutcome write has not happened yet, and an earlier version of this method would resolve here anyway because it only tracked the latest attempt',
+      );
+
+      call1.finishUnwind();
+      await stopPromise;
+      assert.equal(stopSettled, true);
+
+      assert.deepEqual(h.outcomes.map((o) => o.type), ['done', 'interrupted']);
+      const interrupted = h.outcomes[1];
+      assert.equal(interrupted?.type, 'interrupted');
+      if (interrupted?.type === 'interrupted') {
+        assert.equal(
+          interrupted.text,
+          'stale partial',
+          "the superseded attempt's own accumulated text was persisted by stop() waiting for it, not lost",
+        );
+      }
+    },
+  );
+
   it('accepts with 202, then streams start -> delta* -> done{usage} to a connected client', async (t) => {
     const h = await startTestServer(t);
     const events = await connectEvents(`${h.server.url}/events`);
