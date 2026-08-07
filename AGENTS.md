@@ -116,9 +116,11 @@ reusing:
   but call `subscribe(res)` and unregister on the request's `close`; this is
   the concrete shape `router.ts`'s "handlers get the raw `res`, so a
   streaming endpoint can hijack it... without fighting the router" comment
-  was anticipating. It also holds the in-flight accumulated answer text
-  in memory (`currentText()`) for #31's future `sync{text}` catch-up to read
-  — #29 doesn't implement that catch-up, just leaves the text reachable.
+  was anticipating. It also holds the in-flight accumulated answer text in
+  memory (`currentText()`), which `subscribe()` reads to send a late-joining
+  client `sync{text}` instead of nothing when a solve is already in flight
+  (#31) — a flag (set on `start()`, cleared on `done()`/`error()`) is the
+  only extra state this needed.
 - **The internal outcome bus** (`solve/types.ts`'s `SolveOutcome`,
   `SolveLoopDeps.onOutcome`) is a small explicit union —
   `done`/`interrupted`/`error`, each carrying the accumulated text — reported
@@ -126,15 +128,34 @@ reusing:
   deliberately *not* on the SSE wire: the wire vocabulary has no
   `interrupted` kind, since an interruption's only wire-visible effect is
   "the old stream stops advancing and a fresh `start` begins immediately".
-  This bus is how #31 (or any future consumer) learns an attempt was
-  interrupted without the wire protocol needing a fourth terminal event kind.
   Same "small union over a class" style as `ConfigChangeEvent` and
-  `SolveEvent`.
+  `SolveEvent`. `onOutcome` itself is wrapped at the call site into
+  `SolveOutcomeEvent { outcome, target, model }` rather than adding those two
+  fields to every union variant — #31's persistence layer is the one real
+  consumer, and needs `target`/`model` regardless of which variant it got.
 
 A pre-flight guard failure (vanished/minimized target, black/zero-size
 frame) never touches either of these — no broadcast, no outcome, no provider
 call — which is the structural way "silent no-spend" is enforced: the code
 simply has no event to emit for that path, rather than a flag suppressing one.
+
+**Durable JSONL logs** (established by #31). `src/host/logs/jsonl.ts`'s
+`openJsonlFile<T>({ path })` is the reusable half of `answers.jsonl` /
+`usage.jsonl`: one JSON object per `\n`-terminated line, `append()` via
+`fs.appendFile`'s OS append mode (`'a'` flag — concurrent appends from this
+process don't clobber each other), `readAll()` re-reading the file fresh
+every call rather than keeping an in-memory cache in sync (`GET /answers`'s
+own requirement). `answer-log.ts`/`usage-log.ts` are both a fixed filename
+plus an entry type wrapped around it; a future status log (#32) is expected
+to be a third instance of exactly this shape rather than its own mechanism.
+`logs/recorder.ts`'s `createSolveLogRecorder` is the one thing that isn't
+generic: it subscribes to the outcome bus above and decides, per outcome,
+which of the two logs get a line (a bail or an `error` never reaches
+`answers.jsonl`; every attempted call reaches `usage.jsonl`) — and
+serializes its own writes through an internal promise chain, since
+interrupt-and-replace means two outcomes can genuinely be in flight at once,
+and unserialized concurrent `fs.appendFile` calls race on disk-completion
+order rather than preserving call order.
 
 ### Environment setup
 

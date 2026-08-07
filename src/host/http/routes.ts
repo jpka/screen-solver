@@ -2,11 +2,12 @@ import type { IsTargetMinimized } from '../capture/types.ts';
 import type { CaptureSessionCoordinator } from '../capture/session-coordinator.ts';
 import type { ConfigStore } from '../config/store.ts';
 import type { EnumerateWindows } from '../config/types.ts';
+import type { AnswerLog } from '../logs/answer-log.ts';
 import type { Logger } from '../logger.ts';
 import type { Provider } from '../provider/types.ts';
 import { createEventBroadcaster } from '../solve/broadcaster.ts';
 import { startSolveLoop } from '../solve/loop.ts';
-import type { SolveOutcome } from '../solve/types.ts';
+import type { SolveOutcomeEvent } from '../solve/types.ts';
 import { sendJson, type Route } from './router.ts';
 
 export interface HostRoutesDeps {
@@ -20,8 +21,10 @@ export interface HostRoutesDeps {
   readonly enumerateWindows?: EnumerateWindows;
   /** #30's minimized check, the other half of the pre-flight guard. Left unset, no target is ever treated as minimized. */
   readonly isTargetMinimized?: IsTargetMinimized;
-  /** #29's internal outcome bus -- see `src/host/solve/types.ts`. #31 is the eventual consumer. */
-  readonly onOutcome?: (outcome: SolveOutcome) => void;
+  /** #29's internal outcome bus -- see `src/host/solve/types.ts`. #31's `bootstrap.ts` wires this to a `SolveLogRecorder` that writes `answers.jsonl`/`usage.jsonl`. */
+  readonly onOutcome?: (event: SolveOutcomeEvent) => void | Promise<void>;
+  /** #31's `answers.jsonl` reader -- `GET /answers` serves its full backlog. Left unset, `GET /answers` answers `[]` (the same "nothing configured yet" default `enumerateWindows`/`isTargetMinimized` already use). */
+  readonly answerLog?: AnswerLog;
   readonly logger?: Logger;
 }
 
@@ -93,6 +96,19 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): Route[] {
       handle: ({ req, res }) => {
         const unsubscribe = broadcaster.subscribe(res);
         req.on('close', unsubscribe);
+      },
+    },
+    {
+      method: 'GET',
+      path: '/answers',
+      handle: async ({ res }) => {
+        // Independent of the live `/events` connection (spec): reads
+        // `answers.jsonl` fresh on every request, no in-memory cache to keep
+        // in sync -- `deps.answerLog` itself already has this property
+        // (`logs/jsonl.ts`'s `readAll()`), so there's nothing extra to do
+        // here beyond serving whatever it hands back.
+        const entries = deps.answerLog === undefined ? [] : await deps.answerLog.readAll();
+        sendJson(res, 200, entries);
       },
     },
   ];

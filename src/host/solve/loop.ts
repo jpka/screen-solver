@@ -6,7 +6,7 @@ import type { EnumerateWindows, TargetWindowIdentity } from '../config/types.ts'
 import { silentLogger, type Logger } from '../logger.ts';
 import type { Provider } from '../provider/types.ts';
 import type { EventBroadcaster } from './broadcaster.ts';
-import type { SolveOutcome } from './types.ts';
+import type { SolveOutcomeEvent } from './types.ts';
 
 /** Safe default when no `enumerateWindows` is injected: every target looks vanished -- the same "no windows" fallback `config/store.ts` and `bootstrap.ts` already use. */
 const NO_WINDOWS: EnumerateWindows = () => Promise.resolve([]);
@@ -22,11 +22,15 @@ export interface SolveLoopDeps {
   readonly isTargetMinimized?: IsTargetMinimized;
   /**
    * Fired once per solve attempt that actually reached the provider, with its
-   * final outcome -- see `types.ts` for exactly what "reached the provider"
-   * excludes. Left unset, outcomes are simply not observed (safe default for
-   * callers that don't care, e.g. most tests).
+   * final outcome plus which window/model it belongs to -- see `types.ts`
+   * for exactly what "reached the provider" excludes and why `target`/
+   * `model` are wrapped around the outcome rather than folded into it. Left
+   * unset, outcomes are simply not observed (safe default for callers that
+   * don't care, e.g. most tests). May return a promise; `runAttempt` awaits
+   * it, so `SolveLoop.settled()` only resolves once persistence (#31) has
+   * actually finished writing, not just been kicked off.
    */
-  readonly onOutcome?: (outcome: SolveOutcome) => void;
+  readonly onOutcome?: (event: SolveOutcomeEvent) => void | Promise<void>;
   readonly logger?: Logger;
 }
 
@@ -113,11 +117,19 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
           break;
         case 'done':
           deps.broadcaster.done(event.usage);
-          deps.onOutcome?.({ type: 'done', text, usage: event.usage, stopReason: event.stopReason });
+          await deps.onOutcome?.({
+            outcome: { type: 'done', text, usage: event.usage, stopReason: event.stopReason },
+            target,
+            model: deps.provider.model,
+          });
           return;
         case 'error':
           deps.broadcaster.error(event.kind);
-          deps.onOutcome?.({ type: 'error', kind: event.kind, message: event.message, text });
+          await deps.onOutcome?.({
+            outcome: { type: 'error', kind: event.kind, message: event.message, text },
+            target,
+            model: deps.provider.model,
+          });
           return;
       }
     }
@@ -126,7 +138,7 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     // no throw, no terminal event -- this is the only documented way the loop
     // reaches here without a `done`/`error` above.
     if (signal.aborted) {
-      deps.onOutcome?.({ type: 'interrupted', text });
+      await deps.onOutcome?.({ outcome: { type: 'interrupted', text }, target, model: deps.provider.model });
     } else {
       logger.error(
         'solve loop: the provider iterable ended without a terminal event and no abort was requested ' +

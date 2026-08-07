@@ -1,3 +1,4 @@
+import type { TargetWindowIdentity } from '../config/types.ts';
 import type { ProviderErrorKind, Usage } from '../provider/types.ts';
 
 /**
@@ -39,3 +40,26 @@ export type SolveOutcome =
       /** Usually empty, but not always -- the provider seam can fail after some text has already streamed (spec: "stream dies mid-answer"). */
       readonly text: string;
     };
+
+/**
+ * What `SolveLoopDeps.onOutcome` (`loop.ts`) actually receives: a
+ * {@link SolveOutcome} plus which window and model it belongs to.
+ *
+ * `SolveOutcome` itself deliberately stays free of these two fields --
+ * `target`/`model` would otherwise have to be duplicated across all three
+ * union variants for no benefit, since every consumer of the outcome bus
+ * needs them regardless of which variant it got. `runAttempt` (`loop.ts`)
+ * already has both in scope (`target` is its own parameter; `model` is
+ * `deps.provider.model`), so wrapping them at the call site costs nothing
+ * there and keeps `SolveOutcome`'s existing "small explicit union" shape
+ * (and every test that already destructures it) untouched.
+ *
+ * #31's persistence layer (`src/host/logs/`) is the one real consumer: it
+ * needs `target`/`model` to write `answers.jsonl`/`usage.jsonl` entries, and
+ * needs the outcome union to decide *whether* to write one at all.
+ */
+export interface SolveOutcomeEvent {
+  readonly outcome: SolveOutcome;
+  readonly target: TargetWindowIdentity;
+  readonly model: string;
+}

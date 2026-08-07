@@ -162,7 +162,9 @@ async function startTestServer(
     provider: provider.provider,
     enumerateWindows,
     isTargetMinimized: async () => minimized,
-    onOutcome: (outcome) => outcomes.push(outcome),
+    onOutcome: (event) => {
+      outcomes.push(event.outcome);
+    },
     logger: silentLogger,
     ...overrides,
   });

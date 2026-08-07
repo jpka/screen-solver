@@ -9,6 +9,9 @@ import { loadConfigStore, type ConfigStore } from './config/store.ts';
 import type { EnumerateWindows } from './config/types.ts';
 import { createHostRoutes } from './http/routes.ts';
 import type { Route } from './http/router.ts';
+import { createAnswerLog } from './logs/answer-log.ts';
+import { createSolveLogRecorder } from './logs/recorder.ts';
+import { createUsageLog } from './logs/usage-log.ts';
 import {
   startHttpServer as defaultStartHttpServer,
   type ListeningHttpServer,
@@ -137,6 +140,14 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
     enumerateWindows: runtime.enumerateWindows,
   });
 
+  // #31's durable memory: `answers.jsonl` / `usage.jsonl` under the same
+  // state root. `answerLog` is also handed to `createHostRoutes` directly
+  // (`GET /answers` reads it fresh on every request); `usageLog` only ever
+  // goes through the recorder below -- nothing else needs to read it back.
+  const answerLog = createAnswerLog({ stateRoot });
+  const usageLog = createUsageLog({ stateRoot });
+  const solveLogRecorder = createSolveLogRecorder({ answerLog, usageLog, logger });
+
   // Not awaited: opening a session can take a moment (in production it waits
   // on the hidden renderer), and there is no reason to hold the HTTP bind
   // hostage to it. It's still "opened at startup" in the sense the spec
@@ -159,6 +170,8 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
         provider,
         enumerateWindows: runtime.enumerateWindows,
         isTargetMinimized: runtime.isTargetMinimized,
+        onOutcome: (event) => solveLogRecorder.record(event),
+        answerLog,
         logger,
       }),
     logger,
