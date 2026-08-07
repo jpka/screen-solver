@@ -29,6 +29,21 @@
   /** @type {CanvasRenderingContext2D|null} */
   let ctx = null;
 
+  // Bumped by every open/close request. `openSession` is async (it awaits
+  // getUserMedia, which is not instantaneous), so a `close` -- or a newer
+  // `open` -- can arrive from main while a previous `openSession` call is
+  // still in flight. Main's own coordinator (src/host/capture/session-
+  // coordinator.ts) already serializes what it *asks for* via a generation
+  // counter, but its real opener (src/main/capture-session.ts) resolves as
+  // soon as the `open` IPC message is sent, not once the renderer has
+  // actually finished setting up the stream -- so a superseding `close` is
+  // routinely sent before that stream exists yet. Without this guard, such a
+  // `close` would arrive while `stream`/`videoEl` are still null (nothing to
+  // stop), and the in-flight `openSession` would then finish and assign a
+  // live stream anyone believes is closed -- a leaked session and a
+  // capture-indicator border lit for a target that was already deselected.
+  let sessionToken = 0;
+
   function stopStream() {
     if (stream) {
       for (const track of stream.getTracks()) track.stop();
@@ -49,28 +64,49 @@
    * function just does whatever main tells it to do.
    */
   async function openSession(sourceId) {
+    const token = (sessionToken += 1);
     stopStream();
 
     // getUserMedia's legacy `mandatory` constraint syntax is what Electron's
     // desktopCapturer integration actually requires; there is no standard
     // MediaTrackConstraints shape for "capture this specific window".
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        mandatory: {
-          chromeMediaSource: 'desktop',
-          chromeMediaSourceId: sourceId,
+    let newStream;
+    try {
+      newStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          mandatory: {
+            chromeMediaSource: 'desktop',
+            chromeMediaSourceId: sourceId,
+          },
         },
-      },
-    });
+      });
+    } catch (error) {
+      if (token !== sessionToken) return; // superseded before the grab even resolved; nothing to clean up
+      throw error;
+    }
 
+    if (token !== sessionToken) {
+      // A close (or a newer open) arrived while getUserMedia was in flight.
+      // Tear down what was just grabbed instead of adopting it as live.
+      for (const track of newStream.getTracks()) track.stop();
+      return;
+    }
+
+    stream = newStream;
     videoEl = document.createElement('video');
     videoEl.muted = true;
     videoEl.srcObject = stream;
     await videoEl.play();
+
+    if (token !== sessionToken) {
+      // Superseded again while awaiting play() -- tear down what was just built.
+      stopStream();
+    }
   }
 
   function closeSession() {
+    sessionToken += 1;
     stopStream();
   }
 
