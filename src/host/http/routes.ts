@@ -34,9 +34,10 @@ export interface HostRoutes {
    * The solve loop backing `POST /solve`, `null` when `configStore`/
    * `captureSessionCoordinator`/`provider` weren't all supplied (the same
    * condition that makes `POST /solve` answer `503` below). `bootstrap.ts`
-   * awaits `.settled()` on shutdown so the in-flight attempt's outcome --
-   * and #31's persistence of it -- finishes before the process exits,
-   * instead of being silently abandoned mid-write.
+   * calls `.stop()` on shutdown so the in-flight attempt's outcome -- and
+   * #31's persistence of it -- finishes before the process exits, instead of
+   * being silently abandoned mid-write, and so no *further* attempt can start
+   * in the window before the server stops listening.
    */
   readonly solveLoop: SolveLoop | null;
 }
@@ -99,7 +100,15 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
         // aborted right here. The pre-flight guards and the provider call for
         // this new solve run asynchronously, after the response has already
         // gone out (#29's own body: "This abort is synchronous with the 202").
-        solveLoop.trigger();
+        //
+        // The one way this comes back refused is shutdown having already begun
+        // (`SolveLoop.stop()`): the server is still listening for the moment it
+        // takes to close, but nothing is left to run or persist a new attempt,
+        // so say so rather than accepting work that will silently evaporate.
+        if (!solveLoop.trigger()) {
+          sendJson(res, 503, { error: 'shutting_down' });
+          return;
+        }
         sendJson(res, 202, { status: 'accepted' });
       },
     },

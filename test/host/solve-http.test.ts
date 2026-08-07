@@ -8,6 +8,7 @@ import { createHostRoutes, type HostRoutesDeps } from '../../src/host/http/route
 import { startHttpServer, type ListeningHttpServer } from '../../src/host/http/server.ts';
 import { silentLogger } from '../../src/host/logger.ts';
 import type { Provider, SolveEvent, SolveImage } from '../../src/host/provider/types.ts';
+import type { SolveLoop } from '../../src/host/solve/loop.ts';
 import type { SolveOutcome } from '../../src/host/solve/types.ts';
 import { tempStateRoot } from '../helpers/temp-state-root.ts';
 
@@ -131,6 +132,8 @@ interface Harness {
   readonly configStore: ConfigStore;
   readonly fakeProvider: FakeProvider;
   readonly outcomes: SolveOutcome[];
+  /** The loop behind `POST /solve`, so a test can drive its shutdown directly the way `bootstrap.ts` does. */
+  readonly solveLoop: SolveLoop;
   setFrame(frame: CapturedFrame | null): void;
   setMinimized(minimized: boolean): void;
   setPresent(present: boolean): void;
@@ -156,7 +159,7 @@ async function startTestServer(
 
   const captureSessionCoordinator = fakeCaptureCoordinator(async () => frame);
 
-  const { routes } = createHostRoutes({
+  const { routes, solveLoop } = createHostRoutes({
     configStore,
     captureSessionCoordinator,
     provider: provider.provider,
@@ -172,11 +175,14 @@ async function startTestServer(
   const server = await startHttpServer({ binding: { host: '127.0.0.1', port: 0 }, routes, logger: silentLogger });
   t.after(() => server.close());
 
+  assert.ok(solveLoop !== null, 'precondition: the harness always wires the solve loop');
+
   return {
     server,
     configStore,
     fakeProvider: provider,
     outcomes,
+    solveLoop,
     setFrame: (next) => {
       frame = next;
     },
@@ -267,6 +273,40 @@ describe('POST /solve + GET /events', () => {
     const response = await fetch(`${server.url}/solve`, { method: 'POST' });
     assert.equal(response.status, 503);
     assert.deepEqual(await response.json(), { error: 'not_ready' });
+  });
+
+  it('answers 503 and starts nothing once shutdown has stopped the loop (#40 review fix)', async (t) => {
+    const h = await startTestServer(t);
+
+    // The window the review flagged: shutdown has begun, but the HTTP server
+    // is still listening for the moment it takes to close.
+    await h.solveLoop.stop();
+
+    const response = await fetch(`${h.server.url}/solve`, { method: 'POST' });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: 'shutting_down' });
+
+    await flush();
+    assert.equal(h.fakeProvider.calls.length, 0, 'no provider call was started after shutdown began');
+    assert.equal(h.outcomes.length, 0, 'and so no outcome exists that shutdown would have failed to persist');
+  });
+
+  it('aborts the in-flight solve on stop() and persists it as interrupted (#40 review fix)', async (t) => {
+    const h = await startTestServer(t);
+
+    const response = await fetch(`${h.server.url}/solve`, { method: 'POST' });
+    assert.equal(response.status, 202);
+
+    const call = await h.fakeProvider.waitForCall(1);
+    call.push({ type: 'delta', text: '# Two Sum\npartial' });
+    await flush();
+
+    // The provider is still mid-stream and would never end on its own --
+    // `stop()` has to abort it, not just wait for it.
+    await h.solveLoop.stop();
+
+    assert.equal(call.signal?.aborted, true, 'the in-flight attempt was aborted, not merely waited on');
+    assert.deepEqual(h.outcomes, [{ type: 'interrupted', text: '# Two Sum\npartial' }]);
   });
 
   it('accepts with 202, then streams start -> delta* -> done{usage} to a connected client', async (t) => {

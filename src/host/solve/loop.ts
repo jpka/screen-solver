@@ -43,10 +43,33 @@ export interface SolveLoop {
    * immediately after -- the abort below is synchronous with that response;
    * everything else in this file happens after the response has already gone
    * out.
+   *
+   * Returns `false`, having done nothing at all, once {@link stop} has been
+   * called -- the one case where a trigger is genuinely refused rather than
+   * accepted. `POST /solve` turns that into a `503` rather than a lying `202`.
    */
-  trigger(): void;
+  trigger(): boolean;
   /** Resolves once the most recently triggered attempt has fully settled. Mainly for tests. */
   settled(): Promise<void>;
+  /**
+   * Shutdown: refuse further triggers, abort whatever attempt is in flight,
+   * and resolve once it has settled -- including the `onOutcome` write it
+   * makes on its way out (an aborted attempt that had reached the provider
+   * still reports `interrupted`, so a partial answer is persisted rather than
+   * lost).
+   *
+   * Two things this does that `settled()` alone can't. It *aborts* rather
+   * than merely waiting, so a still-streaming provider ends promptly instead
+   * of holding shutdown open for as long as the model feels like talking.
+   * And it latches the refusal, so a `POST /solve` arriving in the window
+   * between here and the HTTP server actually closing can't start an attempt
+   * nothing is left to wait for.
+   *
+   * Not a guarantee of promptness on its own: a provider that ignores its
+   * `AbortSignal`, or a pre-flight seam that never resolves, can still stall
+   * here. `bootstrap.ts` bounds the wait for that reason.
+   */
+  stop(): Promise<void>;
 }
 
 /**
@@ -76,8 +99,11 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
 
   let controller: AbortController | null = null;
   let attempt: Promise<void> = Promise.resolve();
+  let stopped = false;
 
-  function trigger(): void {
+  function trigger(): boolean {
+    if (stopped) return false;
+
     const previous = controller;
     const next = new AbortController();
     controller = next;
@@ -90,6 +116,15 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
         : runAttempt(target, next.signal).catch((error: unknown) => {
             logger.error(`solve loop: attempt failed unexpectedly: ${describeError(error)}`);
           });
+    return true;
+  }
+
+  async function stop(): Promise<void> {
+    stopped = true;
+    controller?.abort();
+    // Safe to await the single `attempt` slot: `stopped` is latched above, so
+    // nothing can reassign it out from under this await.
+    await attempt;
   }
 
   async function runAttempt(target: TargetWindowIdentity, signal: AbortSignal): Promise<void> {
@@ -150,6 +185,7 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
   return {
     trigger,
     settled: () => attempt,
+    stop,
   };
 }
 

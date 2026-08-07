@@ -39,6 +39,15 @@ function recordingLogger(): Logger & { lines: string[] } {
   };
 }
 
+/** A deferred promise, for synchronizing a test with a point it knows the code under test reached -- no arbitrary sleeps. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 interface Scenario {
   env: NodeJS.ProcessEnv;
   stateRoot: string;
@@ -360,5 +369,77 @@ describe('bootstrapHost', () => {
 
     const entries = await createAnswerLog({ stateRoot: s.stateRoot }).readAll();
     assert.equal(entries.length, 1, 'the in-flight answer was persisted, not abandoned mid-write by shutdown');
+  });
+
+  it('shutdown gives up on a solve that ignores its abort rather than hanging forever (#40 review fix)', async (t) => {
+    const s = await scenario(t);
+    const target: TargetWindowIdentity = { processName: 'chrome.exe', title: 'Two Sum - LeetCode' };
+    await writeFile(
+      join(s.stateRoot, CONFIG_FILE_NAME),
+      JSON.stringify({ targetWindow: target, provider: null }),
+    );
+
+    const frame: CapturedFrame = {
+      mediaType: 'image/jpeg',
+      bytes: new Uint8Array([1, 2, 3]),
+      width: 1200,
+      height: 800,
+      quality: 'ok',
+    };
+
+    // The pathological provider: its stream never ends and it never checks
+    // the `AbortSignal`, so aborting the attempt does nothing. Real-world
+    // stand-in for a wedged socket -- the case `settled()`/`stop()` alone
+    // can't get out of, which is why shutdown bounds the wait.
+    const started = deferred();
+    const provider: Provider = {
+      model: 'fake-model',
+      solve(): AsyncIterable<SolveEvent> {
+        return {
+          [Symbol.asyncIterator]() {
+            return {
+              next(): Promise<IteratorResult<SolveEvent>> {
+                started.resolve();
+                return new Promise<IteratorResult<SolveEvent>>(() => {});
+              },
+            };
+          },
+        };
+      },
+    };
+
+    const logger = recordingLogger();
+    const result = await bootstrapHost({
+      ...runtimeFor(s, logger),
+      provider,
+      solveDrainTimeoutMs: 50,
+      enumerateWindows: async () => [target],
+      isTargetMinimized: async () => false,
+      openCaptureSession: async () => ({
+        captureFrame: async () => frame,
+        close: async () => {},
+      }),
+    });
+    assert.equal(result.status, 'started');
+    if (result.status !== 'started') return;
+
+    await result.host.captureSessionCoordinator.settled();
+
+    const response = await fetch(`http://${LOOPBACK}:${result.host.binding.port}/solve`, { method: 'POST' });
+    assert.equal(response.status, 202);
+    await started.promise;
+
+    // The assertion is simply that this resolves at all -- before the fix it
+    // awaited the stuck attempt with no bound, and the process stayed up.
+    await result.host.shutdown();
+
+    assert.ok(
+      logger.lines.some((line) => line.includes('without waiting any longer')),
+      'giving up on the drain is reported, not silent',
+    );
+    await assert.rejects(
+      () => fetch(`http://${LOOPBACK}:${result.host.binding.port}/health`),
+      'the server really did close, rather than shutdown returning early with teardown left undone',
+    );
   });
 });
