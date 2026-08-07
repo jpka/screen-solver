@@ -16,6 +16,19 @@ import { hiddenRendererPage, hiddenRendererPreload } from './paths.ts';
  * send frames back, without giving that page's own script any access to
  * Node, `require`, or the raw `ipcRenderer`/`electron` modules — see
  * `static/renderer/preload.js` for exactly what it exposes.
+ *
+ * Not yet wired here: the spec's "renderer crash → auto-restart, escalating
+ * on repeat" (#32's failure taxonomy). `src/host/capture/crash-restart-policy.ts`
+ * has the pure, unit-tested escalation ladder (when to restart, how long to
+ * back off, when to give up) ready for a `webContents.on('render-process-gone', ...)`
+ * listener to drive by re-calling {@link createHiddenWindow} and re-pointing
+ * whatever holds the current window reference (`src/main/index.ts`'s
+ * `hiddenWindowReady`, `capture-session.ts`'s open sessions) at the new one.
+ * Left undone because it needs a real renderer crash to verify against, the
+ * same manual/E2E-only territory `minimized-check.ts` and
+ * `window-enumeration.ts` are already in for their own Windows-only
+ * mechanism -- #32's own acceptance criteria explicitly sanction a
+ * documented manual step here rather than an unverifiable automated one.
  */
 export async function createHiddenWindow(): Promise<BrowserWindow> {
   const window = new BrowserWindow({
