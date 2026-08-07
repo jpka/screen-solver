@@ -9,6 +9,9 @@ import { loadConfigStore, type ConfigStore } from './config/store.ts';
 import type { EnumerateWindows } from './config/types.ts';
 import { createHostRoutes } from './http/routes.ts';
 import type { Route } from './http/router.ts';
+import { createAnswerLog } from './logs/answer-log.ts';
+import { createSolveLogRecorder } from './logs/recorder.ts';
+import { createUsageLog } from './logs/usage-log.ts';
 import {
   startHttpServer as defaultStartHttpServer,
   type ListeningHttpServer,
@@ -23,6 +26,19 @@ import { ensureStateRoot } from './state-root.ts';
 
 /** No opener was injected. Nothing ever opens, which is a safe default for tests that don't care about capture. */
 const NEVER_OPENS: OpenCaptureSession = () => Promise.reject(new Error('No capture session opener configured.'));
+
+/**
+ * How long `shutdown()` will wait for the in-flight solve to end and its JSONL
+ * lines to land before giving up and tearing down anyway.
+ *
+ * There has to be *some* bound. Aborting the attempt (`SolveLoop.stop()`) is
+ * what normally ends it promptly, but abort is cooperative: a provider stream
+ * that ignores its signal, a window-enumeration call that never returns, or a
+ * hung `fs.appendFile` would otherwise leave the process alive indefinitely
+ * after the user asked it to quit. Losing the last answer's line is the lesser
+ * failure of the two, and it's logged when it happens.
+ */
+const SOLVE_DRAIN_TIMEOUT_MS = 5_000;
 
 /**
  * Everything the startup sequence needs from the outside world.
@@ -79,6 +95,12 @@ export interface HostRuntime {
    * instead of touching the network.
    */
   readonly provider?: Provider;
+  /**
+   * Overrides {@link SOLVE_DRAIN_TIMEOUT_MS}. Injected by tests that need to
+   * assert the give-up path without sitting out the real timeout; production
+   * never sets it.
+   */
+  readonly solveDrainTimeoutMs?: number;
 }
 
 /** The state the app lives in for the rest of its life. */
@@ -137,6 +159,14 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
     enumerateWindows: runtime.enumerateWindows,
   });
 
+  // #31's durable memory: `answers.jsonl` / `usage.jsonl` under the same
+  // state root. `answerLog` is also handed to `createHostRoutes` directly
+  // (`GET /answers` reads it fresh on every request); `usageLog` only ever
+  // goes through the recorder below -- nothing else needs to read it back.
+  const answerLog = createAnswerLog({ stateRoot });
+  const usageLog = createUsageLog({ stateRoot });
+  const solveLogRecorder = createSolveLogRecorder({ answerLog, usageLog, logger });
+
   // Not awaited: opening a session can take a moment (in production it waits
   // on the hidden renderer), and there is no reason to hold the HTTP bind
   // hostage to it. It's still "opened at startup" in the sense the spec
@@ -148,21 +178,25 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
     logger,
   });
 
-  const startServer = runtime.startHttpServer ?? defaultStartHttpServer;
-  const server = await startServer({
-    binding,
-    routes:
-      runtime.routes ??
-      createHostRoutes({
+  // `solveLoop` is `null` when `runtime.routes` was injected directly (tests
+  // that bypass `createHostRoutes` entirely) -- shutdown then has no attempt
+  // to await, the same "nothing to do" shape `solveLogRecorder.drain()` has
+  // when nothing was ever recorded.
+  const { routes, solveLoop } = runtime.routes
+    ? { routes: runtime.routes, solveLoop: null }
+    : createHostRoutes({
         configStore,
         captureSessionCoordinator,
         provider,
         enumerateWindows: runtime.enumerateWindows,
         isTargetMinimized: runtime.isTargetMinimized,
+        onOutcome: (event) => solveLogRecorder.record(event),
+        answerLog,
         logger,
-      }),
-    logger,
-  });
+      });
+
+  const startServer = runtime.startHttpServer ?? defaultStartHttpServer;
+  const server = await startServer({ binding, routes, logger });
 
   logger.info(`Screen Solver state root: ${stateRoot}`);
   logger.info(`Screen Solver listening on ${server.url} (bound ${server.host}:${server.port})`);
@@ -177,11 +211,60 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
       configStore,
       captureSessionCoordinator,
       shutdown: async () => {
+        // Let whatever solve attempt is currently in flight reach a terminal
+        // outcome -- and #31's persistence of it -- before tearing anything
+        // down. `solveLoop.stop()` aborts that attempt and doesn't resolve
+        // until `onOutcome` (which writes the JSONL lines) has already been
+        // awaited (`solve/loop.ts`); it also latches the loop closed, so a
+        // `POST /solve` landing in the gap before `server.close()` below is
+        // refused rather than starting work nothing here is left to wait for.
+        // `solveLogRecorder.drain()` is the belt to that suspenders: it also
+        // waits out a *superseded* attempt's write still queued behind it,
+        // which `stop()` alone wouldn't catch since the loop only tracks the
+        // most recently triggered attempt.
+        //
+        // Bounded as a whole, per `SOLVE_DRAIN_TIMEOUT_MS`: neither the abort
+        // nor the disk write is something this process can force to complete,
+        // and shutdown has to end regardless.
+        const drained = (async () => {
+          await solveLoop?.stop();
+          await solveLogRecorder.drain();
+        })();
+        if (!(await settlesWithin(drained, runtime.solveDrainTimeoutMs ?? SOLVE_DRAIN_TIMEOUT_MS))) {
+          logger.warn(
+            'Shutting down without waiting any longer for the in-flight solve to finish persisting. ' +
+              'Its answers.jsonl / usage.jsonl line may be missing or truncated.',
+          );
+        }
+
         await captureSessionCoordinator.stop();
         await server.close();
       },
     },
   };
+}
+
+/**
+ * Resolves `true` once `work` settles, or `false` if `timeoutMs` elapses
+ * first. The timer is cleared on the happy path, so a shutdown that drains
+ * immediately doesn't hold the event loop open for the rest of the timeout.
+ *
+ * `work` is caught rather than propagated: everything it awaits already
+ * handles its own failures (`trigger()` catches the attempt, `record()`
+ * catches each chained write), and a rejection arriving *after* a timeout has
+ * already moved shutdown on would otherwise surface as an unhandled rejection
+ * with nobody left to receive it.
+ */
+function settlesWithin(work: Promise<void>, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    void work
+      .catch(() => {})
+      .then(() => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+  });
 }
 
 /** True once the key has been taken — asserted by tests, and cheap insurance. */

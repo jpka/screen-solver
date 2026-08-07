@@ -2,11 +2,12 @@ import type { IsTargetMinimized } from '../capture/types.ts';
 import type { CaptureSessionCoordinator } from '../capture/session-coordinator.ts';
 import type { ConfigStore } from '../config/store.ts';
 import type { EnumerateWindows } from '../config/types.ts';
+import type { AnswerLog } from '../logs/answer-log.ts';
 import type { Logger } from '../logger.ts';
 import type { Provider } from '../provider/types.ts';
 import { createEventBroadcaster } from '../solve/broadcaster.ts';
-import { startSolveLoop } from '../solve/loop.ts';
-import type { SolveOutcome } from '../solve/types.ts';
+import { startSolveLoop, type SolveLoop } from '../solve/loop.ts';
+import type { SolveOutcomeEvent } from '../solve/types.ts';
 import { sendJson, type Route } from './router.ts';
 
 export interface HostRoutesDeps {
@@ -20,9 +21,25 @@ export interface HostRoutesDeps {
   readonly enumerateWindows?: EnumerateWindows;
   /** #30's minimized check, the other half of the pre-flight guard. Left unset, no target is ever treated as minimized. */
   readonly isTargetMinimized?: IsTargetMinimized;
-  /** #29's internal outcome bus -- see `src/host/solve/types.ts`. #31 is the eventual consumer. */
-  readonly onOutcome?: (outcome: SolveOutcome) => void;
+  /** #29's internal outcome bus -- see `src/host/solve/types.ts`. #31's `bootstrap.ts` wires this to a `SolveLogRecorder` that writes `answers.jsonl`/`usage.jsonl`. */
+  readonly onOutcome?: (event: SolveOutcomeEvent) => void | Promise<void>;
+  /** #31's `answers.jsonl` reader -- `GET /answers` serves its full backlog. Left unset, `GET /answers` answers `[]` (the same "nothing configured yet" default `enumerateWindows`/`isTargetMinimized` already use). */
+  readonly answerLog?: AnswerLog;
   readonly logger?: Logger;
+}
+
+export interface HostRoutes {
+  readonly routes: readonly Route[];
+  /**
+   * The solve loop backing `POST /solve`, `null` when `configStore`/
+   * `captureSessionCoordinator`/`provider` weren't all supplied (the same
+   * condition that makes `POST /solve` answer `503` below). `bootstrap.ts`
+   * calls `.stop()` on shutdown so the in-flight attempt's outcome -- and
+   * #31's persistence of it -- finishes before the process exits, instead of
+   * being silently abandoned mid-write, and so no *further* attempt can start
+   * in the window before the server stops listening.
+   */
+  readonly solveLoop: SolveLoop | null;
 }
 
 /**
@@ -38,7 +55,7 @@ export interface HostRoutesDeps {
  * branch exists for routes constructed directly, the way a route-level test
  * does.
  */
-export function createHostRoutes(deps: HostRoutesDeps = {}): Route[] {
+export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
   const broadcaster = createEventBroadcaster();
   const { configStore, captureSessionCoordinator, provider } = deps;
 
@@ -56,7 +73,7 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): Route[] {
         })
       : null;
 
-  return [
+  const routes: Route[] = [
     {
       method: 'GET',
       path: '/health',
@@ -83,7 +100,15 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): Route[] {
         // aborted right here. The pre-flight guards and the provider call for
         // this new solve run asynchronously, after the response has already
         // gone out (#29's own body: "This abort is synchronous with the 202").
-        solveLoop.trigger();
+        //
+        // The one way this comes back refused is shutdown having already begun
+        // (`SolveLoop.stop()`): the server is still listening for the moment it
+        // takes to close, but nothing is left to run or persist a new attempt,
+        // so say so rather than accepting work that will silently evaporate.
+        if (!solveLoop.trigger()) {
+          sendJson(res, 503, { error: 'shutting_down' });
+          return;
+        }
         sendJson(res, 202, { status: 'accepted' });
       },
     },
@@ -95,5 +120,20 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): Route[] {
         req.on('close', unsubscribe);
       },
     },
+    {
+      method: 'GET',
+      path: '/answers',
+      handle: async ({ res }) => {
+        // Independent of the live `/events` connection (spec): reads
+        // `answers.jsonl` fresh on every request, no in-memory cache to keep
+        // in sync -- `deps.answerLog` itself already has this property
+        // (`logs/jsonl.ts`'s `readAll()`), so there's nothing extra to do
+        // here beyond serving whatever it hands back.
+        const entries = deps.answerLog === undefined ? [] : await deps.answerLog.readAll();
+        sendJson(res, 200, entries);
+      },
+    },
   ];
+
+  return { routes, solveLoop };
 }

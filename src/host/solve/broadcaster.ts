@@ -2,18 +2,18 @@ import type { ServerResponse } from 'node:http';
 import type { ProviderErrorKind, Usage } from '../provider/types.ts';
 
 /**
- * The SSE wire vocabulary this ticket implements: the spec's full vocabulary
- * (`start`, `delta`, `done`, `error`, `sync`, `config`) minus `sync` (#31's
- * mid-flight-join catch-up -- this ticket only has to keep the accumulated
- * text somewhere `EventBroadcaster.currentText()` can reach, per the issue
- * body) and `config{target}`, which already has its own home on
- * `ConfigStore.onChange` (#28) and isn't this broadcaster's job.
+ * The SSE wire vocabulary: the spec's full vocabulary minus `config{target}`,
+ * which already has its own home on `ConfigStore.onChange` (#28) and isn't
+ * this broadcaster's job. `sync{text}` (#31) is sent only to one
+ * newly-subscribing client mid-flight, in place of `start` -- see
+ * {@link EventBroadcaster.subscribe}.
  */
 export type SseEvent =
   | { readonly type: 'start' }
   | { readonly type: 'delta'; readonly text: string }
   | { readonly type: 'done'; readonly usage: Usage }
-  | { readonly type: 'error'; readonly kind: ProviderErrorKind };
+  | { readonly type: 'error'; readonly kind: ProviderErrorKind }
+  | { readonly type: 'sync'; readonly text: string };
 
 /**
  * One shared broadcast to every connected `GET /events` client -- no
@@ -26,22 +26,32 @@ export interface EventBroadcaster {
    * Writes SSE headers, registers `res` as a client, and returns an
    * unsubscribe function. The caller (the `GET /events` route handler) wires
    * that to the request's `close` event.
+   *
+   * If a solve is currently in flight (`start()` has fired with no terminal
+   * `done`/`error` since), this one connecting client is sent `sync{text}`
+   * -- the accumulated text so far -- instead of silently waiting for the
+   * next `start`. A client connecting with nothing in flight gets no extra
+   * frame at all; it simply waits for the next real `start`, same as before
+   * this ticket. `EventSource`'s own reconnect (after a network blip, e.g. a
+   * phone lock/unlock) hits this exact path too -- a reconnect is treated
+   * identically to a fresh mid-flight join, per spec, so no separate
+   * `Last-Event-ID` replay logic exists.
    */
   subscribe(res: ServerResponse): () => void;
-  /** Starts a fresh solve: resets the in-memory accumulated text, then broadcasts `start`. */
+  /** Starts a fresh solve: resets the in-memory accumulated text, marks a solve in flight, then broadcasts `start`. */
   start(): void;
   /** Appends to the in-memory accumulated text, then broadcasts `delta`. */
   delta(text: string): void;
-  /** Broadcasts the terminal `done`. Does not touch the accumulated text -- it stays readable via {@link currentText} until the next `start()`. */
+  /** Broadcasts the terminal `done`, marking nothing in flight. Does not touch the accumulated text -- it stays readable via {@link currentText} until the next `start()`. */
   done(usage: Usage): void;
-  /** Broadcasts the terminal `error`. */
+  /** Broadcasts the terminal `error`, marking nothing in flight. */
   error(kind: ProviderErrorKind): void;
   /**
    * The in-memory accumulated text of whatever solve is currently in flight
    * (or just finished) -- reset on the next `start()`. This is the "server
    * holds the in-flight accumulated answer text in memory" the issue calls
-   * for; #31 reads this directly to build a `sync{text}` catch-up for a
-   * late-joining client. Nothing in this ticket implements that catch-up.
+   * for; `subscribe()` reads this directly to build a `sync{text}` catch-up
+   * for a late-joining client.
    */
   currentText(): string;
 }
@@ -49,9 +59,10 @@ export interface EventBroadcaster {
 export function createEventBroadcaster(): EventBroadcaster {
   const clients = new Set<ServerResponse>();
   let text = '';
+  let inFlight = false;
 
   function broadcast(event: SseEvent): void {
-    const frame = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+    const frame = frameFor(event);
     for (const client of clients) {
       try {
         client.write(frame);
@@ -77,6 +88,18 @@ export function createEventBroadcaster(): EventBroadcaster {
       // happened, not just been requested.
       res.write(':ok\n\n');
       clients.add(res);
+
+      if (inFlight) {
+        // Sent to this one connecting client only -- not a `broadcast()`,
+        // since every other already-subscribed client has no use for a
+        // catch-up it doesn't need.
+        try {
+          res.write(frameFor({ type: 'sync', text }));
+        } catch {
+          clients.delete(res);
+        }
+      }
+
       return () => {
         clients.delete(res);
       };
@@ -84,6 +107,7 @@ export function createEventBroadcaster(): EventBroadcaster {
 
     start() {
       text = '';
+      inFlight = true;
       broadcast({ type: 'start' });
     },
 
@@ -93,13 +117,19 @@ export function createEventBroadcaster(): EventBroadcaster {
     },
 
     done(usage) {
+      inFlight = false;
       broadcast({ type: 'done', usage });
     },
 
     error(kind) {
+      inFlight = false;
       broadcast({ type: 'error', kind });
     },
 
     currentText: () => text,
   };
+}
+
+function frameFor(event: SseEvent): string {
+  return `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
 }

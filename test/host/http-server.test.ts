@@ -10,7 +10,7 @@ const LOOPBACK = '127.0.0.1';
 async function startOnEphemeralPort(t: import('node:test').TestContext) {
   const server = await startHttpServer({
     binding: { host: LOOPBACK, port: 0 },
-    routes: createHostRoutes(),
+    routes: createHostRoutes().routes,
     logger: silentLogger,
   });
   t.after(() => server.close());
@@ -50,7 +50,7 @@ describe('startHttpServer', () => {
       () =>
         startHttpServer({
           binding: { host: LOOPBACK, port: occupant.port },
-          routes: createHostRoutes(),
+          routes: createHostRoutes().routes,
           logger: silentLogger,
         }),
       (error: unknown) => {

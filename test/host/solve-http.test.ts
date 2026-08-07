@@ -8,6 +8,7 @@ import { createHostRoutes, type HostRoutesDeps } from '../../src/host/http/route
 import { startHttpServer, type ListeningHttpServer } from '../../src/host/http/server.ts';
 import { silentLogger } from '../../src/host/logger.ts';
 import type { Provider, SolveEvent, SolveImage } from '../../src/host/provider/types.ts';
+import type { SolveLoop } from '../../src/host/solve/loop.ts';
 import type { SolveOutcome } from '../../src/host/solve/types.ts';
 import { tempStateRoot } from '../helpers/temp-state-root.ts';
 
@@ -131,6 +132,8 @@ interface Harness {
   readonly configStore: ConfigStore;
   readonly fakeProvider: FakeProvider;
   readonly outcomes: SolveOutcome[];
+  /** The loop behind `POST /solve`, so a test can drive its shutdown directly the way `bootstrap.ts` does. */
+  readonly solveLoop: SolveLoop;
   setFrame(frame: CapturedFrame | null): void;
   setMinimized(minimized: boolean): void;
   setPresent(present: boolean): void;
@@ -156,13 +159,15 @@ async function startTestServer(
 
   const captureSessionCoordinator = fakeCaptureCoordinator(async () => frame);
 
-  const routes = createHostRoutes({
+  const { routes, solveLoop } = createHostRoutes({
     configStore,
     captureSessionCoordinator,
     provider: provider.provider,
     enumerateWindows,
     isTargetMinimized: async () => minimized,
-    onOutcome: (outcome) => outcomes.push(outcome),
+    onOutcome: (event) => {
+      outcomes.push(event.outcome);
+    },
     logger: silentLogger,
     ...overrides,
   });
@@ -170,11 +175,14 @@ async function startTestServer(
   const server = await startHttpServer({ binding: { host: '127.0.0.1', port: 0 }, routes, logger: silentLogger });
   t.after(() => server.close());
 
+  assert.ok(solveLoop !== null, 'precondition: the harness always wires the solve loop');
+
   return {
     server,
     configStore,
     fakeProvider: provider,
     outcomes,
+    solveLoop,
     setFrame: (next) => {
       frame = next;
     },
@@ -254,7 +262,7 @@ describe('POST /solve + GET /events', () => {
   });
 
   it('answers 503 when the routes were constructed without solve-loop dependencies wired', async (t) => {
-    const routes = createHostRoutes();
+    const { routes } = createHostRoutes();
     const server = await startHttpServer({
       binding: { host: '127.0.0.1', port: 0 },
       routes,
@@ -266,6 +274,177 @@ describe('POST /solve + GET /events', () => {
     assert.equal(response.status, 503);
     assert.deepEqual(await response.json(), { error: 'not_ready' });
   });
+
+  it('answers 503 and starts nothing once shutdown has stopped the loop (#40 review fix)', async (t) => {
+    const h = await startTestServer(t);
+
+    // The window the review flagged: shutdown has begun, but the HTTP server
+    // is still listening for the moment it takes to close.
+    await h.solveLoop.stop();
+
+    const response = await fetch(`${h.server.url}/solve`, { method: 'POST' });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: 'shutting_down' });
+
+    await flush();
+    assert.equal(h.fakeProvider.calls.length, 0, 'no provider call was started after shutdown began');
+    assert.equal(h.outcomes.length, 0, 'and so no outcome exists that shutdown would have failed to persist');
+  });
+
+  it('aborts the in-flight solve on stop() and persists it as interrupted (#40 review fix)', async (t) => {
+    const h = await startTestServer(t);
+
+    const response = await fetch(`${h.server.url}/solve`, { method: 'POST' });
+    assert.equal(response.status, 202);
+
+    const call = await h.fakeProvider.waitForCall(1);
+    call.push({ type: 'delta', text: '# Two Sum\npartial' });
+    await flush();
+
+    // The provider is still mid-stream and would never end on its own --
+    // `stop()` has to abort it, not just wait for it.
+    await h.solveLoop.stop();
+
+    assert.equal(call.signal?.aborted, true, 'the in-flight attempt was aborted, not merely waited on');
+    assert.deepEqual(h.outcomes, [{ type: 'interrupted', text: '# Two Sum\npartial' }]);
+  });
+
+  it(
+    "stop() waits for a superseded attempt still unwinding after abort, not just the latest one " +
+      '(#40 review fix: superseded persistence escapes shutdown)',
+    async (t) => {
+      // A target change supersedes the previous attempt by aborting it and
+      // starting a new one -- but the old attempt keeps running until *it*
+      // notices the abort. This provider's first call is built to notice on
+      // command (`finishUnwind()`) rather than the instant it's aborted, so
+      // the test can force the exact ordering the review flagged: the second,
+      // superseding attempt finishes completely -- onOutcome write and all --
+      // while the first is still stuck mid-unwind.
+      interface ManualCall {
+        readonly signal: AbortSignal | undefined;
+        push(event: SolveEvent): void;
+        finishUnwind(): void;
+      }
+
+      function manualAbortProvider(): {
+        provider: Provider;
+        calls: ManualCall[];
+        waitForCall(n: number): Promise<ManualCall>;
+      } {
+        const calls: ManualCall[] = [];
+        const waiters = new Map<number, (call: ManualCall) => void>();
+
+        const provider: Provider = {
+          model: 'fake-model',
+          solve(_image, options) {
+            const queue: SolveEvent[] = [];
+            let notify: (() => void) | null = null;
+            let readyToUnwind = false;
+
+            const call: ManualCall = {
+              signal: options?.signal,
+              push(event) {
+                queue.push(event);
+                const wake = notify;
+                notify = null;
+                wake?.();
+              },
+              finishUnwind() {
+                readyToUnwind = true;
+                const wake = notify;
+                notify = null;
+                wake?.();
+              },
+            };
+            calls.push(call);
+            waiters.get(calls.length)?.(call);
+
+            return {
+              [Symbol.asyncIterator]() {
+                return {
+                  async next(): Promise<IteratorResult<SolveEvent>> {
+                    for (;;) {
+                      if (queue.length > 0) {
+                        return { value: queue.shift() as SolveEvent, done: false };
+                      }
+                      if (options?.signal?.aborted === true && readyToUnwind) {
+                        return { value: undefined, done: true };
+                      }
+                      await new Promise<void>((resolve) => {
+                        notify = resolve;
+                      });
+                    }
+                  },
+                };
+              },
+            };
+          },
+        };
+
+        return {
+          provider,
+          calls,
+          waitForCall(n) {
+            const existing = calls[n - 1];
+            if (existing !== undefined) return Promise.resolve(existing);
+            return new Promise((resolve) => waiters.set(n, resolve));
+          },
+        };
+      }
+
+      const manual = manualAbortProvider();
+      const h = await startTestServer(t, { provider: manual.provider });
+
+      const first = await fetch(`${h.server.url}/solve`, { method: 'POST' });
+      assert.equal(first.status, 202);
+      const call1 = await manual.waitForCall(1);
+      call1.push({ type: 'delta', text: 'stale partial' });
+      await flush();
+
+      const second = await fetch(`${h.server.url}/solve`, { method: 'POST' });
+      assert.equal(second.status, 202);
+      const call2 = await manual.waitForCall(2);
+      assert.equal(call1.signal?.aborted, true, 'the first attempt was aborted by the second');
+
+      call2.push({
+        type: 'done',
+        usage: { inputTokens: 1, outputTokens: 1, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+        stopReason: 'end_turn',
+      });
+      await flush();
+      assert.deepEqual(
+        h.outcomes.map((o) => o.type),
+        ['done'],
+        'precondition: the superseding attempt has already fully settled, including its own onOutcome write',
+      );
+
+      let stopSettled = false;
+      const stopPromise = h.solveLoop.stop().then(() => {
+        stopSettled = true;
+      });
+      await flush();
+      assert.equal(
+        stopSettled,
+        false,
+        'stop() must not resolve while the superseded first attempt is still unwinding -- its onOutcome write has not happened yet, and an earlier version of this method would resolve here anyway because it only tracked the latest attempt',
+      );
+
+      call1.finishUnwind();
+      await stopPromise;
+      assert.equal(stopSettled, true);
+
+      assert.deepEqual(h.outcomes.map((o) => o.type), ['done', 'interrupted']);
+      const interrupted = h.outcomes[1];
+      assert.equal(interrupted?.type, 'interrupted');
+      if (interrupted?.type === 'interrupted') {
+        assert.equal(
+          interrupted.text,
+          'stale partial',
+          "the superseded attempt's own accumulated text was persisted by stop() waiting for it, not lost",
+        );
+      }
+    },
+  );
 
   it('accepts with 202, then streams start -> delta* -> done{usage} to a connected client', async (t) => {
     const h = await startTestServer(t);

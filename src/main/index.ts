@@ -71,11 +71,23 @@ async function main(): Promise<void> {
   // it would silently quit the whole host.
   app.on('window-all-closed', () => {});
 
+  // `host.shutdown()` (#31) is bounded (`SOLVE_DRAIN_TIMEOUT_MS`) but not
+  // guaranteed to leave nothing referencing the event loop -- a provider that
+  // ignores its `AbortSignal` can still have an open socket after shutdown
+  // gives up waiting on it (review feedback on #40). `preventDefault()` holds
+  // Electron's own quit sequence off until `shutdown()` settles either way,
+  // and `app.exit()` afterward forces the process down regardless of what's
+  // still open, rather than trusting a clean event-loop drain that a
+  // misbehaving provider could defeat.
   let shuttingDown = false;
-  app.on('before-quit', () => {
+  app.on('before-quit', (event) => {
+    event.preventDefault();
     if (shuttingDown) return;
     shuttingDown = true;
-    void host.shutdown().catch(() => {});
+    void host
+      .shutdown()
+      .catch(() => {})
+      .then(() => app.exit(EXIT_OK));
   });
 
   await app.whenReady();

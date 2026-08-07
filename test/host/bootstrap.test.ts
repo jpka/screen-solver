@@ -6,10 +6,14 @@ import { describe, it, type TestContext } from 'node:test';
 import { API_KEY_ENV_VAR } from '../../src/host/api-key.ts';
 import { HTTP_HOST_ENV_VAR, HTTP_PORT_ENV_VAR } from '../../src/host/binding.ts';
 import { apiKeyIsOutOfEnvironment, bootstrapHost } from '../../src/host/bootstrap.ts';
+import type { CapturedFrame } from '../../src/host/capture/types.ts';
 import { CONFIG_FILE_NAME } from '../../src/host/config/store.ts';
+import type { TargetWindowIdentity } from '../../src/host/config/types.ts';
 import { StartupError } from '../../src/host/errors.ts';
 import { silentLogger, type Logger } from '../../src/host/logger.ts';
 import { startHttpServer } from '../../src/host/http/server.ts';
+import { createAnswerLog } from '../../src/host/logs/answer-log.ts';
+import type { Provider, SolveEvent } from '../../src/host/provider/types.ts';
 import { tempStateRoot } from '../helpers/temp-state-root.ts';
 
 const KEY = 'sk-ant-test-bootstrap';
@@ -33,6 +37,15 @@ function recordingLogger(): Logger & { lines: string[] } {
     warn: (m) => void lines.push(m),
     error: (m) => void lines.push(m),
   };
+}
+
+/** A deferred promise, for synchronizing a test with a point it knows the code under test reached -- no arbitrary sleeps. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
 }
 
 interface Scenario {
@@ -275,5 +288,158 @@ describe('bootstrapHost', () => {
 
     await result.host.captureSessionCoordinator.settled();
     assert.equal(result.host.captureSessionCoordinator.currentTarget(), null);
+  });
+
+  it('shutdown waits for an in-flight solve to finish persisting before closing resources (#40 review fix)', async (t) => {
+    const s = await scenario(t);
+    const target: TargetWindowIdentity = { processName: 'chrome.exe', title: 'Two Sum - LeetCode' };
+    await writeFile(
+      join(s.stateRoot, CONFIG_FILE_NAME),
+      JSON.stringify({ targetWindow: target, provider: null }),
+    );
+
+    const frame: CapturedFrame = {
+      mediaType: 'image/jpeg',
+      bytes: new Uint8Array([1, 2, 3]),
+      width: 1200,
+      height: 800,
+      quality: 'ok',
+    };
+
+    // A single-call provider whose terminal event is pushed by hand, so the
+    // test can race `shutdown()` against the still-in-flight write it
+    // triggers -- the exact race the #40 review comment flagged.
+    let resolvePushDoneReady!: (push: () => void) => void;
+    const pushDoneReady = new Promise<() => void>((resolve) => {
+      resolvePushDoneReady = resolve;
+    });
+    const provider: Provider = {
+      model: 'fake-model',
+      solve(): AsyncIterable<SolveEvent> {
+        return {
+          [Symbol.asyncIterator]() {
+            let sent = false;
+            return {
+              async next(): Promise<IteratorResult<SolveEvent>> {
+                if (sent) return { value: undefined, done: true };
+                await new Promise<void>((resolve) => {
+                  resolvePushDoneReady(resolve);
+                });
+                sent = true;
+                return {
+                  value: {
+                    type: 'done',
+                    usage: { inputTokens: 1, outputTokens: 2, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+                    stopReason: 'end_turn',
+                  },
+                  done: false,
+                };
+              },
+            };
+          },
+        };
+      },
+    };
+
+    const result = await bootstrapHost({
+      ...runtimeFor(s),
+      provider,
+      enumerateWindows: async () => [target],
+      isTargetMinimized: async () => false,
+      openCaptureSession: async () => ({
+        captureFrame: async () => frame,
+        close: async () => {},
+      }),
+    });
+    assert.equal(result.status, 'started');
+    if (result.status !== 'started') return;
+
+    await result.host.captureSessionCoordinator.settled();
+
+    const response = await fetch(`http://${LOOPBACK}:${result.host.binding.port}/solve`, { method: 'POST' });
+    assert.equal(response.status, 202);
+
+    const pushDone = await pushDoneReady;
+
+    // Resolve the provider's terminal event and, in the same breath, start
+    // shutdown -- without the fix, `shutdown()` would race ahead and close
+    // resources before `onOutcome`'s JSONL write ever lands.
+    pushDone();
+    await result.host.shutdown();
+
+    const entries = await createAnswerLog({ stateRoot: s.stateRoot }).readAll();
+    assert.equal(entries.length, 1, 'the in-flight answer was persisted, not abandoned mid-write by shutdown');
+  });
+
+  it('shutdown gives up on a solve that ignores its abort rather than hanging forever (#40 review fix)', async (t) => {
+    const s = await scenario(t);
+    const target: TargetWindowIdentity = { processName: 'chrome.exe', title: 'Two Sum - LeetCode' };
+    await writeFile(
+      join(s.stateRoot, CONFIG_FILE_NAME),
+      JSON.stringify({ targetWindow: target, provider: null }),
+    );
+
+    const frame: CapturedFrame = {
+      mediaType: 'image/jpeg',
+      bytes: new Uint8Array([1, 2, 3]),
+      width: 1200,
+      height: 800,
+      quality: 'ok',
+    };
+
+    // The pathological provider: its stream never ends and it never checks
+    // the `AbortSignal`, so aborting the attempt does nothing. Real-world
+    // stand-in for a wedged socket -- the case `settled()`/`stop()` alone
+    // can't get out of, which is why shutdown bounds the wait.
+    const started = deferred();
+    const provider: Provider = {
+      model: 'fake-model',
+      solve(): AsyncIterable<SolveEvent> {
+        return {
+          [Symbol.asyncIterator]() {
+            return {
+              next(): Promise<IteratorResult<SolveEvent>> {
+                started.resolve();
+                return new Promise<IteratorResult<SolveEvent>>(() => {});
+              },
+            };
+          },
+        };
+      },
+    };
+
+    const logger = recordingLogger();
+    const result = await bootstrapHost({
+      ...runtimeFor(s, logger),
+      provider,
+      solveDrainTimeoutMs: 50,
+      enumerateWindows: async () => [target],
+      isTargetMinimized: async () => false,
+      openCaptureSession: async () => ({
+        captureFrame: async () => frame,
+        close: async () => {},
+      }),
+    });
+    assert.equal(result.status, 'started');
+    if (result.status !== 'started') return;
+
+    await result.host.captureSessionCoordinator.settled();
+
+    const response = await fetch(`http://${LOOPBACK}:${result.host.binding.port}/solve`, { method: 'POST' });
+    assert.equal(response.status, 202);
+    await started.promise;
+
+    // The assertion is simply that this resolves at all -- before the fix it
+    // awaited the stuck attempt with no bound, and the process stayed up.
+    await result.host.shutdown();
+
+    assert.ok(
+      logger.lines.some((line) => line.includes('without waiting any longer')),
+      'giving up on the drain is reported, not silent',
+    );
+    await assert.rejects(
+      () => fetch(`http://${LOOPBACK}:${result.host.binding.port}/health`),
+      'the server really did close, rather than shutdown returning early with teardown left undone',
+    );
   });
 });

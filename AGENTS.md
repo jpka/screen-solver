@@ -116,9 +116,11 @@ reusing:
   but call `subscribe(res)` and unregister on the request's `close`; this is
   the concrete shape `router.ts`'s "handlers get the raw `res`, so a
   streaming endpoint can hijack it... without fighting the router" comment
-  was anticipating. It also holds the in-flight accumulated answer text
-  in memory (`currentText()`) for #31's future `sync{text}` catch-up to read
-  — #29 doesn't implement that catch-up, just leaves the text reachable.
+  was anticipating. It also holds the in-flight accumulated answer text in
+  memory (`currentText()`), which `subscribe()` reads to send a late-joining
+  client `sync{text}` instead of nothing when a solve is already in flight
+  (#31) — a flag (set on `start()`, cleared on `done()`/`error()`) is the
+  only extra state this needed.
 - **The internal outcome bus** (`solve/types.ts`'s `SolveOutcome`,
   `SolveLoopDeps.onOutcome`) is a small explicit union —
   `done`/`interrupted`/`error`, each carrying the accumulated text — reported
@@ -126,15 +128,81 @@ reusing:
   deliberately *not* on the SSE wire: the wire vocabulary has no
   `interrupted` kind, since an interruption's only wire-visible effect is
   "the old stream stops advancing and a fresh `start` begins immediately".
-  This bus is how #31 (or any future consumer) learns an attempt was
-  interrupted without the wire protocol needing a fourth terminal event kind.
   Same "small union over a class" style as `ConfigChangeEvent` and
-  `SolveEvent`.
+  `SolveEvent`. `onOutcome` itself is wrapped at the call site into
+  `SolveOutcomeEvent { outcome, target, model }` rather than adding those two
+  fields to every union variant — #31's persistence layer is the one real
+  consumer, and needs `target`/`model` regardless of which variant it got.
 
 A pre-flight guard failure (vanished/minimized target, black/zero-size
 frame) never touches either of these — no broadcast, no outcome, no provider
 call — which is the structural way "silent no-spend" is enforced: the code
 simply has no event to emit for that path, rather than a flag suppressing one.
+
+**Durable JSONL logs** (established by #31). `src/host/logs/jsonl.ts`'s
+`openJsonlFile<T>({ path })` is the reusable half of `answers.jsonl` /
+`usage.jsonl`: one JSON object per `\n`-terminated line, `append()` via
+`fs.appendFile`'s OS append mode (`'a'` flag — concurrent appends from this
+process don't clobber each other), `readAll()` re-reading the file fresh
+every call rather than keeping an in-memory cache in sync (`GET /answers`'s
+own requirement). `answer-log.ts`/`usage-log.ts` are both a fixed filename
+plus an entry type wrapped around it; a future status log (#32) is expected
+to be a third instance of exactly this shape rather than its own mechanism.
+`logs/recorder.ts`'s `createSolveLogRecorder` is the one thing that isn't
+generic: it subscribes to the outcome bus above and decides, per outcome,
+which of the two logs get a line (a bail or an `error` never reaches
+`answers.jsonl`; every attempted call reaches `usage.jsonl`) — and
+serializes its own writes through an internal promise chain, since
+interrupt-and-replace means two outcomes can genuinely be in flight at once,
+and unserialized concurrent `fs.appendFile` calls race on disk-completion
+order rather than preserving call order.
+
+**Shutdown ordering** (established by #31, tightened across three rounds of
+review). Anything that persists on its way out has to be drained by
+`StartedHost.shutdown()` (`bootstrap.ts`) *before* the resources it depends on
+are torn down, and the drain itself has to be bounded. The worked example is
+the solve loop: `SolveLoop.stop()` aborts the in-flight attempt (rather than
+politely waiting out a model that may keep talking for another minute),
+awaits *every* attempt still unwinding (not only the most recently triggered
+one -- see below), and latches the loop closed so `trigger()` returns `false`
+— `POST /solve` answers `503 shutting_down` for the moment the server is
+still listening but nothing is left to run the work. Then
+`SolveLogRecorder.drain()` catches any write still queued behind those.
+The whole phase races `SOLVE_DRAIN_TIMEOUT_MS`, because abort is cooperative:
+a provider ignoring its signal, or a hung `fs.appendFile`, must not keep the
+process alive after the user quit. Losing the last line is the lesser
+failure, and it's logged when it happens. A future subsystem with the same
+shape belongs in the same bounded phase, not in a second unbounded await
+appended after it.
+
+**Track every in-flight unit of work a shutdown must wait for, not just the
+newest one.** `SolveLoop`'s internal state used to hold a single `attempt`
+slot, overwritten on every `trigger()` -- correct for `settled()` (a test
+convenience that only ever cares about the latest call) but wrong for
+shutdown: a target change supersedes the previous attempt by aborting it, but
+that old attempt keeps running until *it* notices the abort and unwinds,
+which can still be in flight when a second change supersedes the new one too.
+`stop()` awaiting only the newest slot could resolve while an older,
+already-superseded attempt was mid-unwind and about to persist its own
+`interrupted` outcome -- silently losing it, a failure `SolveLogRecorder.drain()`
+can't catch either, since it only awaits writes already enqueued into its
+chain, not ones a still-running attempt hasn't gotten to yet. Fixed by
+tracking every triggered attempt in a `Set`, self-removing on settle, and
+having `stop()` await the whole set. The general lesson for anything shaped
+like "the latest one supersedes the previous one, and shutdown needs to
+observe all of it": a single mutable slot naturally answers "what should
+`trigger()` return next", but shutdown's question is "what is still
+outstanding", and those are different questions once more than one thing can
+be in flight at once.
+
+The bound on `bootstrapHost`'s own promise isn't the end of the story in
+Electron, though (`src/main/index.ts`, tightened in review): `settlesWithin`
+giving up doesn't mean whatever it was waiting on actually stopped -- a
+provider ignoring its `AbortSignal` can still hold a socket open past the
+timeout. `before-quit`'s handler calls `event.preventDefault()` and only lets
+Electron's own quit sequence resume via an explicit `app.exit()` once
+`host.shutdown()` has settled (bound and all), so a leftover handle can't
+silently keep the process alive after shutdown has already given up on it.
 
 ### Environment setup
 
