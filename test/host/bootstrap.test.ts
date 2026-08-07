@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { stat } from 'node:fs/promises';
+import { stat, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { describe, it, type TestContext } from 'node:test';
 import { API_KEY_ENV_VAR } from '../../src/host/api-key.ts';
 import { HTTP_HOST_ENV_VAR, HTTP_PORT_ENV_VAR } from '../../src/host/binding.ts';
 import { apiKeyIsOutOfEnvironment, bootstrapHost } from '../../src/host/bootstrap.ts';
+import { CONFIG_FILE_NAME } from '../../src/host/config/store.ts';
 import { StartupError } from '../../src/host/errors.ts';
 import { silentLogger, type Logger } from '../../src/host/logger.ts';
 import { startHttpServer } from '../../src/host/http/server.ts';
@@ -224,5 +226,54 @@ describe('bootstrapHost', () => {
     t.after(() => result.host.shutdown());
 
     assert.deepEqual(await result.host.configStore.listWindows(), []);
+  });
+
+  it('opens a capture session at startup for a target already resolved by the config store', async (t) => {
+    const s = await scenario(t);
+    const target = { processName: 'chrome.exe', title: 'Two Sum - LeetCode' };
+    // Pre-seed config.json with a saved target, the same way #28's config
+    // suite simulates a restart -- so the config store resolves it as the
+    // *live* target before bootstrapHost ever returns.
+    await writeFile(
+      join(s.stateRoot, CONFIG_FILE_NAME),
+      JSON.stringify({ targetWindow: target, provider: null }),
+    );
+    const opened: unknown[] = [];
+
+    const result = await bootstrapHost({
+      ...runtimeFor(s),
+      enumerateWindows: async () => [target],
+      openCaptureSession: async (openedTarget) => {
+        opened.push(openedTarget);
+        return {
+          captureFrame: async (): Promise<never> => {
+            throw new Error('not exercised');
+          },
+          close: async () => {},
+        };
+      },
+    });
+    assert.equal(result.status, 'started');
+    if (result.status !== 'started') return;
+    t.after(() => result.host.shutdown());
+
+    assert.deepEqual(result.host.configStore.get().targetWindow, target, 'precondition: resolved at load');
+
+    await result.host.captureSessionCoordinator.settled();
+
+    assert.deepEqual(opened, [target], 'a session opens at startup, not deferred to the first solve');
+    assert.deepEqual(result.host.captureSessionCoordinator.currentTarget(), target);
+  });
+
+  it('never opens a capture session when no target is configured, per the documented safe default', async (t) => {
+    const s = await scenario(t);
+
+    const result = await bootstrapHost(runtimeFor(s));
+    assert.equal(result.status, 'started');
+    if (result.status !== 'started') return;
+    t.after(() => result.host.shutdown());
+
+    await result.host.captureSessionCoordinator.settled();
+    assert.equal(result.host.captureSessionCoordinator.currentTarget(), null);
   });
 });

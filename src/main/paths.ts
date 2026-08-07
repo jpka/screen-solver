@@ -16,3 +16,18 @@ export const staticRoot = fileURLToPath(new URL('../../static/', import.meta.url
 export const hiddenRendererPage = fileURLToPath(
   new URL('../../static/renderer/index.html', import.meta.url),
 );
+
+/**
+ * The preload script for the hidden renderer (#30).
+ *
+ * Lives under `static/renderer/`, not compiled by `tsc`, even though it's
+ * Electron/Node-facing code that every other file in `src/main` would
+ * normally be: sandboxed preload scripts (`hidden-window.ts` sets
+ * `sandbox: true`) run as plain script outside Node's ESM/CJS module
+ * resolution, so a `tsc`-emitted `import` statement is invalid syntax there
+ * regardless of this project's `"type": "module"` setup. See
+ * `static/renderer/preload.js` for the detail.
+ */
+export const hiddenRendererPreload = fileURLToPath(
+  new URL('../../static/renderer/preload.js', import.meta.url),
+);
