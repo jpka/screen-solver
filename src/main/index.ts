@@ -4,6 +4,7 @@ import { isStartupError } from '../host/errors.ts';
 import { consoleLogger } from '../host/logger.ts';
 import { createRealCaptureSessionOpener } from './capture-session.ts';
 import { createHiddenWindow } from './hidden-window.ts';
+import { isTargetMinimizedReal } from './minimized-check.ts';
 import { enumerateOpenWindows } from './window-enumeration.ts';
 
 const EXIT_OK = 0;
@@ -47,6 +48,7 @@ async function main(): Promise<void> {
     logger: consoleLogger,
     enumerateWindows: enumerateOpenWindows,
     openCaptureSession: createRealCaptureSessionOpener(hiddenWindowReady),
+    isTargetMinimized: isTargetMinimizedReal,
   });
 
   if (result.status === 'already-running') {

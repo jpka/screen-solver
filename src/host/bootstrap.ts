@@ -4,7 +4,7 @@ import {
   startCaptureSessionCoordinator,
   type CaptureSessionCoordinator,
 } from './capture/session-coordinator.ts';
-import type { OpenCaptureSession } from './capture/types.ts';
+import type { IsTargetMinimized, OpenCaptureSession } from './capture/types.ts';
 import { loadConfigStore, type ConfigStore } from './config/store.ts';
 import type { EnumerateWindows } from './config/types.ts';
 import { createHostRoutes } from './http/routes.ts';
@@ -15,6 +15,9 @@ import {
   type StartHttpServer,
 } from './http/server.ts';
 import type { Logger } from './logger.ts';
+import { createProvider } from './provider/anthropic.ts';
+import { DEFAULT_SYSTEM_PROMPT } from './provider/system-prompt.ts';
+import type { Provider } from './provider/types.ts';
 import type { Secret } from './secret.ts';
 import { ensureStateRoot } from './state-root.ts';
 
@@ -59,6 +62,23 @@ export interface HostRuntime {
    * shape as `enumerateWindows`.
    */
   readonly openCaptureSession?: OpenCaptureSession;
+  /**
+   * Whether the target window is minimized (#30's `IsIconic`-equivalent
+   * check) — the other half of `POST /solve`'s pre-flight guard (#29),
+   * alongside `enumerateWindows`. Electron supplies the real implementation
+   * (`src/main/minimized-check.ts`); tests supply a fake. Left unset, no
+   * target is ever treated as minimized — the same "safe default" shape as
+   * `enumerateWindows` and `openCaptureSession`.
+   */
+  readonly isTargetMinimized?: IsTargetMinimized;
+  /**
+   * The provider seam (#27) the solve loop (#29) calls to turn a captured
+   * frame into an answer. Left unset, a real Anthropic provider is
+   * constructed from the API key just taken out of `env` and a fixed system
+   * prompt (`src/host/provider/system-prompt.ts`); tests inject a fake here
+   * instead of touching the network.
+   */
+  readonly provider?: Provider;
 }
 
 /** The state the app lives in for the rest of its life. */
@@ -104,6 +124,13 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   const apiKey = takeApiKey(env);
   const binding = readHttpBinding(env);
 
+  // Built here rather than in `src/main`, unlike `enumerateWindows` and
+  // `openCaptureSession`: the Anthropic provider (`provider/anthropic.ts`)
+  // needs nothing Electron-specific, only the API key (just taken above) and
+  // a fixed system prompt, both already available at this point in the
+  // startup sequence.
+  const provider = runtime.provider ?? createProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT });
+
   const stateRoot = await ensureStateRoot(runtime.stateRoot);
   const configStore = await loadConfigStore({
     stateRoot,
@@ -124,7 +151,16 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   const startServer = runtime.startHttpServer ?? defaultStartHttpServer;
   const server = await startServer({
     binding,
-    routes: runtime.routes ?? createHostRoutes(),
+    routes:
+      runtime.routes ??
+      createHostRoutes({
+        configStore,
+        captureSessionCoordinator,
+        provider,
+        enumerateWindows: runtime.enumerateWindows,
+        isTargetMinimized: runtime.isTargetMinimized,
+        logger,
+      }),
     logger,
   });
 
