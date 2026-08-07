@@ -162,6 +162,28 @@ describe('loadConfigStore', () => {
     const onDisk = JSON.parse(await readFile(configPath, 'utf8'));
     assert.deepEqual(onDisk.targetWindow, KATA_TAB);
   });
+
+  it('starts up with no live target, rather than refusing to start, when enumerateWindows rejects', async (t) => {
+    const stateRoot = await tempStateRoot(t);
+    const configPath = join(stateRoot, CONFIG_FILE_NAME);
+    const first = await loadConfigStore({ stateRoot });
+    await first.setTargetWindow(KATA_TAB);
+
+    const restarted = await loadConfigStore({
+      stateRoot,
+      enumerateWindows: async () => {
+        throw new Error('Get-Process failed: execution policy restricted');
+      },
+    });
+
+    assert.equal(
+      restarted.get().targetWindow,
+      null,
+      'an enumeration failure degrades to "no target configured" instead of failing bootstrap',
+    );
+    const onDisk = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.deepEqual(onDisk.targetWindow, KATA_TAB, 'the persisted identity is untouched by the failure');
+  });
 });
 
 describe('resolveTargetWindowOnStartup', () => {
@@ -185,6 +207,13 @@ describe('resolveTargetWindowOnStartup', () => {
   it('matches on both process name and title, not either alone', async () => {
     const sameTitleDifferentProcess: WindowInfo = { processName: 'firefox.exe', title: KATA_TAB.title };
     const result = await resolveTargetWindowOnStartup(KATA_TAB, async () => [sameTitleDifferentProcess]);
+    assert.equal(result, null);
+  });
+
+  it('falls back to null, rather than throwing, when enumerateWindows itself rejects', async () => {
+    const result = await resolveTargetWindowOnStartup(KATA_TAB, async () => {
+      throw new Error('Get-Process failed: execution policy restricted');
+    });
     assert.equal(result, null);
   });
 });

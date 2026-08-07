@@ -194,4 +194,35 @@ describe('bootstrapHost', () => {
 
     await assert.rejects(() => fetch(`http://${LOOPBACK}:${port}/health`));
   });
+
+  it('wires the config store into StartedHost, with the injected enumerateWindows actually threaded through', async (t) => {
+    const s = await scenario(t);
+    const injectedWindows = [{ processName: 'chrome.exe', title: 'Two Sum - LeetCode' }];
+
+    const result = await bootstrapHost({
+      ...runtimeFor(s),
+      enumerateWindows: async () => injectedWindows,
+    });
+    assert.equal(result.status, 'started');
+    if (result.status !== 'started') return;
+    t.after(() => result.host.shutdown());
+
+    assert.deepEqual(result.host.configStore.get(), { targetWindow: null, provider: null });
+    assert.deepEqual(
+      await result.host.configStore.listWindows(),
+      injectedWindows,
+      'listWindows() reaches the enumerateWindows passed into bootstrapHost, not some other default',
+    );
+  });
+
+  it('defaults to no windows when enumerateWindows is left unset, per its documented fallback', async (t) => {
+    const s = await scenario(t);
+
+    const result = await bootstrapHost(runtimeFor(s));
+    assert.equal(result.status, 'started');
+    if (result.status !== 'started') return;
+    t.after(() => result.host.shutdown());
+
+    assert.deepEqual(await result.host.configStore.listWindows(), []);
+  });
 });

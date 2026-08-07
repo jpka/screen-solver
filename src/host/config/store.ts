@@ -125,6 +125,15 @@ export async function loadConfigStore(options: LoadConfigStoreOptions): Promise<
  * for. Documented fallback: if nothing in the current enumeration matches
  * both fields, this resolves to `null` rather than throwing — the app falls
  * through to "no target configured" (the picker), never a startup failure.
+ *
+ * The same fallback applies if `enumerateWindows` itself rejects (the real
+ * implementation shells out to `Get-Process` and calls Electron's
+ * `desktopCapturer` — either can fail for reasons that have nothing to do
+ * with whether the saved window still exists, e.g. a locked-down execution
+ * policy or no screen-capture permission yet granted). A target window is
+ * never load-bearing for the rest of the host to come up, so a resolution
+ * failure here must not turn into a fatal startup error; it degrades to "no
+ * target configured", the same as a window that's simply gone.
  */
 export async function resolveTargetWindowOnStartup(
   saved: TargetWindowIdentity | null,
@@ -132,7 +141,13 @@ export async function resolveTargetWindowOnStartup(
 ): Promise<TargetWindowIdentity | null> {
   if (saved === null) return null;
 
-  const windows = await enumerateWindows();
+  let windows: readonly WindowInfo[];
+  try {
+    windows = await enumerateWindows();
+  } catch {
+    return null;
+  }
+
   const stillOpen = windows.some(
     (candidate) => candidate.processName === saved.processName && candidate.title === saved.title,
   );
