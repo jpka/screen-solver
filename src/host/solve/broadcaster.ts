@@ -1,11 +1,10 @@
 import type { ServerResponse } from 'node:http';
+import type { TargetWindowIdentity } from '../config/types.ts';
 import type { ProviderErrorKind, Usage } from '../provider/types.ts';
 import type { StatusSnapshot } from './status.ts';
 
 /**
- * The SSE wire vocabulary: the spec's full vocabulary minus `config{target}`,
- * which already has its own home on `ConfigStore.onChange` (#28) and isn't
- * this broadcaster's job. `sync{text}` (#31) is sent only to one
+ * The SSE wire vocabulary. `sync{text}` (#31) is sent only to one
  * newly-subscribing client mid-flight, in place of `start` -- see
  * {@link EventBroadcaster.subscribe}.
  *
@@ -18,6 +17,14 @@ import type { StatusSnapshot } from './status.ts';
  * newly-subscribing client whenever it isn't `silent`, the same "catch this
  * one connecting client up" idea `sync` already uses -- see
  * {@link EventBroadcaster.subscribe}.
+ *
+ * `config{target}` (#33) mirrors `ConfigStore.onChange` (#28) onto the wire,
+ * so the client (#33) can react live to a target change -- a fresh pick from
+ * the picker, or #32's own mid-run fallback to `null` -- without a reload.
+ * Unlike `sync`/`status`, `subscribe()` never replays this on connect: a
+ * freshly-connecting client already gets the current target from a plain
+ * `GET /config`, so there is nothing "in flight" here for a catch-up frame to
+ * backfill.
  */
 export type SseEvent =
   | { readonly type: 'start' }
@@ -25,7 +32,8 @@ export type SseEvent =
   | { readonly type: 'done'; readonly usage: Usage }
   | { readonly type: 'error'; readonly kind: ProviderErrorKind }
   | { readonly type: 'sync'; readonly text: string }
-  | { readonly type: 'status'; readonly level: StatusSnapshot['level']; readonly kind: StatusSnapshot['kind'] };
+  | { readonly type: 'status'; readonly level: StatusSnapshot['level']; readonly kind: StatusSnapshot['kind'] }
+  | { readonly type: 'config'; readonly target: TargetWindowIdentity | null };
 
 /**
  * One shared broadcast to every connected `GET /events` client -- no
@@ -75,6 +83,13 @@ export interface EventBroadcaster {
   status(snapshot: StatusSnapshot): void;
   /** The pill's current reading -- `subscribe()` reads this to catch up a newly-connecting client; `silent` is the default and is never itself replayed (nothing to catch up on). */
   currentStatus(): StatusSnapshot;
+  /**
+   * Broadcasts a target-window change (#33) -- `routes.ts` wires this to
+   * `ConfigStore.onChange` whenever a `configStore` is supplied. No
+   * corresponding `currentTarget()`/catch-up on `subscribe()`: see the
+   * `config{target}` doc comment on {@link SseEvent} for why.
+   */
+  config(target: TargetWindowIdentity | null): void;
 }
 
 export function createEventBroadcaster(): EventBroadcaster {
@@ -170,6 +185,10 @@ export function createEventBroadcaster(): EventBroadcaster {
     },
 
     currentStatus: () => status,
+
+    config(target) {
+      broadcast({ type: 'config', target });
+    },
   };
 }
 

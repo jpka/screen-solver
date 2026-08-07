@@ -26,6 +26,36 @@ export function sendJson(res: ServerResponse, status: number, body: unknown): vo
 }
 
 /**
+ * Buffers a request body and parses it as JSON -- the one thing the router
+ * itself has no built-in support for, since `POST /solve` (#29) never needed
+ * one. `POST /config/target` (#33) is the first route that does.
+ *
+ * An empty body parses as `null` rather than rejecting, so a client can
+ * `POST` with no body at all to mean "no target" without also having to send
+ * a literal `null` JSON payload. Malformed JSON rejects with the parse
+ * error; the caller decides how that becomes a `400`.
+ */
+export function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8').trim();
+      if (raw === '') {
+        resolve(null);
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+/**
  * Turn a route table into a `http.createServer` listener.
  *
  * Handlers get the raw `res`, so a streaming endpoint (`GET /events`, #29) can

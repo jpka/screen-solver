@@ -207,6 +207,67 @@ re-creation needs a real renderer process, so — like the WGC capture
 mechanism and `minimized-check.ts`'s `IsIconic` call — it stays
 manual/E2E-verified rather than unit-tested.
 
+**Web client core** (established by #33; the client `pause()` breadcrumb
+above is still open — nothing calls it yet). `static/client/` is plain
+HTML/CSS/vanilla JS, no bundler, no framework, matching this repo's
+no-runtime-dependency rule (`package.json` still has zero `dependencies`).
+Three new pieces on the host side, all `src/host/http/routes.ts` appends
+rather than surgery on `POST /solve`/`GET /events`/`GET /answers`:
+
+- **`GET /config`** — `{ targetWindow }`, the one thing a client can't learn
+  from `GET /events` alone: what the target is *right now*, before any
+  `config` frame has ever been broadcast. Deliberately narrower than the
+  full `ScreenSolverConfig` — `provider` stays unexposed since nothing
+  through #33 writes it.
+- **`GET /windows`** / **`POST /config/target`** — the picker's list and
+  commit action, both thin wrappers over `ConfigStore.listWindows()` /
+  `.setTargetWindow()`. The body parser (`router.ts`'s new `readJsonBody`)
+  is the one genuinely new mechanism: unbuffered request bodies had no
+  reader anywhere in this codebase before `POST /config/target` needed one.
+  An empty body parses as `null` (clear the target) rather than rejecting,
+  so a client doesn't have to send a literal `null` payload for the common
+  "no body" case.
+- **`config{target}` on the SSE wire** — `EventBroadcaster` gains a fourth
+  broadcast method alongside `start`/`delta`/`done`/`error`/`sync`/`status`,
+  and `createHostRoutes` subscribes it to `ConfigStore.onChange` whenever a
+  `configStore` is supplied. This is the belated other half of #28's own
+  `config{target}` — its doc comment used to say the event "already has its
+  own home on `ConfigStore.onChange`... and isn't this broadcaster's job",
+  written before any client existed to actually listen. Now one does, so a
+  target change (a fresh pick, *or* #32's own mid-run fallback to `null`)
+  reaches every open tab live instead of only being visible on reload. No
+  catch-up replay on `subscribe()`, unlike `sync`/`status`: a freshly
+  connecting client already gets the current target from a plain `GET
+  /config`, so there's nothing "in flight" for a catch-up frame to backfill
+  — see `broadcaster.ts`'s own doc comment on the `config` variant of
+  `SseEvent`. This also changed two pre-existing tests'
+  expectations (`solve-http.test.ts`'s vanished-target case,
+  `failure-taxonomy.test.ts`'s mid-run-loss case): both used to assert "no
+  SSE traffic at all" for the picker fallback, which was only ever true
+  because nothing broadcast it yet — now it's a `config` frame, and the
+  tests assert that instead.
+
+**Static asset serving** (established by #33; nothing served files before
+this). `http/static.ts`'s `createStaticRoutes({ dir })` reads every file
+under a directory once at startup (recursive `readdir`, `withFileTypes` +
+`recursive: true` — Node ≥20.12, well inside this repo's `>=24` floor) and
+turns each into its own exact-match `GET` route serving the file from
+memory, content-type keyed off the extension. Deliberately not a wildcard
+"catch everything under this prefix" handler: `router.ts`'s own comment
+("the v1 HTTP surface has no path parameters") stays true, since this still
+registers one literal route per file rather than adding pattern matching to
+the router itself. `index.html` also gets a second route at bare `/`, so
+opening the server's own URL is the same as opening `/index.html`. Wired
+into `bootstrap.ts` as an *optional* `runtime.clientStaticDir` — appended
+after `createHostRoutes`'s own routes rather than folded into that function,
+so the `runtime.routes` full-bypass escape hatch (existing tests that inject
+routes directly) stays a bypass of static serving too, not partially
+reintroduced behind it. `src/main/index.ts` passes `paths.ts`'s new
+`webClientDir` (`static/client/`); tests that don't care about the web
+client simply never set it, and get no static routes at all — the same
+"safe default that does less" shape every other optional `HostRuntime` field
+already has.
+
 **Shutdown ordering** (established by #31, tightened across three rounds of
 review). Anything that persists on its way out has to be drained by
 `StartedHost.shutdown()` (`bootstrap.ts`) *before* the resources it depends on

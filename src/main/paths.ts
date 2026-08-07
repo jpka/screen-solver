@@ -12,6 +12,9 @@ export const appRoot = fileURLToPath(new URL('../../', import.meta.url));
 /** Static assets served or loaded as-is; not compiled, not copied. */
 export const staticRoot = fileURLToPath(new URL('../../static/', import.meta.url));
 
+/** The web client (#33) -- served at the HTTP server's root by `createStaticRoutes` (`src/host/http/static.ts`). */
+export const webClientDir = fileURLToPath(new URL('../../static/client/', import.meta.url));
+
 /** The page loaded into the hidden renderer. Capture mechanism lands here (#30). */
 export const hiddenRendererPage = fileURLToPath(
   new URL('../../static/renderer/index.html', import.meta.url),

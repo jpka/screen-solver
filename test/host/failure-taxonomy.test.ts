@@ -496,8 +496,11 @@ describe('#32 failure taxonomy: mid-run target loss', () => {
       'fell back to the picker by clearing the configured target',
     );
 
-    const frame = await events.raceTimeout(150);
-    assert.equal(frame, 'timeout', 'the fallback is a config change, not SSE traffic');
+    // #33 wires `ConfigStore.onChange` onto the wire as a `config` frame, so
+    // a connected client learns about this fallback live -- "not SSE
+    // traffic" no longer holds now that a client actually exists to tell.
+    const [frame] = await events.take(1);
+    assert.deepEqual(frame, { type: 'config', target: null });
   });
 
   it('a re-resolved target (vanished once, found again) proceeds silently -- no fallback, the solve still happens', async (t) => {

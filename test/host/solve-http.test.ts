@@ -590,12 +590,23 @@ describe('POST /solve + GET /events', () => {
     const response = await fetch(`${h.server.url}/solve`, { method: 'POST' });
     assert.equal(response.status, 202);
 
+    // No `targetIntent` was injected, so the loop's default always-`'active'`
+    // tracker treats this vanished target as an unexpected loss (#32) and
+    // falls back to the picker via `configStore.setTargetWindow(null)` --
+    // which is real disk I/O (`config.json`), so wait on the attempt actually
+    // settling rather than just a couple of microtask hops.
+    await h.solveLoop.settled();
     await flush();
 
-    assert.equal(h.fakeProvider.calls.length, 0);
+    assert.equal(h.fakeProvider.calls.length, 0, 'no spend either way -- this is still the "silent" no-spend guard');
     assert.equal(h.outcomes.length, 0);
-    const frame = await events.raceTimeout(150);
-    assert.equal(frame, 'timeout');
+
+    // "Silent" means no provider spend, not literal SSE silence: #33 wires
+    // `ConfigStore.onChange` onto the wire as a `config` frame, so a
+    // connected client learns about the fallback live instead of the picker
+    // only reappearing on a manual reload.
+    const [frame] = await events.take(1);
+    assert.deepEqual(frame, { type: 'config', target: null });
   });
 
   it('delivers a provider error{kind} to the wire as a terminal event', async (t) => {
