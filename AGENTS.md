@@ -157,6 +157,56 @@ interrupt-and-replace means two outcomes can genuinely be in flight at once,
 and unserialized concurrent `fs.appendFile` calls race on disk-completion
 order rather than preserving call order.
 
+**Standing status pill** (established by #32; corrects this section's own
+earlier guess that it would land as a third JSONL log -- it didn't. Nothing
+in the spec or #32's acceptance criteria asks for a persisted status
+history, only a live signal and one console line, so it stays in-memory
+like `EventBroadcaster`'s own accumulated text, not a fourth file under the
+state root). Two new pieces, both consumed from `solve/loop.ts`:
+
+- **`solve/status.ts`**'s `StatusTracker` is the escalation ladder itself
+  (`silent → auto-recovering → sticky`) as a pure function of
+  `SolveOutcome` — no I/O, no `EventBroadcaster` dependency, so the rules
+  (`done` resolves anything standing, including `sticky`; `auth` always
+  escalates straight to `sticky` and doesn't get displaced by a later
+  `transient`/`refusal`; `interrupted` never moves it) are unit-tested in
+  isolation. `onOutcome` returns `null` on no-op transitions (e.g. a second
+  `auth` error while already `sticky`) specifically so the caller doesn't
+  have to diff snapshots itself just to avoid a duplicate SSE frame or
+  console line.
+- **`EventBroadcaster`** gained a `status{level,kind}` SSE frame alongside
+  `start`/`delta`/`done`/`error`/`sync` — the spec's "standing status
+  indicator... over the existing SSE channel" (story 38) ruled out a
+  separate endpoint. `subscribe()` replays the current non-`silent` status
+  to a freshly-connecting client exactly the way it already replays
+  `sync{text}` to one connecting mid-flight, so a client that opens during
+  an ongoing problem learns about it immediately rather than only on the
+  next failure.
+
+`loop.ts` prints exactly one console line on the way *into* `sticky`
+(`logger.error`) — the acceptance criterion's own wording — and one more on
+the way back to `silent` (`logger.info`, not required but cheap and keeps
+the console honest about recovery too).
+
+**Mid-run target loss** (established by #32). `capture/intent.ts`'s
+`TargetIntentTracker` (`'active' | 'paused'`) is the "deliberate pause vs
+unexpected loss" flag the spec calls for; nothing calls `pause()` yet (no
+client exists to ask for one — that's #33/#34's job), so production always
+reads `'active'` today. `loop.ts`'s pre-flight guard consults it the moment
+a target is found vanished: paused means ignored outright (the existing
+silent no-spend, no different from any other guard failure); active means
+exactly one extra `checkTargetStatus` re-check before concluding the target
+is really gone and falling back to the picker via
+`configStore.setTargetWindow(null)` — reusing #28's existing change
+broadcast and #30's existing "close the session when the target clears"
+reaction rather than inventing a second fallback mechanism. Renderer-crash
+escalation (the taxonomy's third branch) is a separate, unrelated concern —
+`capture/crash-restart-policy.ts` unit-tests the pure backoff/give-up ladder,
+but wiring it to a real `render-process-gone` event and hidden-window
+re-creation needs a real renderer process, so — like the WGC capture
+mechanism and `minimized-check.ts`'s `IsIconic` call — it stays
+manual/E2E-verified rather than unit-tested.
+
 **Shutdown ordering** (established by #31, tightened across three rounds of
 review). Anything that persists on its way out has to be drained by
 `StartedHost.shutdown()` (`bootstrap.ts`) *before* the resources it depends on

@@ -1,5 +1,6 @@
 import type { ServerResponse } from 'node:http';
 import type { ProviderErrorKind, Usage } from '../provider/types.ts';
+import type { StatusSnapshot } from './status.ts';
 
 /**
  * The SSE wire vocabulary: the spec's full vocabulary minus `config{target}`,
@@ -7,13 +8,24 @@ import type { ProviderErrorKind, Usage } from '../provider/types.ts';
  * this broadcaster's job. `sync{text}` (#31) is sent only to one
  * newly-subscribing client mid-flight, in place of `start` -- see
  * {@link EventBroadcaster.subscribe}.
+ *
+ * `status{level,kind}` (#32) is the standing status pill's wire home -- the
+ * spec calls for "a standing status indicator... over the existing SSE
+ * channel" (story 38) rather than a separate push/toast mechanism, so it
+ * rides this same broadcast the way every other event here does, not a new
+ * endpoint. Broadcast only on an actual level change (`status.ts`'s own
+ * `onOutcome` already suppresses no-op transitions), and replayed to a
+ * newly-subscribing client whenever it isn't `silent`, the same "catch this
+ * one connecting client up" idea `sync` already uses -- see
+ * {@link EventBroadcaster.subscribe}.
  */
 export type SseEvent =
   | { readonly type: 'start' }
   | { readonly type: 'delta'; readonly text: string }
   | { readonly type: 'done'; readonly usage: Usage }
   | { readonly type: 'error'; readonly kind: ProviderErrorKind }
-  | { readonly type: 'sync'; readonly text: string };
+  | { readonly type: 'sync'; readonly text: string }
+  | { readonly type: 'status'; readonly level: StatusSnapshot['level']; readonly kind: StatusSnapshot['kind'] };
 
 /**
  * One shared broadcast to every connected `GET /events` client -- no
@@ -54,12 +66,22 @@ export interface EventBroadcaster {
    * for a late-joining client.
    */
   currentText(): string;
+  /**
+   * Records the standing status pill's new reading and broadcasts `status`
+   * (#32) -- `loop.ts` calls this with whatever `status.ts`'s `StatusTracker`
+   * hands back, which is already `null`-filtered down to real level changes
+   * only.
+   */
+  status(snapshot: StatusSnapshot): void;
+  /** The pill's current reading -- `subscribe()` reads this to catch up a newly-connecting client; `silent` is the default and is never itself replayed (nothing to catch up on). */
+  currentStatus(): StatusSnapshot;
 }
 
 export function createEventBroadcaster(): EventBroadcaster {
   const clients = new Set<ServerResponse>();
   let text = '';
   let inFlight = false;
+  let status: StatusSnapshot = { level: 'silent', kind: null };
 
   function broadcast(event: SseEvent): void {
     const frame = frameFor(event);
@@ -100,6 +122,20 @@ export function createEventBroadcaster(): EventBroadcaster {
         }
       }
 
+      if (status.level !== 'silent') {
+        // Same "catch this one client up" idea as `sync` above, for the
+        // status pill: a client that opens for the first time during an
+        // ongoing `sticky`/`auto-recovering` episode learns about it
+        // immediately, rather than only on the *next* failure -- "the pill
+        // only speaks to whichever client is currently open" (spec) still
+        // holds, since this only ever reaches the one client asking.
+        try {
+          res.write(frameFor({ type: 'status', level: status.level, kind: status.kind }));
+        } catch {
+          clients.delete(res);
+        }
+      }
+
       return () => {
         clients.delete(res);
       };
@@ -127,6 +163,13 @@ export function createEventBroadcaster(): EventBroadcaster {
     },
 
     currentText: () => text,
+
+    status(snapshot) {
+      status = snapshot;
+      broadcast({ type: 'status', level: snapshot.level, kind: snapshot.kind });
+    },
+
+    currentStatus: () => status,
   };
 }
 

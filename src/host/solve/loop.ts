@@ -1,12 +1,14 @@
 import type { CaptureSessionCoordinator } from '../capture/session-coordinator.ts';
 import { checkTargetStatus } from '../capture/target-status.ts';
+import { createTargetIntentTracker, type TargetIntentTracker } from '../capture/intent.ts';
 import type { IsTargetMinimized } from '../capture/types.ts';
 import type { ConfigStore } from '../config/store.ts';
 import type { EnumerateWindows, TargetWindowIdentity } from '../config/types.ts';
 import { silentLogger, type Logger } from '../logger.ts';
 import type { Provider } from '../provider/types.ts';
 import type { EventBroadcaster } from './broadcaster.ts';
-import type { SolveOutcomeEvent } from './types.ts';
+import { createStatusTracker, type StatusTracker } from './status.ts';
+import type { SolveOutcome, SolveOutcomeEvent } from './types.ts';
 
 /** Safe default when no `enumerateWindows` is injected: every target looks vanished -- the same "no windows" fallback `config/store.ts` and `bootstrap.ts` already use. */
 const NO_WINDOWS: EnumerateWindows = () => Promise.resolve([]);
@@ -31,6 +33,14 @@ export interface SolveLoopDeps {
    * actually finished writing, not just been kicked off.
    */
   readonly onOutcome?: (event: SolveOutcomeEvent) => void | Promise<void>;
+  /**
+   * The "deliberate pause vs unexpected loss" intent flag (#32; see
+   * `capture/intent.ts`). Left unset, a fresh tracker is created that always
+   * reads `'active'` -- every vanished target is treated as an unexpected
+   * loss, which is today's only reachable behavior since no caller yet wires
+   * a pause action to it.
+   */
+  readonly targetIntent?: TargetIntentTracker;
   readonly logger?: Logger;
 }
 
@@ -109,6 +119,11 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
   const logger = deps.logger ?? silentLogger;
   const enumerateWindows = deps.enumerateWindows ?? NO_WINDOWS;
   const isTargetMinimized = deps.isTargetMinimized ?? NEVER_MINIMIZED;
+  const targetIntent = deps.targetIntent ?? createTargetIntentTracker();
+  // One tracker for the life of this loop -- the standing status pill (#32)
+  // is app-wide, not per-attempt, so it has to survive across `runAttempt`
+  // calls the same way `broadcaster`'s own in-flight text does.
+  const statusTracker: StatusTracker = createStatusTracker();
 
   let controller: AbortController | null = null;
   let latest: Promise<void> = Promise.resolve();
@@ -154,9 +169,47 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
   }
 
   async function runAttempt(target: TargetWindowIdentity, signal: AbortSignal): Promise<void> {
-    const status = await checkTargetStatus(target, { enumerateWindows, isTargetMinimized });
+    let status = await checkTargetStatus(target, { enumerateWindows, isTargetMinimized });
     if (signal.aborted) return;
-    if (status.presence === 'vanished' || status.minimized) return;
+
+    if (status.presence === 'vanished') {
+      if (targetIntent.current() === 'paused') {
+        // Deliberate pause (spec: "Three-way split on an app-tracked intent
+        // flag: deliberate pause → ignored..."): a vanished target is
+        // expected right now and is ignored outright -- same silent no-spend
+        // as any other pre-flight guard failure, no re-resolution, no
+        // fallback.
+        return;
+      }
+
+      // Unexpected loss: exactly one silent re-resolution attempt before
+      // concluding the target is genuinely gone (spec: "...unexpected loss →
+      // one silent re-resolution, then fallback to the picker"). Re-running
+      // the full check (not just presence) means a target that's back also
+      // has its minimized-ness re-read, rather than trusting a stale `false`
+      // default from the first, vanished-branch check.
+      status = await checkTargetStatus(target, { enumerateWindows, isTargetMinimized });
+      if (signal.aborted) return;
+
+      if (status.presence === 'vanished') {
+        // Still gone: fall back to the picker by clearing the configured
+        // target. `ConfigStore.setTargetWindow` (#28) both persists the
+        // clear and broadcasts `config{target: null}` to every connected
+        // client -- #33's eventual picker reacts to that; #30's capture
+        // session coordinator reacts to the very same change by tearing down
+        // the now-pointless session. Nothing further to do here, and no
+        // provider call was ever spent (spec table: "N/A").
+        await deps.configStore.setTargetWindow(null).catch((error: unknown) => {
+          logger.error(
+            `solve loop: failed to clear the vanished target ${target.processName} / "${target.title}": ${describeError(error)}`,
+          );
+        });
+        return;
+      }
+      // Re-resolved on the retry: fall through and treat it exactly as if
+      // the first check had already found it present.
+    }
+    if (status.minimized) return;
 
     const frame = await deps.captureSessionCoordinator.captureFrame();
     if (signal.aborted) return;
@@ -176,22 +229,20 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
           text += event.text;
           deps.broadcaster.delta(event.text);
           break;
-        case 'done':
+        case 'done': {
           deps.broadcaster.done(event.usage);
-          await deps.onOutcome?.({
-            outcome: { type: 'done', text, usage: event.usage, stopReason: event.stopReason },
-            target,
-            model: deps.provider.model,
-          });
+          const outcome: SolveOutcome = { type: 'done', text, usage: event.usage, stopReason: event.stopReason };
+          applyStatusTransition(outcome);
+          await deps.onOutcome?.({ outcome, target, model: deps.provider.model });
           return;
-        case 'error':
+        }
+        case 'error': {
           deps.broadcaster.error(event.kind);
-          await deps.onOutcome?.({
-            outcome: { type: 'error', kind: event.kind, message: event.message, text },
-            target,
-            model: deps.provider.model,
-          });
+          const outcome: SolveOutcome = { type: 'error', kind: event.kind, message: event.message, text };
+          applyStatusTransition(outcome);
+          await deps.onOutcome?.({ outcome, target, model: deps.provider.model });
           return;
+        }
       }
     }
 
@@ -199,12 +250,46 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     // no throw, no terminal event -- this is the only documented way the loop
     // reaches here without a `done`/`error` above.
     if (signal.aborted) {
-      await deps.onOutcome?.({ outcome: { type: 'interrupted', text }, target, model: deps.provider.model });
+      const outcome: SolveOutcome = { type: 'interrupted', text };
+      // `interrupted` never moves the status ladder (`status.ts`'s own
+      // rules) -- called anyway so the "one place decides" property holds
+      // even though this call is always a no-op today.
+      applyStatusTransition(outcome);
+      await deps.onOutcome?.({ outcome, target, model: deps.provider.model });
     } else {
       logger.error(
         'solve loop: the provider iterable ended without a terminal event and no abort was requested ' +
           '-- this violates the provider seam contract (see src/host/provider/types.ts)',
       );
+    }
+  }
+
+  /**
+   * Folds one outcome into the standing status pill (#32), broadcasting
+   * `status` and printing the one required console line only when the level
+   * actually changed -- `statusTracker.onOutcome` already does the
+   * "did anything change" filtering, so this is purely "what to do once it
+   * has".
+   *
+   * The console line is the acceptance criterion's own wording: "A sticky
+   * status transition prints one line to the host's console" -- printed on
+   * the way *into* `sticky`. The matching recovery line (back to `silent`,
+   * whether from `sticky` or `auto-recovering`) isn't required by that
+   * criterion but costs nothing and keeps the console from going quiet about
+   * a problem it already announced.
+   */
+  function applyStatusTransition(outcome: SolveOutcome): void {
+    const transition = statusTracker.onOutcome(outcome);
+    if (transition === null) return;
+
+    deps.broadcaster.status(transition);
+
+    if (transition.level === 'sticky') {
+      logger.error(
+        `status: the standing status pill is now STICKY (${String(transition.kind)}) -- this will keep failing on every future solve until it's fixed outside the app.`,
+      );
+    } else if (transition.level === 'silent') {
+      logger.info('status: the standing status pill is back to normal.');
     }
   }
 

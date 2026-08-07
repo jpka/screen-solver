@@ -1,3 +1,4 @@
+import type { TargetIntentTracker } from '../capture/intent.ts';
 import type { IsTargetMinimized } from '../capture/types.ts';
 import type { CaptureSessionCoordinator } from '../capture/session-coordinator.ts';
 import type { ConfigStore } from '../config/store.ts';
@@ -21,6 +22,8 @@ export interface HostRoutesDeps {
   readonly enumerateWindows?: EnumerateWindows;
   /** #30's minimized check, the other half of the pre-flight guard. Left unset, no target is ever treated as minimized. */
   readonly isTargetMinimized?: IsTargetMinimized;
+  /** #32's deliberate-pause-vs-unexpected-loss intent flag. Left unset, a fresh always-`'active'` tracker is used -- every vanished target is treated as an unexpected loss. */
+  readonly targetIntent?: TargetIntentTracker;
   /** #29's internal outcome bus -- see `src/host/solve/types.ts`. #31's `bootstrap.ts` wires this to a `SolveLogRecorder` that writes `answers.jsonl`/`usage.jsonl`. */
   readonly onOutcome?: (event: SolveOutcomeEvent) => void | Promise<void>;
   /** #31's `answers.jsonl` reader -- `GET /answers` serves its full backlog. Left unset, `GET /answers` answers `[]` (the same "nothing configured yet" default `enumerateWindows`/`isTargetMinimized` already use). */
@@ -68,6 +71,7 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
           broadcaster,
           enumerateWindows: deps.enumerateWindows,
           isTargetMinimized: deps.isTargetMinimized,
+          targetIntent: deps.targetIntent,
           onOutcome: deps.onOutcome,
           logger: deps.logger,
         })
