@@ -43,6 +43,7 @@ constructor parameter properties.
 
 ```
 src/host/     plain Node. Imports Electron nowhere. All decision logic.
+src/host/provider/  the model call, behind one swappable seam (#27).
 src/main/     Electron main: thin. userData path, single-instance lock,
               the one hidden BrowserWindow, exit codes. Nothing to decide here.
 static/       assets loaded/served as-is; not compiled, not copied by the build.
@@ -56,6 +57,16 @@ made structural: put new logic in `src/host` behind injected dependencies so it
 is testable without launching Electron. HTTP routes are a plain list —
 `createHostRoutes()` in `src/host/http/routes.ts` — so `POST /solve`,
 `GET /events`, and `GET /answers` are appends, not surgery.
+
+**Outbound HTTP** (established by #27). `package.json` has no runtime
+dependencies and shouldn't grow one for a REST API: talk to it with `fetch`
+from a thin transport module, and have the module that owns the logic take that
+transport as an injected function. `src/host/provider/` is the worked example —
+`transport.ts` is HTTP and SSE mechanics with no domain knowledge, `anthropic.ts`
+is domain logic that never touches the network, and the suite drives real
+streams and real failure shapes through both with no server and no fixtures.
+Reach for an SDK only when the protocol is genuinely more than request/response,
+and say why in the PR.
 
 ### Environment setup
 
