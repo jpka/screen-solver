@@ -61,6 +61,17 @@ export class PayloadTooLargeError extends Error {
  */
 export function readJsonBody(req: IncomingMessage, maxBytes = MAX_JSON_BODY_BYTES): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    // A baseline listener that stays attached for this request's entire
+    // life, independent of `settle()` below. Node's `EventEmitter` throws
+    // (crashing the whole host process, not just failing this request) when
+    // an `error` event fires with zero listeners registered -- and `settle`
+    // deliberately removes the "real" `onError` listener once this promise
+    // has already resolved or rejected, so a later error (e.g. a client
+    // disconnecting mid-drain of an oversized body that's still being read)
+    // would otherwise have nothing left to catch it (review feedback: the
+    // first version of the oversized-body path did exactly this).
+    req.on('error', () => {});
+
     const chunks: Buffer[] = [];
     let received = 0;
     let settled = false;
@@ -85,6 +96,9 @@ export function readJsonBody(req: IncomingMessage, maxBytes = MAX_JSON_BODY_BYTE
         // drains and discards whatever's left with no listener attached to
         // buffer it -- bounded memory, same as rejecting, but the
         // connection stays alive long enough to actually deliver the `413`.
+        // The baseline listener above is what makes this safe: `settle()`
+        // just removed `onError`, but a socket error during this drain
+        // still has somewhere to go.
         req.resume();
         return;
       }
