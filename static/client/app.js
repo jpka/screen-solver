@@ -369,10 +369,28 @@
     // fetch ran, in which case the snapshot above already contains it and
     // replaying would duplicate the row. Matched on `_id` (the content
     // fingerprint), not `_uid` -- see the identity doc comment above.
+    //
+    // A *count* per fingerprint, not a `Set` (review, round 2): two
+    // genuinely distinct completed attempts can share a fingerprint (the
+    // same "solving the same exercise twice in a row" case `_id`'s own doc
+    // comment already flags), and can both be queued while only one of them
+    // has actually landed in the snapshot yet (the recorder's writes don't
+    // all complete before this fetch resolves). A `Set.has()` membership
+    // check can't tell "already accounted for by the snapshot" from
+    // "another queued entry with the same fingerprint already claimed
+    // that", so it dropped *both* -- silently losing a real completed
+    // attempt. Decrementing a count as each queued entry claims one
+    // snapshot occurrence makes only as many queued entries "already
+    // there" as the snapshot actually contains that many times.
     historySnapshotLoaded = true;
-    const alreadyPersisted = new Set(historyEntries.map((e) => e._id));
+    const remainingInSnapshot = new Map();
+    for (const entry of historyEntries) {
+      remainingInSnapshot.set(entry._id, (remainingInSnapshot.get(entry._id) ?? 0) + 1);
+    }
     for (const queued of queuedDemotedEntries) {
-      if (!alreadyPersisted.has(queued._id)) historyEntries.unshift(queued);
+      const remaining = remainingInSnapshot.get(queued._id) ?? 0;
+      if (remaining > 0) remainingInSnapshot.set(queued._id, remaining - 1);
+      else historyEntries.unshift(queued);
     }
     queuedDemotedEntries.length = 0;
 
