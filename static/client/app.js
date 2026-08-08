@@ -65,7 +65,10 @@
   //
   // `historyEntries` is the persisted log: the `GET /answers` snapshot plus
   // anything `demoteLiveEntry` has folded in since, newest first, each
-  // frozen with a stable `_id` the moment it's created.
+  // frozen with a stable `_uid` (the UI selection identity) the moment it's
+  // created -- see the doc comment on `nextEntryUid` below for why that's a
+  // separate field from `_id`, the content-fingerprint identity used only
+  // for dedup.
   //
   // There is deliberately no separate "pane mode" per layout (live vs.
   // history) the way the rejected D-only prototype had -- both layouts
@@ -301,6 +304,21 @@
     ]);
   }
 
+  // A history entry carries two different identities, deliberately kept
+  // apart (Greptile review on this PR): `_id` (`completionIdentity`) is a
+  // *content* fingerprint, used only to answer "does the snapshot already
+  // contain this" during the merge below -- it's fine, even correct, for
+  // two independent entries to collide on it, since that's exactly what
+  // marks a queued fold as already-persisted. `_uid` is a per-entry
+  // identity for the UI (`openEntryId`, both layouts' click-to-open), and
+  // has to be unique per entry even when the content is byte-identical --
+  // `completionIdentity`'s own doc comment already calls out that solving
+  // the same exercise twice in a row can legitimately produce identical
+  // text *and* usage. Reusing the content fingerprint as the UI id (an
+  // earlier version of this file did) collapses two such entries onto one
+  // selectable card and strands the other, unreachable.
+  let nextEntryUid = 1;
+
   /**
    * Folds a finished `liveEntry` into `historyEntries` and clears the live
    * slot, called right before a new `start` claims it. Only a cleanly
@@ -314,7 +332,7 @@
   function demoteLiveEntry() {
     if (!liveEntry) return;
     if (liveEntry.state === 'done') {
-      const finished = { ...liveEntry, _id: completionIdentity(liveEntry) };
+      const finished = { ...liveEntry, _id: completionIdentity(liveEntry), _uid: nextEntryUid++ };
       if (historySnapshotLoaded) historyEntries.unshift(finished);
       else queuedDemotedEntries.push(finished);
     }
@@ -322,7 +340,7 @@
     // `openEntryId` is left untouched: if it was `'live'`, it now naturally
     // refers to whatever `start` sets up next (the whole point of the
     // sentinel); if it was pointing at some other history entry, that
-    // entry's `_id` is unaffected by this fold.
+    // entry's `_uid` is unaffected by this fold.
   }
 
   async function loadHistory() {
@@ -341,7 +359,7 @@
     historyEntries = snapshot
       .slice()
       .reverse()
-      .map((entry) => ({ ...entry, _id: completionIdentity(entry) }));
+      .map((entry) => ({ ...entry, _id: completionIdentity(entry), _uid: nextEntryUid++ }));
 
     // Whether the fetch succeeded or not, the snapshot phase is over -- any
     // fold that happened while it was in flight was queued rather than
@@ -349,8 +367,8 @@
     // above). Replay it now, on top of what the snapshot just produced --
     // except when the recorder's JSONL write already landed before this
     // fetch ran, in which case the snapshot above already contains it and
-    // replaying would duplicate the row. See `completionIdentity` for what
-    // "already contains it" is judged by, and why.
+    // replaying would duplicate the row. Matched on `_id` (the content
+    // fingerprint), not `_uid` -- see the identity doc comment above.
     historySnapshotLoaded = true;
     const alreadyPersisted = new Set(historyEntries.map((e) => e._id));
     for (const queued of queuedDemotedEntries) {
@@ -446,7 +464,7 @@
     const live = liveEntry
       ? { ...liveEntry, id: 'live', isLive: true }
       : { id: 'live', isLive: true, title: null, text: IDLE_TEXT, state: 'idle' };
-    const history = historyEntries.map((entry) => ({ ...entry, id: entry._id, isLive: false }));
+    const history = historyEntries.map((entry) => ({ ...entry, id: entry._uid, isLive: false }));
     return [live, ...history];
   }
 
