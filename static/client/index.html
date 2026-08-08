@@ -9,9 +9,16 @@
   <body>
     <header class="app-header">
       <h1>Screen Solver</h1>
+      <span id="connection-indicator" class="connection-indicator"></span>
       <span id="status-pill" class="status-pill" hidden></span>
+      <button id="fullscreen-button" type="button" class="icon-button" title="Fullscreen">&#9974;</button>
       <button id="solve-button" type="button" disabled>Solve now</button>
     </header>
+
+    <div id="target-bar" class="target-bar" hidden>
+      <span id="target-label" class="target-label"></span>
+      <div id="solve-error" class="error-message" hidden></div>
+    </div>
 
     <main>
       <section id="picker" class="panel" hidden>
@@ -22,17 +29,13 @@
         <button id="refresh-windows" type="button">Refresh list</button>
       </section>
 
-      <section id="answer-pane" class="panel" hidden>
-        <h2>Current answer</h2>
-        <div id="target-label" class="target-label"></div>
-        <div id="solve-error" class="error-message" hidden></div>
-        <pre id="answer-text" class="answer-text" data-state="idle">Click &quot;Solve now&quot; to analyze the target window.</pre>
-      </section>
-
-      <section id="history-pane" class="panel">
-        <h2>History</h2>
-        <ul id="history-list" class="history-list"></ul>
-      </section>
+      <!--
+        Populated entirely from app.js's render() -- which of the two layouts
+        (continuous log / split rail) lands here depends on orientation, so
+        there is no static markup to give it beyond this mount point. See
+        #34 / prototype/21-web-client for why.
+      -->
+      <section id="entries-root" class="entries-root" hidden></section>
     </main>
 
     <script src="/app.js"></script>

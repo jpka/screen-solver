@@ -315,6 +315,83 @@ Electron's own quit sequence resume via an explicit `app.exit()` once
 `host.shutdown()` has settled (bound and all), so a leftover handle can't
 silently keep the process alive after shutdown has already given up on it.
 
+**Web client responsive layout** (established by #34, closing out #25's own
+spec). `static/client/` gains two phone-oriented layouts picked by
+orientation, swapping live with no reload -- nothing on the host side
+changed, this is entirely `app.js`/`styles.css`/`index.html`.
+
+- **Orientation is `innerWidth > innerHeight` directly, not a media query,
+  with a 480px landscape floor.** Verified against `prototype/21-web-client`
+  (#21's real-device prototyping, kept on that branch as prior art, not
+  promoted to `main`): a compound `matchMedia` query is one more thing that
+  can silently fail to match; a direct dimension comparison cannot.
+  `matchMedia`/`resize`/`orientationchange` are kept only as change
+  *triggers* that ask the comparison to re-run -- `orientationchange` in
+  particular re-checks again a frame later and once more after a short
+  delay, since Android fires it before the resize settles. The 480px floor
+  (clearing every phone in landscape, iPhone SE included) exists so a narrow
+  desktop window that happens to be taller-than-wide-adjacent doesn't get a
+  rail it has no room for.
+- **One `openEntryId`, not a per-layout pane mode.** Portrait
+  (`app.js`'s `renderPortrait`) is a continuous log -- one feed, physical
+  order fixed (newest/live first), whichever entry is "open" renders
+  expanded and outlined, everything else collapses to a line, tapping a
+  collapsed one opens it. Landscape (`renderLandscape`) is a 132px rail
+  (every entry, collapsed, live pinned at top) beside a single detail pane
+  holding whichever entry is open. Both layouts read the exact same
+  `openEntryId`, which is deliberately why a rotation needs no explicit
+  normalization step: the prototype's own writeup documented a "forced-
+  variant trap" where its rail's separate `paneMode: 'history'` concept
+  didn't survive being carried into the log layout unchanged (a live entry
+  rendered with history's chrome). There is only ever one open entry here,
+  full stop, so that mismatch has nowhere to live.
+- **`liveEntry` vs. `historyEntries` is folded, not duplicated.** The `#33`
+  client rendered "the current answer" and "history" as two independent
+  views, so a completed answer showed up twice (once in each). `#34`
+  collapses that: `liveEntry` is this session's current-or-just-finished
+  attempt, always referenced by the sentinel id `'live'`; `demoteLiveEntry()`
+  folds a *finished* (`state === 'done'`) one into `historyEntries` right
+  before the next `start` claims the slot, using the same
+  `completionIdentity`-keyed dedup queue #33 built for the snapshot-vs-stream
+  race (a fold that happens before `GET /answers` resolves is queued and
+  replayed after, filtered against what the snapshot already contains). A
+  bail or an `error` is simply dropped at that point, matching what
+  `logs/recorder.ts` would (not) persist -- there is nothing a reload would
+  ever show for either.
+- **The connection indicator collapses two signals onto one**, per the
+  prototype's own settled finding: the SSE socket's own state
+  (`connecting`/`connected`/`reconnecting`/`disconnected`, tracked off
+  `EventSource`'s native `open`/`error` events and `readyState`) while
+  `openEntryId === 'live'`, replaced wholesale by "Viewing history" the
+  moment it isn't -- a history view has no use for "the live socket is
+  fine underneath". A transient `syncing…` tag rides along, set on a `sync`
+  catch-up frame and cleared the moment a real `delta` resumes (or anything
+  else ends the window: `done`/`error`/a fresh `start`).
+- **Fullscreen is feature-detected, not assumed.** `document.documentElement
+  .requestFullscreen` (with the `webkit`-prefixed fallback) gates the
+  button's `disabled` state and its `title` tooltip -- confirmed functional
+  on Android Chrome by the same real-device prototyping; iPhone Safari has
+  never exposed the Fullscreen API for arbitrary elements, so there the
+  button renders visibly disabled with an explanation instead of failing
+  silently on click. ("Add to Home Screen" + a `display: standalone`
+  manifest is the prototype's noted alternate route for that case -- a
+  different mechanism, not built here.)
+
+Nothing here is unit-tested -- consistent with the ticket's own testing
+decision, and with #28's `window-enumeration.ts` / #30's `minimized-check.ts`
+precedent for "needs a real device/composited surface, stays manual/E2E-
+verified": there is no browser test runner in this repo, and orientation
+swap + fullscreen feature-detection both need a real (or at least a real
+Chromium) viewport to mean anything. Verified instead by booting the real
+HTTP surface (`createHostRoutes` + `createStaticRoutes`) against a temp
+state root and a scripted fake `Provider`, then driving it through a real
+Chromium viewport: the 480px floor's exact boundary (479px stays portrait,
+480px flips to landscape), rotation preserving whichever entry was open in
+both directions (live-open and history-open), the connection indicator's
+live/history swap, `demoteLiveEntry`'s fold-on-next-`start` behavior, and
+both the enabled and (via a feature-detection override, simulating iPhone
+Safari) disabled fullscreen-button states.
+
 ### Environment setup
 
 Claude Code web sessions provision the `mattpocock/skills` bundle (wayfinder, grilling, domain-modeling, ...) and a pinned, checksum-verified `gh` CLI via a `SessionStart` hook — see `.claude/hooks/session-start.sh`. Re-run it manually with `npm run setup`. `.agents/` and `.claude/skills/` are generated by that hook and gitignored, not committed; `skills-lock.json` records what was actually installed for drift-checking (the upstream skills repo has no supported way to pin an exact ref, so each run fetches its current HEAD).
