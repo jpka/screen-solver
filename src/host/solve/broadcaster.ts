@@ -1,11 +1,10 @@
 import type { ServerResponse } from 'node:http';
+import type { TargetWindowIdentity } from '../config/types.ts';
 import type { ProviderErrorKind, Usage } from '../provider/types.ts';
 import type { StatusSnapshot } from './status.ts';
 
 /**
- * The SSE wire vocabulary: the spec's full vocabulary minus `config{target}`,
- * which already has its own home on `ConfigStore.onChange` (#28) and isn't
- * this broadcaster's job. `sync{text}` (#31) is sent only to one
+ * The SSE wire vocabulary. `sync{text}` (#31) is sent only to one
  * newly-subscribing client mid-flight, in place of `start` -- see
  * {@link EventBroadcaster.subscribe}.
  *
@@ -18,6 +17,26 @@ import type { StatusSnapshot } from './status.ts';
  * newly-subscribing client whenever it isn't `silent`, the same "catch this
  * one connecting client up" idea `sync` already uses -- see
  * {@link EventBroadcaster.subscribe}.
+ *
+ * `config{target,revision}` (#33) mirrors `ConfigStore.onChange` (#28) onto
+ * the wire, so the client (#33) can react live to a target change -- a fresh
+ * pick from the picker, or #32's own mid-run fallback to `null` -- without a
+ * reload. Unlike `sync`/`status`, `subscribe()` never replays this on
+ * connect: a freshly-connecting client already gets the current target from
+ * a plain `GET /config`, so there is nothing "in flight" here for a catch-up
+ * frame to backfill.
+ *
+ * `revision` exists because a client has *two* independent, unordered
+ * sources for the target -- this SSE event and its own `GET /config`
+ * fetch -- and network delivery order between them says nothing about which
+ * one is actually more current (review feedback on #33's PR: a client that
+ * simply trusted "whichever arrived first" could permanently strand itself
+ * on a stale target if a slow-to-arrive `GET /config` response happened to
+ * describe a *later* change than an SSE frame the client had already
+ * applied). A monotonically increasing counter, bumped on every `config()`
+ * call and handed back by both `GET /config` (`routes.ts`) and this event,
+ * gives the client real ordering to compare against instead of guessing from
+ * arrival order.
  */
 export type SseEvent =
   | { readonly type: 'start' }
@@ -25,7 +44,8 @@ export type SseEvent =
   | { readonly type: 'done'; readonly usage: Usage }
   | { readonly type: 'error'; readonly kind: ProviderErrorKind }
   | { readonly type: 'sync'; readonly text: string }
-  | { readonly type: 'status'; readonly level: StatusSnapshot['level']; readonly kind: StatusSnapshot['kind'] };
+  | { readonly type: 'status'; readonly level: StatusSnapshot['level']; readonly kind: StatusSnapshot['kind'] }
+  | { readonly type: 'config'; readonly target: TargetWindowIdentity | null; readonly revision: number };
 
 /**
  * One shared broadcast to every connected `GET /events` client -- no
@@ -75,6 +95,22 @@ export interface EventBroadcaster {
   status(snapshot: StatusSnapshot): void;
   /** The pill's current reading -- `subscribe()` reads this to catch up a newly-connecting client; `silent` is the default and is never itself replayed (nothing to catch up on). */
   currentStatus(): StatusSnapshot;
+  /**
+   * Broadcasts a target-window change (#33) -- `routes.ts` wires this to
+   * `ConfigStore.onChange` whenever a `configStore` is supplied. Assigns and
+   * broadcasts the next revision number; no corresponding catch-up on
+   * `subscribe()`: see the `config{target,revision}` doc comment on
+   * {@link SseEvent} for why.
+   */
+  config(target: TargetWindowIdentity | null): void;
+  /**
+   * The revision last broadcast by {@link config} (`0` if `config()` has
+   * never been called) -- `routes.ts`'s `GET /config` hands this back
+   * alongside the current target, so a client can tell whether that
+   * snapshot is newer or older than whatever `config` SSE frame it may have
+   * already applied. See the `revision` doc comment on {@link SseEvent}.
+   */
+  currentConfigRevision(): number;
 }
 
 export function createEventBroadcaster(): EventBroadcaster {
@@ -82,6 +118,7 @@ export function createEventBroadcaster(): EventBroadcaster {
   let text = '';
   let inFlight = false;
   let status: StatusSnapshot = { level: 'silent', kind: null };
+  let configRevision = 0;
 
   function broadcast(event: SseEvent): void {
     const frame = frameFor(event);
@@ -170,6 +207,13 @@ export function createEventBroadcaster(): EventBroadcaster {
     },
 
     currentStatus: () => status,
+
+    config(target) {
+      configRevision += 1;
+      broadcast({ type: 'config', target, revision: configRevision });
+    },
+
+    currentConfigRevision: () => configRevision,
   };
 }
 

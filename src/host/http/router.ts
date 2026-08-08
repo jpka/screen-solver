@@ -26,6 +26,111 @@ export function sendJson(res: ServerResponse, status: number, body: unknown): vo
 }
 
 /**
+ * Every request body this HTTP surface's JSON routes ever legitimately need
+ * is a couple of short strings (`POST /config/target`'s `{processName,
+ * title}`) -- 64 KiB is generously past that, with headroom, while still
+ * bounding how much a single request can force this process to hold in
+ * memory before it's even been validated.
+ */
+export const MAX_JSON_BODY_BYTES = 64 * 1024;
+
+/** Thrown by {@link readJsonBody} when a request body exceeds {@link MAX_JSON_BODY_BYTES}. A distinct type so callers can answer `413` instead of the generic `400` a parse failure gets. */
+export class PayloadTooLargeError extends Error {
+  constructor(maxBytes: number) {
+    super(`Request body exceeds the ${maxBytes}-byte limit.`);
+    this.name = 'PayloadTooLargeError';
+  }
+}
+
+/**
+ * Buffers a request body and parses it as JSON -- the one thing the router
+ * itself has no built-in support for, since `POST /solve` (#29) never needed
+ * one. `POST /config/target` (#33) is the first route that does.
+ *
+ * An empty body parses as `null` rather than rejecting, so a client can
+ * `POST` with no body at all to mean "no target" without also having to send
+ * a literal `null` JSON payload. Malformed JSON rejects with the parse
+ * error; the caller decides how that becomes a `400`.
+ *
+ * Rejects with {@link PayloadTooLargeError} -- and stops reading, destroying
+ * the connection rather than draining it -- the moment accumulated bytes
+ * cross `maxBytes` (review feedback on #33's PR: the original version had no
+ * bound at all, so any client with network access could hand this an
+ * unbounded or endlessly-streamed body and exhaust process memory before
+ * validation ever ran).
+ */
+export function readJsonBody(req: IncomingMessage, maxBytes = MAX_JSON_BODY_BYTES): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    // A baseline listener that stays attached for this request's entire
+    // life, independent of `settle()` below. Node's `EventEmitter` throws
+    // (crashing the whole host process, not just failing this request) when
+    // an `error` event fires with zero listeners registered -- and `settle`
+    // deliberately removes the "real" `onError` listener once this promise
+    // has already resolved or rejected, so a later error (e.g. a client
+    // disconnecting mid-drain of an oversized body that's still being read)
+    // would otherwise have nothing left to catch it (review feedback: the
+    // first version of the oversized-body path did exactly this).
+    req.on('error', () => {});
+
+    const chunks: Buffer[] = [];
+    let received = 0;
+    let settled = false;
+
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+      fn();
+    };
+
+    function onData(chunk: Buffer): void {
+      received += chunk.length;
+      if (received > maxBytes) {
+        settle(() => reject(new PayloadTooLargeError(maxBytes)));
+        // Not `req.destroy()`: destroying the socket mid-write races the
+        // still-in-progress request body against the connection dying, and
+        // a client can observe that as a raw `ECONNRESET` instead of the
+        // `413` response the caller is about to send. `resume()` instead
+        // drains and discards whatever's left with no listener attached to
+        // buffer it -- bounded memory, same as rejecting, but the
+        // connection stays alive long enough to actually deliver the `413`.
+        // The baseline listener above is what makes this safe: `settle()`
+        // just removed `onError`, but a socket error during this drain
+        // still has somewhere to go.
+        req.resume();
+        return;
+      }
+      chunks.push(chunk);
+    }
+
+    function onEnd(): void {
+      settle(() => {
+        const raw = Buffer.concat(chunks).toString('utf8').trim();
+        if (raw === '') {
+          resolve(null);
+          return;
+        }
+        try {
+          resolve(JSON.parse(raw));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    }
+
+    function onError(error: Error): void {
+      settle(() => reject(error));
+    }
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+  });
+}
+
+/**
  * Turn a route table into a `http.createServer` listener.
  *
  * Handlers get the raw `res`, so a streaming endpoint (`GET /events`, #29) can

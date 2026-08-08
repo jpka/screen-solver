@@ -9,6 +9,7 @@ import { loadConfigStore, type ConfigStore } from './config/store.ts';
 import type { EnumerateWindows } from './config/types.ts';
 import { createHostRoutes } from './http/routes.ts';
 import type { Route } from './http/router.ts';
+import { createStaticRoutes } from './http/static.ts';
 import { createAnswerLog } from './logs/answer-log.ts';
 import { createSolveLogRecorder } from './logs/recorder.ts';
 import { createUsageLog } from './logs/usage-log.ts';
@@ -101,6 +102,15 @@ export interface HostRuntime {
    * never sets it.
    */
   readonly solveDrainTimeoutMs?: number;
+  /**
+   * The web client's static assets (#33) -- `src/main/index.ts` passes
+   * `paths.ts`'s `webClientDir` (`static/client/`, gitignored by the build,
+   * loaded as-is per `AGENTS.md`'s "Layout"). Left unset, no static routes
+   * are added at all -- the same "safe default that just does less" shape as
+   * `enumerateWindows`/`openCaptureSession`; existing tests that only care
+   * about the JSON routes don't have to know this exists.
+   */
+  readonly clientStaticDir?: string;
 }
 
 /** The state the app lives in for the rest of its life. */
@@ -195,8 +205,18 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
         logger,
       });
 
+  // #33's web client, appended after the JSON/SSE routes above rather than
+  // folded into `createHostRoutes` itself: static-asset serving has nothing
+  // to do with the solve loop's dependency wiring, and `runtime.routes`
+  // (the test-only full-bypass escape hatch) should stay a bypass of
+  // *everything* server-side, static assets included -- not partially
+  // reintroduced behind its back.
+  const staticRoutes = runtime.clientStaticDir
+    ? await createStaticRoutes({ dir: runtime.clientStaticDir })
+    : [];
+
   const startServer = runtime.startHttpServer ?? defaultStartHttpServer;
-  const server = await startServer({ binding, routes, logger });
+  const server = await startServer({ binding, routes: [...routes, ...staticRoutes], logger });
 
   logger.info(`Screen Solver state root: ${stateRoot}`);
   logger.info(`Screen Solver listening on ${server.url} (bound ${server.host}:${server.port})`);
