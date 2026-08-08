@@ -246,6 +246,35 @@
     return li;
   }
 
+  /**
+   * A completion's identity for de-duplicating a queued live entry against
+   * the `GET /answers` snapshot (see {@link loadHistory}). The server
+   * assigns no client-visible ID to a solve, so this is necessarily a
+   * heuristic -- but `text` alone is too weak (review feedback: solving the
+   * same exercise twice in a row can legitimately produce byte-identical
+   * output, which would make a real second answer look like a duplicate of
+   * the first and get silently dropped). Folding in the target identity and
+   * the *exact* token-usage tuple narrows this to "two independent calls
+   * produced the same text *and* the same target *and* the same four usage
+   * numbers" -- a provider call's real accounting varies with things the
+   * client has no control over (retries, exact image bytes, prompt-cache
+   * hits), so two genuinely different solves landing on identical usage as
+   * well as identical text is not a realistic collision, even though it
+   * remains possible in principle without a real ID from the server.
+   */
+  function completionIdentity(entry) {
+    const usage = entry.usage ?? {};
+    return JSON.stringify([
+      entry.text,
+      entry.target?.processName,
+      entry.target?.title,
+      usage.inputTokens,
+      usage.outputTokens,
+      usage.cacheCreationInputTokens,
+      usage.cacheReadInputTokens,
+    ]);
+  }
+
   async function loadHistory() {
     let entries = [];
     try {
@@ -253,8 +282,9 @@
       if (res.ok) entries = await res.json();
     } catch {
       // Best-effort: a failed load just leaves the snapshot half empty
-      // rather than blocking the rest of the page -- the `finally` below
-      // still runs, so any queued live completion is not lost either way.
+      // rather than blocking the rest of the page -- the code below still
+      // runs regardless, so any queued live completion is not lost either
+      // way, just replayed on top of an empty-ish snapshot.
     }
 
     historyList.innerHTML = '';
@@ -269,14 +299,12 @@
     // above). Replay it now, on top of what the snapshot just rendered --
     // except when the recorder's JSONL write already landed before this
     // fetch ran, in which case the snapshot above already contains it and
-    // replaying would duplicate the row. `text` (the full accumulated
-    // answer) is compared rather than `timestamp`, since the queued entry's
-    // client-generated timestamp and the snapshot's server-recorded one for
-    // the same answer are never exactly equal.
+    // replaying would duplicate the row. See `completionIdentity` for what
+    // "already contains it" is judged by, and why.
     historySnapshotLoaded = true;
-    const alreadyPersisted = new Set(entries.map((entry) => entry.text));
+    const alreadyPersisted = new Set(entries.map(completionIdentity));
     for (const queued of queuedLiveHistoryEntries) {
-      if (!alreadyPersisted.has(queued.text)) addHistoryEntry(queued);
+      if (!alreadyPersisted.has(completionIdentity(queued))) addHistoryEntry(queued);
     }
     queuedLiveHistoryEntries.length = 0;
 
