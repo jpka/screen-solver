@@ -107,6 +107,8 @@ export function createSolveLogRecorder(deps: SolveLogRecorderDeps): SolveLogReco
     const usage = outcome.type === 'done' ? outcome.usage : UNKNOWN_USAGE;
     const bail = outcome.type === 'done' && isBailTitle(title);
 
+    const withTranscript = event.withTranscript === true ? { withTranscript: true as const } : {};
+
     const usageEntry: UsageLogEntry = {
       timestamp,
       model,
@@ -115,6 +117,7 @@ export function createSolveLogRecorder(deps: SolveLogRecorderDeps): SolveLogReco
       usage,
       ...(bail ? { bail: true as const } : {}),
       ...(outcome.type === 'error' ? { errorKind: outcome.kind } : {}),
+      ...withTranscript,
     };
     try {
       await deps.usageLog.append(usageEntry);
@@ -133,6 +136,7 @@ export function createSolveLogRecorder(deps: SolveLogRecorderDeps): SolveLogReco
       usage,
       target,
       ...(outcome.type === 'interrupted' ? { interrupted: true as const } : {}),
+      ...withTranscript,
     };
     try {
       await deps.answerLog.append(answerEntry);

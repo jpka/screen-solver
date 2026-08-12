@@ -1,3 +1,4 @@
+import type { TranscriptWindow } from '../audio/window.ts';
 import type { CaptureSessionCoordinator } from '../capture/session-coordinator.ts';
 import { checkTargetStatus } from '../capture/target-status.ts';
 import { createTargetIntentTracker, type TargetIntentTracker } from '../capture/intent.ts';
@@ -41,7 +42,23 @@ export interface SolveLoopDeps {
    * a pause action to it.
    */
   readonly targetIntent?: TargetIntentTracker;
+  /**
+   * The bounded recent-speech buffer `trigger({ includeTranscript: true })`
+   * reads. Left unset, that flag can still be passed but never finds anything
+   * to send, so a solve stays image-only -- the same "safe default that just
+   * does less" every other optional dep here uses.
+   */
+  readonly transcriptWindow?: TranscriptWindow;
   readonly logger?: Logger;
+}
+
+export interface TriggerOptions {
+  /**
+   * Send the recent transcript alongside the screenshot. Defaults to `false`,
+   * which is what keeps `POST /solve` byte-identical to what it always was --
+   * see `SolveLoop.trigger`.
+   */
+  readonly includeTranscript?: boolean;
 }
 
 export interface SolveLoop {
@@ -57,8 +74,12 @@ export interface SolveLoop {
    * Returns `false`, having done nothing at all, once {@link stop} has been
    * called -- the one case where a trigger is genuinely refused rather than
    * accepted. `POST /solve` turns that into a `503` rather than a lying `202`.
+   *
+   * `options` defaults to sending no transcript, so the existing `POST /solve`
+   * call site is unchanged in behavior and on the wire. Only
+   * `POST /solve/with-transcript` passes `includeTranscript`.
    */
-  trigger(): boolean;
+  trigger(options?: TriggerOptions): boolean;
   /** Resolves once the most recently triggered attempt has fully settled. Mainly for tests. */
   settled(): Promise<void>;
   /**
@@ -136,7 +157,7 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
   // superseded attempt is still unwinding.
   const inFlight = new Set<Promise<void>>();
 
-  function trigger(): boolean {
+  function trigger(options: TriggerOptions = {}): boolean {
     if (stopped) return false;
 
     const previous = controller;
@@ -144,11 +165,20 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     controller = next;
     previous?.abort();
 
+    // Rendered here, synchronously with the trigger, rather than inside
+    // `runAttempt` after the pre-flight guards have awaited: the transcript is
+    // meant to be "what was being said when the button was pressed", and the
+    // guards can take long enough (a window enumeration, a minimized check, a
+    // frame grab) that re-reading the window afterwards would fold in
+    // sentences spoken after the user asked.
+    const transcript =
+      options.includeTranscript === true ? (deps.transcriptWindow?.render() ?? null) : null;
+
     const target = deps.configStore.get().targetWindow;
     const run =
       target === null
         ? Promise.resolve()
-        : runAttempt(target, next.signal).catch((error: unknown) => {
+        : runAttempt(target, next.signal, transcript).catch((error: unknown) => {
             logger.error(`solve loop: attempt failed unexpectedly: ${describeError(error)}`);
           });
 
@@ -168,7 +198,16 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     await Promise.all(inFlight);
   }
 
-  async function runAttempt(target: TargetWindowIdentity, signal: AbortSignal): Promise<void> {
+  async function runAttempt(
+    target: TargetWindowIdentity,
+    signal: AbortSignal,
+    transcript: string | null,
+  ): Promise<void> {
+    // Only tagged when a transcript was actually sent. A "Solve with
+    // transcript" pressed during silence is, on the wire and in the logs,
+    // exactly an ordinary solve -- which is the honest record of what happened.
+    const withTranscript = transcript === null ? {} : { withTranscript: true as const };
+
     let status = await checkTargetStatus(target, { enumerateWindows, isTargetMinimized });
     if (signal.aborted) return;
 
@@ -222,7 +261,10 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
 
     for await (const event of deps.provider.solve(
       { mediaType: frame.mediaType, bytes: frame.bytes },
-      { signal },
+      // `transcript` stays absent rather than `undefined`-valued when there is
+      // none, so a plain solve builds a request byte-identical to the one it
+      // built before this option existed.
+      transcript === null ? { signal } : { signal, transcript },
     )) {
       switch (event.type) {
         case 'delta':
@@ -233,14 +275,14 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
           deps.broadcaster.done(event.usage);
           const outcome: SolveOutcome = { type: 'done', text, usage: event.usage, stopReason: event.stopReason };
           applyStatusTransition(outcome);
-          await deps.onOutcome?.({ outcome, target, model: deps.provider.model });
+          await deps.onOutcome?.({ outcome, target, model: deps.provider.model, ...withTranscript });
           return;
         }
         case 'error': {
           deps.broadcaster.error(event.kind);
           const outcome: SolveOutcome = { type: 'error', kind: event.kind, message: event.message, text };
           applyStatusTransition(outcome);
-          await deps.onOutcome?.({ outcome, target, model: deps.provider.model });
+          await deps.onOutcome?.({ outcome, target, model: deps.provider.model, ...withTranscript });
           return;
         }
       }
@@ -255,7 +297,7 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
       // rules) -- called anyway so the "one place decides" property holds
       // even though this call is always a no-op today.
       applyStatusTransition(outcome);
-      await deps.onOutcome?.({ outcome, target, model: deps.provider.model });
+      await deps.onOutcome?.({ outcome, target, model: deps.provider.model, ...withTranscript });
     } else {
       logger.error(
         'solve loop: the provider iterable ended without a terminal event and no abort was requested ' +

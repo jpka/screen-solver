@@ -88,7 +88,7 @@ export function createProvider(config: ProviderConfig): Provider {
   };
   const system: readonly SystemBlock[] = Object.freeze([systemBlock]);
 
-  function buildRequest(image: SolveImage): MessagesRequest {
+  function buildRequest(image: SolveImage, transcript: string | undefined): MessagesRequest {
     return {
       model,
       max_tokens: maxTokens,
@@ -96,6 +96,14 @@ export function createProvider(config: ProviderConfig): Provider {
       system,
       // The image differs every call and so sits after the cached prefix,
       // which is where the render order (tools → system → messages) puts it.
+      //
+      // The transcript, when there is one, follows the image rather than
+      // preceding it: images before text matches Anthropic's own guidance, and
+      // it keeps the screenshot — which the system prompt names as
+      // authoritative — as the first thing the model reads. Both blocks sit
+      // after the cached system prefix, so adding one costs nothing in cache
+      // hits; a request with no transcript is byte-identical to what this
+      // built before the option existed.
       messages: [
         {
           role: 'user',
@@ -108,6 +116,9 @@ export function createProvider(config: ProviderConfig): Provider {
                 data: Buffer.from(image.bytes).toString('base64'),
               },
             },
+            ...(transcript === undefined || transcript === ''
+              ? []
+              : [{ type: 'text' as const, text: wrapTranscript(transcript) }]),
           ],
         },
       ],
@@ -120,7 +131,7 @@ export function createProvider(config: ProviderConfig): Provider {
     // A call, not a comparison: the abort can land between any two statements,
     // so the check must be re-evaluated rather than narrowed away.
     const aborted = (): boolean => signal?.aborted === true;
-    const body = buildRequest(image);
+    const body = buildRequest(image, options.transcript);
 
     for (let attempt = 0; ; attempt += 1) {
       if (aborted()) return;
@@ -212,6 +223,15 @@ export function createProvider(config: ProviderConfig): Provider {
   }
 
   return Object.freeze({ model, solve });
+}
+
+/**
+ * The tag pair the system prompt tells the model to expect. Fixed here rather
+ * than in `system-prompt.ts` because it is request mechanics — the two have to
+ * agree, and this is the side that actually emits it.
+ */
+function wrapTranscript(transcript: string): string {
+  return `<recent_transcript>\n${transcript}\n</recent_transcript>`;
 }
 
 interface MutableUsage {

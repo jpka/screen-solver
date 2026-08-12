@@ -70,6 +70,21 @@ export type SolveEvent =
 export interface SolveOptions {
   /** Aborting ends the iterable quietly — no terminal event, no throw. */
   readonly signal?: AbortSignal;
+  /**
+   * Recent speech to answer alongside the screenshot, already windowed and
+   * rendered by the caller (`audio/window.ts`).
+   *
+   * Optional, and absent on an ordinary solve: the plain Solve button sends a
+   * screenshot and nothing else, exactly as it always has. Only the separate
+   * "Solve with transcript" action fills this in.
+   *
+   * It becomes a *second* user-content block after the image, so the cached
+   * system prefix is untouched and prompt caching still hits. The seam takes
+   * rendered text rather than structured segments on purpose — deciding how
+   * much history is worth sending, and how to label who said what, is a policy
+   * question that belongs to the window, not to the wire.
+   */
+  readonly transcript?: string;
 }
 
 /** The one thing the rest of the app calls to turn a screenshot into an answer. */

@@ -213,6 +213,73 @@ describe('createProvider().solve', () => {
     });
   });
 
+  describe('the transcript block', () => {
+    it('adds a second content block after the image, wrapped in tags the prompt names', async () => {
+      const fake = fakeTransport([answer(['ok'])]);
+
+      await collect(
+        provider(fake).solve(IMAGE, { transcript: 'Them: without extra space\nThem: and empty input' }),
+      );
+
+      const [body] = fake.requests;
+      assert.ok(body !== undefined);
+      assert.deepEqual(body.messages, [
+        {
+          role: 'user',
+          content: [
+            // Image first: it is what the system prompt names as authoritative.
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AQIDBA==' } },
+            {
+              type: 'text',
+              text: '<recent_transcript>\nThem: without extra space\nThem: and empty input\n</recent_transcript>',
+            },
+          ],
+        },
+      ]);
+    });
+
+    it('sends exactly one content block when there is no transcript', async () => {
+      const fake = fakeTransport([answer(['ok'])]);
+
+      await collect(provider(fake).solve(IMAGE));
+
+      const [body] = fake.requests;
+      assert.ok(body !== undefined);
+      assert.equal(body.messages[0]?.content.length, 1);
+    });
+
+    it('treats an empty transcript as no transcript rather than an empty block', async () => {
+      // An empty `<recent_transcript>` would tell the model speech was captured
+      // and there wasn't any -- a different claim from "none is available".
+      const fake = fakeTransport([answer(['ok'])]);
+
+      await collect(provider(fake).solve(IMAGE, { transcript: '' }));
+
+      const [body] = fake.requests;
+      assert.ok(body !== undefined);
+      assert.equal(body.messages[0]?.content.length, 1);
+    });
+
+    it('leaves the cached system prefix byte-identical either way', async () => {
+      // The prompt-cache regression guard. There is deliberately ONE system
+      // prompt, not one per solve flavour: a second prompt would mean a second
+      // 1h cache entry, and every alternation between the two client buttons
+      // would be a cache MISS on a ~1400-token prefix.
+      const fake = fakeTransport([answer(['a']), answer(['b'])]);
+      const seam = provider(fake);
+
+      await collect(seam.solve(IMAGE));
+      await collect(seam.solve(IMAGE, { transcript: 'Them: hello' }));
+
+      const [plain, withTranscript] = fake.requests;
+      assert.ok(plain !== undefined && withTranscript !== undefined);
+      assert.equal(JSON.stringify(plain.system), JSON.stringify(withTranscript.system));
+      assert.deepEqual(withTranscript.system, [
+        { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral', ttl: '1h' } },
+      ]);
+    });
+  });
+
   describe('failures that must not be retried', () => {
     it('surfaces an auth rejection immediately', async () => {
       const fake = fakeTransport([

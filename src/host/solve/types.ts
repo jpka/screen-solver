@@ -62,4 +62,18 @@ export interface SolveOutcomeEvent {
   readonly outcome: SolveOutcome;
   readonly target: TargetWindowIdentity;
   readonly model: string;
+  /**
+   * Present and `true` only when this attempt was triggered by
+   * `POST /solve/with-transcript` *and* the transcript window actually had
+   * something in it. Absent otherwise, following the existing
+   * `interrupted?: true` / `bail?: true` idiom rather than carrying a `false`
+   * on every ordinary solve.
+   *
+   * Recorded so the logs can distinguish an answer the model reached from the
+   * screen alone from one it reached with speech in front of it -- the two are
+   * not equally reproducible from `answers.jsonl`, since the transcript that
+   * shaped the second one is a bounded in-memory window that is gone by the
+   * time anyone reads the log.
+   */
+  readonly withTranscript?: true;
 }
