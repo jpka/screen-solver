@@ -64,6 +64,21 @@ export interface SegmentWriterDeps {
 }
 
 export interface SegmentWriter {
+  /**
+   * Opens a new recording session, clearing any latched overflow and fencing
+   * off everything queued by the previous one.
+   *
+   * This writer outlives every session -- `bootstrap.ts` builds exactly one per
+   * process -- while `onError` tears down whichever recording is live *now*.
+   * Those two facts together mean an unfenced failure from an old session's
+   * still-draining write kills the new recording that replaced it (review), and
+   * that is not a hypothetical pairing: an overflow means the disk is already
+   * struggling, so the writes left queued behind it are exactly the ones most
+   * likely to fail, and `stop()` doesn't drain them (only a roll and shutdown
+   * do). Called once per `start()`, never on a roll -- within one session a
+   * failed write for an earlier segment is still this session's problem.
+   */
+  startSession(): void;
   /** Appends the `opened` index line and starts accepting chunks for `id`. */
   begin(id: SegmentId, mimeType: string, target: TargetWindowIdentity | null): Promise<void>;
   /**
@@ -92,6 +107,8 @@ export function createSegmentWriter(deps: SegmentWriterDeps): SegmentWriter {
   let chain: Promise<void> = Promise.resolve();
   let queuedBytes = 0;
   let overflowed = false;
+  /** Bumped per recording session; every queued write remembers the one it belongs to. */
+  let session = 0;
   /** Per-segment byte totals and mime types, dropped once a segment is closed out. */
   const open = new Map<SegmentId, { bytes: number; mimeType: string; startedAt: string }>();
 
@@ -103,20 +120,23 @@ export function createSegmentWriter(deps: SegmentWriterDeps): SegmentWriter {
   }
 
   return {
-    async begin(id, mimeType, target): Promise<void> {
-      // Clears a previous overflow. This writer outlives any one recording
-      // session -- `bootstrap.ts` builds exactly one for the process -- so a
-      // latched `overflowed` used to mean that after the disk fell behind
-      // once, *every* later recording silently discarded every chunk while
-      // the UI cheerfully reported `recording` (review). Nothing else can
-      // clear it: an overflow always routes through `onError` -> `fail()`,
-      // which tears the recorder down, so the only path back here is a fresh
-      // `start()`, which is exactly when a retry deserves a clean slate.
-      // In-flight writes from the previous session keep decrementing
-      // `queuedBytes` as they land, so that counter is deliberately *not*
-      // reset -- it is still tracking real outstanding bytes.
+    startSession(): void {
+      session += 1;
+      // Clears a previous overflow. A latched `overflowed` used to mean that
+      // after the disk fell behind once, *every* later recording silently
+      // discarded every chunk while the UI cheerfully reported `recording`
+      // (review). Nothing else can clear it: an overflow always routes through
+      // `onError` -> `fail()`, which tears the recorder down, so the only path
+      // back here is a fresh `start()` -- exactly when a retry deserves a clean
+      // slate.
+      //
+      // `queuedBytes` is deliberately *not* reset: writes from the previous
+      // session are still outstanding and still decrement it as they land, so
+      // it is tracking real bytes, not session-scoped ones.
       overflowed = false;
+    },
 
+    async begin(id, mimeType, target): Promise<void> {
       const startedAt = now().toISOString();
       open.set(id, { bytes: 0, mimeType, startedAt });
       await mkdir(deps.dir, { recursive: true });
@@ -161,11 +181,25 @@ export function createSegmentWriter(deps: SegmentWriterDeps): SegmentWriter {
       const last = chunk.last;
       const id = chunk.segmentId;
       const bytes = chunk.bytes;
+      const writeSession = session;
 
       enqueue(async () => {
         try {
           await appendFile(path, bytes);
         } catch (error) {
+          if (writeSession !== session) {
+            // A write left over from a session that has already ended. Its
+            // failure is real, but it is not the *current* recording's fault
+            // and must not tear it down (review) -- reporting it would let a
+            // dying disk kill each fresh retry with the previous attempt's
+            // error. Logged rather than swallowed: this segment's tail is
+            // genuinely lost, and the next launch's `reconcile()` will close
+            // it out from whatever did reach disk.
+            logger.error(
+              `recording: a write from a finished session failed for ${path}: ${describeError(error)}`,
+            );
+            return;
+          }
           deps.onError(`Failed writing ${path}: ${describeError(error)}`);
           return;
         } finally {

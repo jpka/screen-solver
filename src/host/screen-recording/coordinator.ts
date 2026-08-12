@@ -385,6 +385,9 @@ export function createScreenRecordingCoordinator(deps: ScreenRecordingCoordinato
         recorder = opened;
         segmentId = firstId;
         segmentOpenedAt = now().getTime();
+        // Fences off anything the previous session left queued, so its failures
+        // can't tear this one down, and clears any latched overflow.
+        deps.writer.startSession();
         await deps.writer.begin(firstId, opened.mimeType, deps.currentTarget());
         setState('recording');
         startTicker();
