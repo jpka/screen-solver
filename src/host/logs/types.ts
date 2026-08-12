@@ -37,7 +37,12 @@ export interface AnswerLogEntry {
   readonly target: TargetWindowIdentity | null;
   /** Present and `true` only when the outcome was `interrupted`. */
   readonly interrupted?: true;
-  /** Present and `true` only when recent speech was sent alongside the screenshot -- see `SolveOutcomeEvent`. */
+  /**
+   * Present and `true` only when recent speech was actually sent to the
+   * model with this attempt -- not exclusive to an attempt that also carried
+   * a screenshot. See `SolveOutcomeEvent.withTranscript` for the full
+   * three-combination matrix against {@link target}.
+   */
   readonly withTranscript?: true;
 }
 
@@ -63,7 +68,12 @@ export interface UsageLogEntry {
   readonly bail?: true;
   /** Present only for an `error` outcome. */
   readonly errorKind?: ProviderErrorKind;
-  /** Present and `true` only when recent speech was sent alongside the screenshot -- see `SolveOutcomeEvent`. */
+  /**
+   * Present and `true` only when recent speech was actually sent to the
+   * model with this attempt -- not exclusive to an attempt that also carried
+   * a screenshot. See `SolveOutcomeEvent.withTranscript` for the full
+   * three-combination matrix against {@link target}.
+   */
   readonly withTranscript?: true;
 }
 
