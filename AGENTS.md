@@ -447,7 +447,7 @@ covering the three ways a question reaches this app -- on the screen, out of
 the speakers, or both at once -- read by an automated e2e suite
 (`test/e2e/mock-quiz.e2e.test.ts`) and by a human at a real Windows machine
 (`npm run mock-quiz` serves the rig). Its own `README.md` is the manual
-procedure; what belongs here is the three decisions behind it.
+procedure; what belongs here is the decisions behind it.
 
 - **The quiz is `quiz.json`, not a `.ts` module.** The manual rig is a browser
   page, and nothing served to a browser in this repo can import from `src/` or
@@ -459,16 +459,26 @@ procedure; what belongs here is the three decisions behind it.
   speech and expected outcome don't line up is a thrown error, because the
   three-kind taxonomy is the entire point of the fixture and a quiz that
   silently lost one of them would still pass every assertion.
-- **A voice-only problem expects the bail, and that is not a limitation.** The
-  system prompt makes the screenshot the sole authority on whether there is
-  anything to solve ("someone talking about a problem is not a problem on
-  screen"), so `# No exercise on screen` is the *correct* answer to a spoken
-  question over a catalogue page, and two of the six problems exist to catch a
-  model that answers it anyway. The rig is built around the same rule: the
-  spoken script is never rendered on the stage, and the crib sheet that holds
-  it is closed by default with a warning, since a page that printed the
-  question would turn a voice problem into a screen problem and quietly pass
-  the test the app should fail.
+- **A voice-only problem has two right answers, and the fixture holds both.**
+  Which one is correct depends on which button was pressed, so `expected` is
+  what the problem's own route should produce and `expectedIfScreenSent` is
+  what the screen-carrying button must produce instead. Pressed with "Solve
+  speech only" a spoken question is genuinely answered; pressed with "Solve
+  with transcript" the catalogue screenshot goes along with the speech and the
+  screen is still authoritative, so `# No exercise on screen` remains the only
+  correct answer. Before the spoken-only mode existed the bail was the *only*
+  expectation these problems had -- keeping it as the second one is what stops
+  the new capability from quietly eroding the older rule, which is the
+  regression a quiz is for. (Each expectation carries its own
+  `scriptedAnswer`, so the answer a fake provider streams in an automated run
+  is still the answer a human grades a real model against.)
+- **The rig never renders the spoken script.** A page that printed the question
+  would turn a voice problem into a screen problem and quietly pass the test
+  the app should fail, so the script lives in a crib sheet that is closed by
+  default and warns that it is on screen while open. That was true when a voice
+  problem could only bail and it is more load-bearing now that one can be
+  answered: with the script visible, a "spoken-only" solve would be reading its
+  own question off the screenshot it isn't sending.
 - **The e2e harness grew the audio half rather than a second harness.**
   `bootApp` now wires fakes for `openAudioCapture` and `transcriber` at the
   same injection points production uses, and `E2EApp` gained the recording

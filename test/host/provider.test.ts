@@ -280,6 +280,85 @@ describe('createProvider().solve', () => {
     });
   });
 
+  describe('the spoken-only request shape (image === null)', () => {
+    it('sends exactly one content block -- text only, wrapped in <recent_transcript> -- with no image block at all', async () => {
+      const fake = fakeTransport([answer(['ok'])]);
+
+      await collect(
+        provider(fake).solve(null, { transcript: 'Them: what is two plus two' }),
+      );
+
+      const [body] = fake.requests;
+      assert.ok(body !== undefined);
+      assert.deepEqual(body.messages, [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '<recent_transcript>\nThem: what is two plus two\n</recent_transcript>' },
+          ],
+        },
+      ]);
+      assert.equal(
+        body.messages[0]?.content.some((block) => block.type === 'image'),
+        false,
+        'a spoken-only request never carries an image block',
+      );
+    });
+
+    it('keeps the cached system prefix byte-identical to a screenshot-carrying request -- one prompt, one cached prefix, whichever button was pressed', async () => {
+      const fake = fakeTransport([answer(['a']), answer(['b'])]);
+      const seam = provider(fake);
+
+      await collect(seam.solve(IMAGE));
+      await collect(seam.solve(null, { transcript: 'Them: hello' }));
+
+      const [withImage, spokenOnly] = fake.requests;
+      assert.ok(withImage !== undefined && spokenOnly !== undefined);
+      assert.deepEqual(spokenOnly.system, withImage.system, 'a second cache entry here would be a cache MISS on every alternation between buttons');
+      assert.deepEqual(spokenOnly.system, [
+        { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral', ttl: '1h' } },
+      ]);
+    });
+
+    it('refuses with a single transient error and never touches the transport when there is neither an image nor a transcript', async () => {
+      const fake = fakeTransport([]);
+
+      const events = await collect(provider(fake).solve(null));
+
+      assert.deepEqual(
+        events.map((event) => (event.type === 'error' ? event.kind : event.type)),
+        ['transient'],
+      );
+      assert.equal(fake.calls(), 0, 'a request with nothing to answer must not spend a call finding that out');
+    });
+
+    it('regression: an image-and-transcript solve still sends image, then text, in that order', async () => {
+      const fake = fakeTransport([answer(['ok'])]);
+
+      await collect(provider(fake).solve(IMAGE, { transcript: 'Them: hint' }));
+
+      const [body] = fake.requests;
+      assert.ok(body !== undefined);
+      assert.deepEqual(
+        body.messages[0]?.content.map((block) => block.type),
+        ['image', 'text'],
+      );
+    });
+
+    it('regression: an image-only solve still sends exactly one image block and no text block', async () => {
+      const fake = fakeTransport([answer(['ok'])]);
+
+      await collect(provider(fake).solve(IMAGE));
+
+      const [body] = fake.requests;
+      assert.ok(body !== undefined);
+      assert.deepEqual(
+        body.messages[0]?.content.map((block) => block.type),
+        ['image'],
+      );
+    });
+  });
+
   describe('failures that must not be retried', () => {
     it('surfaces an auth rejection immediately', async () => {
       const fake = fakeTransport([

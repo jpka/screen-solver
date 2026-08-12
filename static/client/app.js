@@ -15,17 +15,35 @@
 //   POST /recording  {on}       -> 200/400/413/503                (#35)
 //   GET  /transcript?limit=N    -> TranscriptEntry[]               (#35)
 //   POST /solve/with-transcript -> 202/400/503, same shape as /solve (#35)
+//   POST /solve/transcript-only -> 202/400/503, speech only, no target needed
 //   GET  /events (SSE)  -> start/delta/done/error/sync/status/config{,revision}
 //                          /recording/transcript/transcript-interim (#35)
 
 (() => {
   'use strict';
 
-  // Mirrors `src/host/logs/title.ts`'s `BAIL_TITLE` -- the client has no
-  // server-side module to import, so this is kept in lockstep by hand. Only
+  // Mirrors `src/host/logs/title.ts`'s two bail markers -- the client has no
+  // server-side module to import, so these are kept in lockstep by hand. Only
   // used to decide *display* emphasis; the server remains the sole authority
   // on what actually gets persisted.
+  //
+  // Two markers, not one: a screenshot-carrying solve bails with "no exercise
+  // on screen", while a speech-only solve (which was shown no screen at all)
+  // bails with "no question in the recent speech". They mean the same thing
+  // here -- this answer answered nothing -- so `isBailTitle` collapses them
+  // the way the server's own `isBailTitle()` does, and the badge below names
+  // whichever one actually came back.
   const BAIL_TITLE = 'No exercise on screen';
+  const NO_QUESTION_TITLE = 'No question in the recent speech';
+
+  function isBailTitle(title) {
+    return title === BAIL_TITLE || title === NO_QUESTION_TITLE;
+  }
+
+  /** What the bail badge says, per marker -- "no exercise" would be a lie about a request that had no screen. */
+  function bailBadgeText(title) {
+    return title === NO_QUESTION_TITLE ? ' no question' : ' no exercise';
+  }
 
   const IDLE_TEXT = 'Click "Solve now" to analyze the target window.';
 
@@ -60,6 +78,10 @@
   // static markup rather than something render() draws -- see index.html.
   const recordToggleButton = document.getElementById('record-toggle');
   const solveTranscriptButton = document.getElementById('solve-transcript-button');
+  // This ticket's third solve button -- speech only, no screenshot, no
+  // target. See its enabled-ness comment (`hasHeardSpeech`/`markSpeechHeard`)
+  // below for why it is wired independently of `applyConfig`.
+  const solveVoiceButton = document.getElementById('solve-voice-button');
   const transcriptPane = document.getElementById('transcript-pane');
   const recordingError = document.getElementById('recording-error');
   const transcriptList = document.getElementById('transcript-list');
@@ -68,6 +90,46 @@
 
   /** @type {{processName: string, title: string} | null} */
   let currentTarget = null;
+
+  /**
+   * Whether `#solve-voice-button` should be enabled -- a heuristic, and
+   * deliberately so. The button needs *some* recent speech, not a target
+   * (`applyConfig` never touches it), but "recent" is a server-side
+   * bounded-window concept (the 5-minute transcript buffer `POST
+   * /solve/transcript-only`'s own `400 no_transcript` guards) that this
+   * client cannot evaluate itself. So this only ever tracks "has this client
+   * seen at least one finalized transcript line at some point" -- from the
+   * `GET /transcript` snapshot `loadTranscript()` loads, or a live
+   * `transcript` SSE frame -- and once true, stays true; it never flips back
+   * off as time passes, even though the server-side window it was inferring
+   * from may since have emptied. That's fine: the button merely offers the
+   * attempt, and the server's `400 no_transcript` (mapped to a human
+   * sentence in the click handler below) is the authoritative refusal when
+   * this guess turns out to be stale.
+   */
+  let hasHeardSpeech = false;
+
+  function markSpeechHeard() {
+    if (hasHeardSpeech) return;
+    hasHeardSpeech = true;
+    solveVoiceButton.disabled = false;
+  }
+
+  // Set for the duration of a speech-only solve *this client* initiated, so
+  // the next `start`/`done` SSE frame stamps `liveEntry.target = null`
+  // instead of `currentTarget` -- a speech-only answer genuinely has no
+  // target (the server records `target: null` for it), and stamping
+  // whatever window this client happens to be watching would mislabel the
+  // entry's meta line with a window the answer had nothing to do with.
+  //
+  // This is best-effort and purely local: the wire carries no marker of
+  // *which* button started a solve, so a speech-only solve triggered from
+  // another device (or another tab) is indistinguishable here from a normal
+  // one and will still get stamped with `currentTarget`, wrongly. The
+  // authoritative record is whatever the next `GET /answers` reports, where
+  // `target` is genuinely `null` for a speech-only entry regardless of what
+  // this flag guessed in the meantime.
+  let voiceSolveInFlight = false;
 
   // ---------------------------------------------------------------------
   // Entry model.
@@ -196,6 +258,10 @@
     // Solving with transcript needs a target too -- it takes the same 400
     // no_target_configured the plain solve gets without one.
     solveTranscriptButton.disabled = targetWindow === null;
+    // `#solve-voice-button` is deliberately left untouched here -- it needs
+    // speech, not a target (see `hasHeardSpeech`'s doc comment), so having no
+    // target configured at all must not disable it the way it disables the
+    // other two.
     if (targetWindow === null) loadWindows();
     render();
   }
@@ -410,6 +476,24 @@
     solveButton.disabled = true;
   });
 
+  // This ticket's third button folds into the same mesh via *more*
+  // independent listeners, rather than editing the two above -- same
+  // byte-for-byte-handler reasoning as the click handlers themselves (adding
+  // a second `click` listener to an element is additive; `addEventListener`
+  // happily runs both). `solveVoiceButton` disabling itself is handled by
+  // its own click handler below, matching how `solveButton`/
+  // `solveTranscriptButton` each disable *themselves* in their own handlers.
+  solveButton.addEventListener('click', () => {
+    solveVoiceButton.disabled = true;
+  });
+  solveTranscriptButton.addEventListener('click', () => {
+    solveVoiceButton.disabled = true;
+  });
+  solveVoiceButton.addEventListener('click', () => {
+    solveButton.disabled = true;
+    solveTranscriptButton.disabled = true;
+  });
+
   solveButton.addEventListener('click', async () => {
     solveError.hidden = true;
     solveButton.disabled = true;
@@ -449,6 +533,40 @@
       solveError.hidden = false;
       solveError.textContent = `Could not start a solve: ${err.message}`;
       solveTranscriptButton.disabled = currentTarget === null;
+    }
+  });
+
+  // Same shape again: modelled on `#solve-button`'s handler (hide
+  // `solveError`, disable itself, POST, throw on anything but 202, surface
+  // the failure), duplicated rather than shared for the same byte-for-byte
+  // reasoning. Two real differences beyond the endpoint and which button
+  // owns the disabled state: (1) `no_transcript` -- the one refusal unique to
+  // this route, since there is no target to be missing -- gets mapped to a
+  // human sentence instead of showing the raw error code; (2) it sets
+  // `voiceSolveInFlight` so the `start`/`done` SSE listeners know to stamp
+  // this attempt's `target` as `null` (see that flag's own doc comment).
+  solveVoiceButton.addEventListener('click', async () => {
+    solveError.hidden = true;
+    solveVoiceButton.disabled = true;
+    voiceSolveInFlight = true;
+    try {
+      const res = await fetch('/solve/transcript-only', { method: 'POST' });
+      if (res.status !== 202) {
+        const body = await res.json().catch(() => ({}));
+        if (body.error === 'no_transcript') {
+          throw new Error('Nothing has been said recently. Start recording and ask your question out loud.');
+        }
+        throw new Error(body.error || `unexpected status ${res.status}`);
+      }
+      // Same "left disabled until done/error" reasoning as the other two.
+    } catch (err) {
+      solveError.hidden = false;
+      solveError.textContent = `Could not start a solve: ${err.message}`;
+      solveVoiceButton.disabled = !hasHeardSpeech;
+      // The attempt never actually reached the server (or was rejected
+      // outright), so there is no in-flight speech-only solve for a later
+      // `start`/`done` to stamp `target: null` for.
+      voiceSolveInFlight = false;
     }
   });
 
@@ -621,6 +739,13 @@
    * lines isn't yanked back down by the next line arriving.
    */
   function addTranscriptEntry(entry, { supersedesInterim = true } = {}) {
+    // Every finalized line -- backfilled from `GET /transcript` or a live
+    // `transcript` SSE frame, replayed-from-queue or not -- passes through
+    // here, so this is the one place `hasHeardSpeech` needs to be set from.
+    // See its doc comment for why this is "has ever heard speech", not "has
+    // speech within the server's window right now".
+    markSpeechHeard();
+
     const wasNearBottom = isNearTranscriptBottom();
 
     const line = document.createElement('div');
@@ -801,8 +926,12 @@
     const title = document.createElement('div');
     title.className = 'entry-title';
     title.textContent = entry.title || (entry.isLive ? 'Current answer' : '(untitled)');
-    if (entry.isLive && entry.state === 'bail') title.appendChild(badge('bail-badge', ' no exercise'));
-    if (!entry.isLive && entry.title === BAIL_TITLE) title.appendChild(badge('bail-badge', ' no exercise'));
+    if (entry.isLive && entry.state === 'bail') {
+      title.appendChild(badge('bail-badge', bailBadgeText(entry.title)));
+    }
+    if (!entry.isLive && isBailTitle(entry.title)) {
+      title.appendChild(badge('bail-badge', bailBadgeText(entry.title)));
+    }
     if (entry.interrupted) title.appendChild(badge('interrupted-badge', ' interrupted'));
     header.appendChild(title);
 
@@ -814,6 +943,11 @@
         entry.usage && (entry.usage.inputTokens || entry.usage.outputTokens)
           ? `${entry.usage.inputTokens} in / ${entry.usage.outputTokens} out`
           : '';
+      // A speech-only entry's `target` is genuinely `null` (see
+      // `voiceSolveInFlight`'s doc comment), so `formatTarget` returns ''
+      // for it -- `.filter(Boolean)` drops that empty segment before the
+      // join, rather than leaving a dangling ` · ` where the window label
+      // would otherwise have gone.
       meta.textContent = [when ? when.toLocaleString() : '', entry.model, formatTarget(entry.target), usageText]
         .filter(Boolean)
         .join(' · ');
@@ -950,6 +1084,17 @@
     setTimeout(handleOrientationSignal, 250);
   });
 
+  /**
+   * What to stamp a fresh/finishing `liveEntry.target` with. Normally
+   * `currentTarget` (the window this client is watching), except while
+   * `voiceSolveInFlight` -- see that flag's own doc comment on why a
+   * speech-only solve this client itself started needs `null` here instead,
+   * and why that is only ever a best-effort local guess.
+   */
+  function liveEntryTargetStamp() {
+    return voiceSolveInFlight ? null : currentTarget;
+  }
+
   // -----------------------------------------------------------------------
   // SSE wire.
   function connectEvents() {
@@ -962,14 +1107,14 @@
 
     source.addEventListener('start', () => {
       demoteLiveEntry();
-      liveEntry = { text: '', state: 'streaming', title: null, target: currentTarget, usage: null, timestamp: null };
+      liveEntry = { text: '', state: 'streaming', title: null, target: liveEntryTargetStamp(), usage: null, timestamp: null };
       syncing = false;
       render();
     });
 
     source.addEventListener('delta', (event) => {
       const data = JSON.parse(event.data);
-      if (!liveEntry) liveEntry = { text: '', state: 'streaming', title: null, target: currentTarget, usage: null, timestamp: null };
+      if (!liveEntry) liveEntry = { text: '', state: 'streaming', title: null, target: liveEntryTargetStamp(), usage: null, timestamp: null };
       liveEntry.text += data.text;
       syncing = false;
       render();
@@ -980,7 +1125,7 @@
     // transient "syncing…" tag (#34) until a real `delta` resumes.
     source.addEventListener('sync', (event) => {
       const data = JSON.parse(event.data);
-      if (!liveEntry) liveEntry = { text: '', state: 'streaming', title: null, target: currentTarget, usage: null, timestamp: null };
+      if (!liveEntry) liveEntry = { text: '', state: 'streaming', title: null, target: liveEntryTargetStamp(), usage: null, timestamp: null };
       liveEntry.text = data.text;
       liveEntry.state = 'streaming';
       syncing = true;
@@ -989,19 +1134,26 @@
 
     source.addEventListener('done', (event) => {
       const data = JSON.parse(event.data);
-      if (!liveEntry) liveEntry = { text: '', state: 'streaming', title: null, target: currentTarget, usage: null, timestamp: null };
+      if (!liveEntry) liveEntry = { text: '', state: 'streaming', title: null, target: liveEntryTargetStamp(), usage: null, timestamp: null };
       const title = parseAnswerTitle(liveEntry.text);
       liveEntry.title = title;
-      liveEntry.state = title === BAIL_TITLE ? 'bail' : 'done';
+      liveEntry.state = isBailTitle(title) ? 'bail' : 'done';
       liveEntry.usage = data.usage;
       liveEntry.timestamp = new Date().toISOString();
-      liveEntry.target = currentTarget;
+      liveEntry.target = liveEntryTargetStamp();
       liveEntry.model = '';
       syncing = false;
+      // The solve this client itself initiated (if any) has now ended --
+      // see `voiceSolveInFlight`'s doc comment for why this has to be
+      // cleared here rather than left set for the next attempt.
+      voiceSolveInFlight = false;
       solveButton.disabled = currentTarget === null;
-      // Re-enables both buttons regardless of which endpoint started this
-      // solve -- see the mutual-exclusion comment above their click listeners.
+      // Re-enables all three buttons regardless of which endpoint started
+      // this solve -- see the mutual-exclusion comment above their click
+      // listeners. `#solve-voice-button`'s enabled-ness depends on whether
+      // this client has ever heard speech, not on `currentTarget`.
       solveTranscriptButton.disabled = currentTarget === null;
+      solveVoiceButton.disabled = !hasHeardSpeech;
       render();
     });
 
@@ -1012,6 +1164,13 @@
     source.addEventListener('error', (event) => {
       solveButton.disabled = currentTarget === null;
       solveTranscriptButton.disabled = currentTarget === null;
+      solveVoiceButton.disabled = !hasHeardSpeech;
+      // Same "the solve this client initiated has ended" clearing as `done`
+      // above -- run unconditionally here too (rather than only inside the
+      // wire-frame branch below) to match the existing re-enable lines just
+      // above, which already treat a native connection error the same as a
+      // wire `error` frame for the purpose of un-disabling the buttons.
+      voiceSolveInFlight = false;
       if (!event.data) {
         // Native failure -- EventSource retries on its own; `readyState`
         // says whether that retry is still coming (CONNECTING) or the
