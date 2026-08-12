@@ -3,15 +3,30 @@ import { join } from 'node:path';
 import type { TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { API_KEY_ENV_VAR } from '../../src/host/api-key.ts';
+import type {
+  AudioChunkSink,
+  OpenAudioCapture,
+  Transcriber,
+  TranscriberStream,
+  TranscriptChannel,
+  TranscriptEvent,
+} from '../../src/host/audio/types.ts';
 import { HTTP_HOST_ENV_VAR, HTTP_PORT_ENV_VAR } from '../../src/host/binding.ts';
 import { bootstrapHost, type HostRuntime, type StartedHost } from '../../src/host/bootstrap.ts';
 import type { CapturedFrame, CaptureSession, TargetWindowIdentity } from '../../src/host/capture/types.ts';
 import type { WindowInfo } from '../../src/host/config/types.ts';
 import type { Logger } from '../../src/host/logger.ts';
 import { ANSWER_LOG_FILE_NAME } from '../../src/host/logs/answer-log.ts';
-import type { AnswerLogEntry, UsageLogEntry } from '../../src/host/logs/types.ts';
+import { TRANSCRIPT_LOG_FILE_NAME } from '../../src/host/logs/transcript-log.ts';
+import type { AnswerLogEntry, TranscriptEntry, UsageLogEntry } from '../../src/host/logs/types.ts';
 import { USAGE_LOG_FILE_NAME } from '../../src/host/logs/usage-log.ts';
-import type { Provider, SolveEvent, SolveImage, Usage } from '../../src/host/provider/types.ts';
+import type {
+  Provider,
+  SolveEvent,
+  SolveImage,
+  SolveOptions,
+  Usage,
+} from '../../src/host/provider/types.ts';
 import { tempStateRoot } from '../helpers/temp-state-root.ts';
 
 /**
@@ -29,15 +44,17 @@ import { tempStateRoot } from '../helpers/temp-state-root.ts';
  * one seam at a time; nothing there proves `bootstrap.ts` connects them to
  * each other correctly, which is exactly what a spec-level check needs.
  *
- * Only the four boundaries the spec itself declares un-unit-testable are
- * faked, and each is faked at the same injection point production uses:
+ * Only the boundaries the spec itself declares un-unit-testable are faked, and
+ * each is faked at the same injection point production uses:
  *
  * - `enumerateWindows` — real one shells out to `Get-Process` + `desktopCapturer`.
  * - `isTargetMinimized` — real one P/Invokes `IsIconic`.
  * - `openCaptureSession` — real one drives the hidden renderer's WGC pipeline.
  * - `provider` — real one calls Anthropic over the network.
+ * - `openAudioCapture` — real one is Windows render-loopback through the hidden renderer.
+ * - `transcriber` — real one holds a Deepgram WebSocket open.
  *
- * Everything on this side of those four is the real code path, files on disk
+ * Everything on this side of those six is the real code path, files on disk
  * included.
  */
 
@@ -135,6 +152,15 @@ function createCounter(): MutableCounter {
 /** One in-progress `Provider.solve()` call, driven by hand from the test. */
 export interface ScriptedCall {
   readonly image: SolveImage;
+  /**
+   * The whole options object the loop passed, `undefined` if it passed none.
+   *
+   * Kept alongside `signal` rather than replacing it: the difference between
+   * "no transcript" and "a transcript that happens to be undefined" is the
+   * thing `POST /solve` promises (`solve-with-transcript.test.ts`), and only
+   * the raw object can be asked whether the key is there at all.
+   */
+  readonly options: SolveOptions | undefined;
   readonly signal: AbortSignal | undefined;
   /** Pushes one raw event into this call's stream. */
   push(event: SolveEvent): void;
@@ -175,6 +201,7 @@ export function createFakeProvider(model: string): FakeProvider {
 
       const call: ScriptedCall = {
         image,
+        options,
         signal: options?.signal,
         push(event) {
           queue.push(event);
@@ -217,6 +244,81 @@ export function createFakeProvider(model: string): FakeProvider {
       const existing = calls[n - 1];
       if (existing !== undefined) return Promise.resolve(existing);
       return new Promise((resolve) => waiters.set(n, resolve));
+    },
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Fake transcription                                                          */
+/* -------------------------------------------------------------------------- */
+
+/** One open transcription stream, driven by hand the way `ScriptedCall` drives one provider call. */
+export interface ScriptedStream {
+  readonly channel: TranscriptChannel;
+  /** Every PCM chunk the recording coordinator routed to this channel, in order. */
+  readonly chunks: readonly Uint8Array[];
+  /** Pushes one event as though it had arrived off the socket. */
+  emit(event: TranscriptEvent): void;
+  readonly closed: boolean;
+}
+
+export interface FakeTranscriber {
+  readonly transcriber: Transcriber;
+  readonly streams: readonly ScriptedStream[];
+  /** The stream the current recording session is using, or a failure saying nothing is recording. */
+  current(): ScriptedStream;
+}
+
+/**
+ * A transcriber whose sockets open the moment they are asked to.
+ *
+ * Reporting `open` synchronously from `open()` is what makes
+ * `app.startRecording()` leave the coordinator in `'on'` rather than
+ * `'starting'`, so a test can say "recording is on, now speak" without racing
+ * a state machine. A real Deepgram socket takes a network round trip to get
+ * there; nothing downstream of `RecordingCoordinator` can tell the difference,
+ * and `test/host/recording-coordinator.test.ts` is where the slow-open and
+ * never-opens paths are actually exercised.
+ */
+export function createFakeTranscriber(model: string): FakeTranscriber {
+  const streams: ScriptedStream[] = [];
+
+  const transcriber: Transcriber = {
+    model,
+    open({ channel, onEvent }) {
+      const chunks: Uint8Array[] = [];
+      let closed = false;
+
+      const stream: ScriptedStream & TranscriberStream = {
+        channel,
+        chunks,
+        emit: onEvent,
+        get closed() {
+          return closed;
+        },
+        send(pcm) {
+          chunks.push(pcm);
+        },
+        async close() {
+          closed = true;
+        },
+      };
+
+      streams.push(stream);
+      onEvent({ type: 'open' });
+      return stream;
+    },
+  };
+
+  return {
+    transcriber,
+    streams,
+    current() {
+      const open = streams.findLast((stream) => !stream.closed);
+      if (open === undefined) {
+        throw new Error('precondition: no transcription stream is open -- call startRecording() first');
+      }
+      return open;
     },
   };
 }
@@ -308,7 +410,20 @@ export interface BootOptions {
   /** Replaces the whole environment block, for the startup-refusal tests. */
   readonly env?: NodeJS.ProcessEnv;
   readonly acquireInstanceLock?: () => boolean;
+  readonly transcriptionModel?: string;
+  /** Wire the audio seams at all. `false` is "no Deepgram key" -- the recording toggle then reports `'unavailable'`. Defaults to true. */
+  readonly recording?: boolean;
 }
+
+/** What `GET`/`POST /recording` answer with. */
+export interface RecordingBody {
+  readonly state: string;
+  readonly sessionId: string | null;
+  readonly revision: number;
+}
+
+/** How long one `say()` line is assumed to take, when the caller doesn't say. */
+const SPOKEN_LINE_SECONDS = 4;
 
 export interface E2EApp {
   readonly url: string;
@@ -318,6 +433,8 @@ export interface E2EApp {
   readonly env: NodeJS.ProcessEnv;
   readonly provider: FakeProvider;
   readonly model: string;
+  readonly transcription: FakeTranscriber;
+  readonly transcriptionModel: string;
   /** Every line the host printed, in order -- the "one console line" surface of the status ladder. */
   readonly consoleLines: readonly string[];
 
@@ -327,6 +444,8 @@ export interface E2EApp {
   readonly enumerations: Counter;
   readonly minimizedChecks: Counter;
   readonly frameGrabs: Counter;
+  readonly audioCapturesOpened: Counter;
+  readonly audioCapturesClosed: Counter;
 
   setWindows(windows: readonly WindowInfo[]): void;
   /**
@@ -340,17 +459,41 @@ export interface E2EApp {
 
   /* The web client's whole vocabulary, and nothing else. */
   solve(): Promise<Response>;
+  /** The second solve button: the same request, plus whatever is in the transcript window. */
+  solveWithTranscript(): Promise<Response>;
   getConfig(): Promise<{ targetWindow: TargetWindowIdentity | null; revision: number }>;
   listWindows(): Promise<WindowInfo[]>;
   setTarget(target: TargetWindowIdentity | null): Promise<Response>;
   getAnswers(): Promise<AnswerLogEntry[]>;
+  getTranscript(limit?: number): Promise<TranscriptEntry[]>;
+  getRecording(): Promise<RecordingBody>;
+  startRecording(): Promise<RecordingBody>;
+  stopRecording(): Promise<RecordingBody>;
   connect(t: TestContext): Promise<SseClient>;
+
+  /**
+   * Says one line out loud, as a *final* transcript segment on the recording
+   * session currently open.
+   *
+   * This is the honest place to inject speech into an e2e run: the text
+   * enters at the transcription seam, exactly where a real Deepgram socket
+   * would put it, and everything downstream -- `transcript.jsonl`, the
+   * bounded window `POST /solve/with-transcript` reads, the SSE frame every
+   * client gets -- is the real code path. `startSeconds`/`endSeconds` default
+   * to a simple advancing cursor; a caller with its own timeline (the mock
+   * quiz's `atSeconds`) passes them.
+   */
+  say(text: string, span?: { readonly startSeconds: number; readonly endSeconds: number }): void;
+  /** Pushes one block of PCM through the fake capture device, the way the hidden renderer would. */
+  pushAudio(pcm?: Uint8Array, channel?: TranscriptChannel): void;
 
   /* What actually landed on disk. */
   readAnswerLog(): Promise<AnswerLogEntry[]>;
   readUsageLog(): Promise<UsageLogEntry[]>;
+  readTranscriptLog(): Promise<TranscriptEntry[]>;
   waitForAnswerLines(n: number): Promise<AnswerLogEntry[]>;
   waitForUsageLines(n: number): Promise<UsageLogEntry[]>;
+  waitForTranscriptLines(n: number): Promise<TranscriptEntry[]>;
 
   shutdown(): Promise<void>;
 }
@@ -378,6 +521,8 @@ export async function bootApp(t: TestContext, options: BootOptions = {}): Promis
   const enumerations = createCounter();
   const minimizedChecks = createCounter();
   const frameGrabs = createCounter();
+  const audioCapturesOpened = createCounter();
+  const audioCapturesClosed = createCounter();
 
   const consoleLines: string[] = [];
   const logger: Logger = {
@@ -387,6 +532,24 @@ export async function bootApp(t: TestContext, options: BootOptions = {}): Promis
   };
 
   const provider = createFakeProvider(model);
+
+  const transcriptionModel = options.transcriptionModel ?? 'fake-transcription-model';
+  const transcription = createFakeTranscriber(transcriptionModel);
+  /** The sink the recording session handed the capture device, or `null` while nothing is recording. */
+  let audioSink: AudioChunkSink | null = null;
+  /** Where `say()` places the next line when the caller doesn't say, reset per recording session. */
+  let spokenSeconds = 0;
+
+  const openAudioCapture: OpenAudioCapture = async (sink) => {
+    audioSink = sink;
+    audioCapturesOpened.increment();
+    return {
+      close: async () => {
+        audioSink = null;
+        audioCapturesClosed.increment();
+      },
+    };
+  };
 
   const env: NodeJS.ProcessEnv = options.env ?? {
     [API_KEY_ENV_VAR]: API_KEY,
@@ -425,6 +588,12 @@ export async function bootApp(t: TestContext, options: BootOptions = {}): Promis
     },
     provider: provider.provider,
     clientStaticDir: options.serveWebClient === false ? undefined : WEB_CLIENT_DIR,
+    // Always wired, unlike `clientStaticDir`: an app whose recording toggle
+    // reports `'unavailable'` is a differently-configured app, and this
+    // harness's job is the fully assembled one. A suite that doesn't care
+    // simply never presses the toggle, and no audio ever flows.
+    transcriber: options.recording === false ? undefined : transcription.transcriber,
+    openAudioCapture: options.recording === false ? undefined : openAudioCapture,
   };
 
   const result = await bootstrapHost(runtime);
@@ -450,12 +619,16 @@ export async function bootApp(t: TestContext, options: BootOptions = {}): Promis
     env,
     provider,
     model,
+    transcription,
+    transcriptionModel,
     consoleLines,
     sessionsOpened,
     sessionsClosed,
     enumerations,
     minimizedChecks,
     frameGrabs,
+    audioCapturesOpened,
+    audioCapturesClosed,
 
     setWindows: (next) => {
       windowSequence = [next];
@@ -473,6 +646,7 @@ export async function bootApp(t: TestContext, options: BootOptions = {}): Promis
     },
 
     solve: () => fetch(`${url}/solve`, { method: 'POST' }),
+    solveWithTranscript: () => fetch(`${url}/solve/with-transcript`, { method: 'POST' }),
     async getConfig() {
       const response = await fetch(`${url}/config`);
       return (await response.json()) as { targetWindow: TargetWindowIdentity | null; revision: number };
@@ -491,6 +665,37 @@ export async function bootApp(t: TestContext, options: BootOptions = {}): Promis
       const response = await fetch(`${url}/answers`);
       return (await response.json()) as AnswerLogEntry[];
     },
+    async getTranscript(limit) {
+      const query = limit === undefined ? '' : `?limit=${limit}`;
+      const response = await fetch(`${url}/transcript${query}`);
+      return (await response.json()) as TranscriptEntry[];
+    },
+    async getRecording() {
+      const response = await fetch(`${url}/recording`);
+      return (await response.json()) as RecordingBody;
+    },
+    async startRecording() {
+      const body = await setRecording(url, true);
+      // A fresh session's transcript offsets start at zero, the same way a
+      // fresh socket's do.
+      spokenSeconds = 0;
+      return body;
+    },
+    stopRecording: () => setRecording(url, false),
+
+    say(text, span) {
+      const startSeconds = span?.startSeconds ?? spokenSeconds;
+      const endSeconds = span?.endSeconds ?? startSeconds + SPOKEN_LINE_SECONDS;
+      spokenSeconds = Math.max(spokenSeconds, endSeconds);
+      transcription.current().emit({ type: 'final', text, startSeconds, endSeconds });
+    },
+    pushAudio(pcm = new Uint8Array([0, 0, 0, 0]), channel = 'them') {
+      if (audioSink === null) {
+        throw new Error('precondition: no audio capture is open -- call startRecording() first');
+      }
+      audioSink({ channel, pcm });
+    },
+
     async connect(testContext) {
       const response = await fetch(`${url}/events`);
       const client = frameReader(response);
@@ -500,14 +705,27 @@ export async function bootApp(t: TestContext, options: BootOptions = {}): Promis
 
     readAnswerLog: () => readJsonl<AnswerLogEntry>(join(stateRoot, ANSWER_LOG_FILE_NAME)),
     readUsageLog: () => readJsonl<UsageLogEntry>(join(stateRoot, USAGE_LOG_FILE_NAME)),
+    readTranscriptLog: () => readJsonl<TranscriptEntry>(join(stateRoot, TRANSCRIPT_LOG_FILE_NAME)),
     waitForAnswerLines: (n) =>
       waitForLines(join(stateRoot, ANSWER_LOG_FILE_NAME), n, ANSWER_LOG_FILE_NAME),
     waitForUsageLines: (n) => waitForLines(join(stateRoot, USAGE_LOG_FILE_NAME), n, USAGE_LOG_FILE_NAME),
+    waitForTranscriptLines: (n) =>
+      waitForLines(join(stateRoot, TRANSCRIPT_LOG_FILE_NAME), n, TRANSCRIPT_LOG_FILE_NAME),
 
     shutdown,
   };
 
   return app;
+}
+
+/** `POST /recording {on}` -- the toggle both `startRecording` and `stopRecording` press. */
+async function setRecording(url: string, on: boolean): Promise<RecordingBody> {
+  const response = await fetch(`${url}/recording`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ on }),
+  });
+  return (await response.json()) as RecordingBody;
 }
 
 /* -------------------------------------------------------------------------- */
