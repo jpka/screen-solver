@@ -60,7 +60,19 @@ export type SolveOutcome =
  */
 export interface SolveOutcomeEvent {
   readonly outcome: SolveOutcome;
-  readonly target: TargetWindowIdentity;
+  /**
+   * The window this attempt was solved against, or `null` for a spoken-only
+   * solve (`POST /solve/transcript-only`), where no frame was captured and no
+   * window was involved.
+   *
+   * `null` rather than "the window that happened to be configured at the
+   * time": recording a target for an attempt that never looked at one would
+   * put a claim in `answers.jsonl` that no screenshot supports. It is also the
+   * only signal a log reader gets that an answer came from speech alone, which
+   * is why it is `null` and not omitted -- a missing field would be
+   * indistinguishable from an older line written before this mode existed.
+   */
+  readonly target: TargetWindowIdentity | null;
   readonly model: string;
   /**
    * Present and `true` only when this attempt was triggered by

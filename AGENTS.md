@@ -392,6 +392,56 @@ live/history swap, `demoteLiveEntry`'s fold-on-next-`start` behavior, and
 both the enabled and (via a feature-detection override, simulating iPhone
 Safari) disabled fullscreen-button states.
 
+**The spoken-only solve.** A third solve mode: the user asks a question out
+loud and nothing is captured at all. `POST /solve/transcript-only` +
+`static/client/`'s "Solve speech only" button, with four decisions worth
+keeping:
+
+- **`Provider.solve` takes `SolveImage | null`, and the absence of the image
+  block is the whole signal.** No second system prompt, no flag in the body --
+  `system-prompt.ts`'s own cache argument (one prompt, one 1-hour cached
+  ~1400-token prefix, so alternating between buttons never pays a cache miss)
+  applies with more force to a third mode than it did to the second. The prompt
+  gained a "Speech only, no screenshot" section instead, and the rules that
+  used to assume a screenshot always exists are now scoped to requests that
+  carry one. `anthropic.ts` also refuses a call with neither image nor
+  transcript rather than sending it: the model could only guess, and the guess
+  would still be billed.
+- **`SolveMode` is a closed union (`screen` / `screen-with-transcript` /
+  `transcript-only`), not a pair of booleans.** "Include the transcript" plus
+  "skip the screenshot" would make four combinations out of the three things
+  this app does, and the fourth has no question in it. `runAttempt` branches
+  once on a value it can exhaust; the committed half of an attempt (the
+  provider call, the single `broadcaster.start()`, the one terminal outcome,
+  the one `onOutcome`) is factored into `callProvider` so every mode shares it
+  and none of those invariants can drift per-mode.
+- **The spoken-only mode is blind to the target window, and the logs say so
+  with `target: null`.** No frame is grabbed, so a vanished, minimized or
+  entirely unconfigured window is irrelevant -- it is the one solve route that
+  answers `202` before the picker has ever been used, which is exactly the
+  case it exists for. `AnswerLogEntry.target` / `UsageLogEntry.target` /
+  `SolveOutcomeEvent.target` are nullable rather than carrying whatever
+  happened to be configured: recording a window for an attempt that never
+  looked at one would be a claim no screenshot supports. Null rather than
+  omitted, so it can't be confused with a line written before this mode
+  existed.
+- **A second bail marker, not a reused one.** `title.ts` gained
+  `NO_QUESTION_TITLE` (`# No question in the recent speech`) for speech that
+  asks nothing, because `# No exercise on screen` would be a false statement
+  about a request that was shown no screen. `isBailTitle()` accepts either, so
+  `recorder.ts`'s dispatch table needed no new branch -- both markers mean the
+  same thing to the logs (a `usage.jsonl` line, no `answers.jsonl` line).
+  `POST /solve/transcript-only` refuses `400 no_transcript` before spending a
+  call when the window is empty, so that marker only ever comes back for
+  speech that was genuinely captured and genuinely asked nothing.
+
+The transcript window is rendered twice on that route -- once by the handler to
+ask "is there anything to send?", once inside `trigger()` for the text that
+actually travels. Deliberate: the second render is what keeps "the transcript
+is what was being said when the button was pressed" true, and threading the
+first one into the loop would trade that property for the appearance of
+tidiness.
+
 **The mock quiz** (`test/fixtures/mock-quiz/`). One fixed set of problems
 covering the three ways a question reaches this app -- on the screen, out of
 the speakers, or both at once -- read by an automated e2e suite

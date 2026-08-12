@@ -28,8 +28,13 @@ export interface AnswerLogEntry {
    * interrupted call actually cost), not a design choice.
    */
   readonly usage: Usage;
-  /** The window this answer was solved against. */
-  readonly target: TargetWindowIdentity;
+  /**
+   * The window this answer was solved against, or `null` when the question
+   * was answered from speech alone (`POST /solve/transcript-only`) and no
+   * screenshot was ever taken -- see `SolveOutcomeEvent.target` for why this
+   * is a null rather than an omission.
+   */
+  readonly target: TargetWindowIdentity | null;
   /** Present and `true` only when the outcome was `interrupted`. */
   readonly interrupted?: true;
   /** Present and `true` only when recent speech was sent alongside the screenshot -- see `SolveOutcomeEvent`. */
@@ -44,7 +49,8 @@ export interface AnswerLogEntry {
 export interface UsageLogEntry {
   readonly timestamp: string;
   readonly model: string;
-  readonly target: TargetWindowIdentity;
+  /** `null` for a spoken-only solve -- see {@link AnswerLogEntry.target}. */
+  readonly target: TargetWindowIdentity | null;
   readonly outcome: 'done' | 'interrupted' | 'error';
   /**
    * Real token counts for `done`. `interrupted` and `error` outcomes carry
