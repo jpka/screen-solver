@@ -1,7 +1,11 @@
 /*
- * Screen Solver web client (#33) -- one reasonable desktop layout.
- * Orientation-aware / phone-responsive layout is deliberately deferred to
- * #34; nothing here is tuned for narrow viewports.
+ * Screen Solver web client (#33/#34) -- phone-first responsive layout.
+ * Orientation picks the layout in app.js (innerWidth/innerHeight, not a
+ * media query -- see app.js's `computeOrientation`), so this file styles
+ * two structurally different DOM shapes (`.entries-root[data-layout=...]`)
+ * rather than reflowing one shape with @media queries. The only @media
+ * query below is a cosmetic header-wrap nicety at very narrow widths, not
+ * part of the layout decision itself.
  */
 
 :root {
@@ -14,6 +18,8 @@
   --accent: #5b8def;
   --danger: #e0555e;
   --warning: #d9a441;
+  --success: #4caf82;
+  --rail-width: 132px;
   font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
 }
 
@@ -21,18 +27,27 @@
   box-sizing: border-box;
 }
 
+html,
 body {
   margin: 0;
+  height: 100%;
+}
+
+body {
   background: var(--bg);
   color: var(--text);
   line-height: 1.5;
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
 }
 
 .app-header {
   display: flex;
   align-items: center;
-  gap: 1rem;
-  padding: 0.75rem 1.5rem;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  padding: 0.6rem 1rem;
   border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;
@@ -41,17 +56,17 @@ body {
 }
 
 .app-header h1 {
-  font-size: 1.1rem;
+  font-size: 1.05rem;
   margin: 0;
   flex: 0 0 auto;
 }
 
-/* #35: the record toggle and the two solve buttons live together so the
-   header's flex layout only needs one auto-margin (here) to push the whole
-   group right, instead of relying on several buttons' individual auto
-   margins collapsing into the same result. `flex-wrap` keeps three buttons
-   from overflowing a narrow (phone) viewport -- they wrap to a second line
-   under the title instead of clipping or forcing horizontal scroll. */
+/* #35: the record toggle, the fullscreen button and the two solve buttons
+   live together so the header's flex layout only needs one auto-margin (here)
+   to push the whole group right, instead of relying on four buttons'
+   individual auto margins collapsing into the same result. `flex-wrap` keeps
+   them from overflowing a narrow (phone) viewport -- they wrap to a second
+   line under the title instead of clipping or forcing horizontal scroll. */
 .header-actions {
   margin-left: auto;
   display: flex;
@@ -79,6 +94,53 @@ button:disabled {
 
 button:not(:disabled):hover {
   filter: brightness(1.1);
+}
+
+.icon-button {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.35rem 0.6rem;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.icon-button:disabled {
+  background: transparent;
+  color: var(--text-muted);
+  border-color: var(--border);
+  opacity: 0.5;
+}
+
+.connection-indicator {
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.connection-indicator[data-state='connected'] {
+  color: var(--success);
+  border-color: var(--success);
+}
+
+.connection-indicator[data-state='reconnecting'] {
+  color: var(--warning);
+  border-color: var(--warning);
+}
+
+.connection-indicator[data-state='disconnected'] {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.connection-indicator[data-state='history'] {
+  color: var(--text-muted);
+  border-style: dashed;
 }
 
 .status-pill {
@@ -122,12 +184,22 @@ button:not(:disabled):hover {
   color: var(--danger);
 }
 
+.target-bar {
+  padding: 0.5rem 1rem 0;
+}
+
+.target-label {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
 main {
-  display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr);
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 1rem;
   gap: 1rem;
-  padding: 1.5rem;
-  align-items: start;
 }
 
 .panel {
@@ -145,72 +217,8 @@ main {
   letter-spacing: 0.04em;
 }
 
-#picker {
-  grid-column: 1;
-}
-
-#answer-pane {
-  grid-column: 1;
-}
-
-/* #35: unlike #picker/#answer-pane, this one is never `hidden`, so it's
-   always the next auto-placed row in column 1 -- below whichever of those
-   two is currently showing. */
-#transcript-pane {
-  grid-column: 1;
-}
-
-#history-pane {
-  grid-column: 2;
-  /* Column 1 auto-places exactly two rows: row 1 is whichever of
-     #picker/#answer-pane isn't `hidden` (they're mutually exclusive, so
-     together they only ever occupy one row), row 2 is #transcript-pane
-     (always present, so always the next one placed). `span 2` still covers
-     both now that #35 added #transcript-pane as that second row -- it
-     already spanned 2 before #35, just with one of them empty. (Grid's
-     negative-line shorthand, `1 / -1`, isn't a safe substitute here: it
-     resolves against the *explicit* grid, and this grid's rows are all
-     implicit/auto -- there's no `grid-template-rows` for `-1` to count
-     from.) */
-  grid-row: 1 / span 2;
-  max-height: calc(100vh - 6rem);
-  overflow-y: auto;
-}
-
 .hint {
   color: var(--text-muted);
-}
-
-.target-label {
-  color: var(--text-muted);
-  font-size: 0.85rem;
-  margin-bottom: 0.75rem;
-}
-
-.answer-text {
-  white-space: pre-wrap;
-  word-wrap: break-word;
-  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
-  font-size: 0.95rem;
-  margin: 0;
-  min-height: 4rem;
-}
-
-.answer-text[data-state='streaming']::after {
-  content: '▍';
-  animation: blink 1s steps(1) infinite;
-  color: var(--accent);
-}
-
-.answer-text[data-state='bail'] {
-  color: var(--text-muted);
-  font-style: italic;
-}
-
-@keyframes blink {
-  50% {
-    opacity: 0;
-  }
 }
 
 .error-message {
@@ -219,12 +227,11 @@ main {
   color: var(--danger);
   border-radius: 6px;
   padding: 0.5rem 0.75rem;
-  margin-bottom: 0.75rem;
+  margin: 0.5rem 0;
   font-size: 0.9rem;
 }
 
-.window-list,
-.history-list {
+.window-list {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -261,42 +268,208 @@ main {
   font-size: 0.8rem;
 }
 
-.history-list li {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.6rem 0.75rem;
+.empty-hint {
+  color: var(--text-muted);
+  font-size: 0.85rem;
 }
 
-.history-list .history-title {
+.bail-badge {
+  color: var(--text-muted);
+  font-style: italic;
+  font-weight: 400;
+}
+
+.interrupted-badge {
+  color: var(--warning);
   font-weight: 600;
-  margin-bottom: 0.15rem;
 }
 
-.history-list .history-meta {
+/* ---------- entries: shared card internals ---------- */
+
+.entry-title {
+  font-weight: 600;
+}
+
+.entry-meta {
   color: var(--text-muted);
   font-size: 0.78rem;
   display: flex;
   gap: 0.5rem;
   flex-wrap: wrap;
+  margin-top: 0.15rem;
 }
 
-.history-list li[data-interrupted='true'] {
-  border-color: var(--warning);
+.entry-card-text {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 0.95rem;
+  margin: 0.5rem 0 0;
 }
 
-.history-list .interrupted-badge {
-  color: var(--warning);
-  font-weight: 600;
+.entry-card-text[data-state='streaming']::after {
+  content: '▍';
+  animation: blink 1s steps(1) infinite;
+  color: var(--accent);
 }
 
-.history-list .bail-badge {
+.entry-card-text[data-state='bail'],
+.entry-card-text[data-state='idle'] {
   color: var(--text-muted);
   font-style: italic;
 }
 
-.empty-hint {
-  color: var(--text-muted);
-  font-size: 0.85rem;
+.entry-card-text[data-state='error'] {
+  color: var(--danger);
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* ---------- portrait: continuous log ---------- */
+
+.entries-root[data-layout='portrait'] {
+  display: block;
+}
+
+.entry-feed {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.entry-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-bg);
+  padding: 0.7rem 0.9rem;
+}
+
+.entry-card--collapsed {
+  cursor: pointer;
+  padding: 0.5rem 0.9rem;
+}
+
+.entry-card--collapsed:hover,
+.entry-card--collapsed:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.entry-card--collapsed .entry-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.entry-card--open.entry-card--live {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.entry-card--live .entry-title::before {
+  content: '● ';
+  color: var(--success);
+}
+
+.entry-card[data-interrupted='true'] {
+  border-color: var(--warning);
+}
+
+/* ---------- landscape: split rail ---------- */
+
+.entries-root[data-layout='landscape'] {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  gap: 0.75rem;
+}
+
+.entry-rail {
+  flex: 0 0 var(--rail-width);
+  width: var(--rail-width);
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-bg);
+}
+
+.entry-rail-list {
+  list-style: none;
+  margin: 0;
+  padding: 0.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.entry-rail-item {
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.entry-rail-item:hover,
+.entry-rail-item:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.entry-rail-item--open {
+  background: var(--bg);
+  border-color: var(--accent);
+}
+
+.entry-rail-item--live .entry-rail-title::before {
+  content: '● ';
+  color: var(--success);
+}
+
+.entry-rail-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.entry-detail {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-bg);
+  padding: 0.9rem 1.1rem;
+}
+
+/* Cosmetic only -- narrow phones in portrait wrap the header onto a second
+   line rather than clipping; unrelated to the orientation decision itself. */
+@media (max-width: 420px) {
+  .app-header h1 {
+    flex: 1 1 100%;
+  }
+  /* #35 moved the buttons into `.header-actions`, so the auto-margin that
+     pushes them right now lives on the wrapper -- this is the rule that
+     un-pushes it once the title has taken a line of its own. */
+  .app-header .header-actions {
+    margin-left: 0;
+  }
+}
+
+/* #35: `main` is a flex column whose growing child is `#entries-root`; the
+   transcript sits underneath it at its natural height rather than competing
+   for the same space, so a long conversation scrolls inside its own list
+   (below) instead of squeezing the answer out of view. */
+#transcript-pane {
+  flex: 0 0 auto;
 }
 
 /* #35: the transcript pane's own scroll container, separate from the
