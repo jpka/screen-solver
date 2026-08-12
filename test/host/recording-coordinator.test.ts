@@ -102,6 +102,9 @@ function harness(
     async readAll() {
       return appended;
     },
+    async readTail(maxEntries: number) {
+      return appended.slice(-maxEntries);
+    },
   } satisfies TranscriptLog;
 
   return {

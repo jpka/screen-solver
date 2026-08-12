@@ -415,8 +415,14 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
           sendJson(res, 400, { error: 'bad_request' });
           return;
         }
-        const entries = deps.transcriptLog === undefined ? [] : await deps.transcriptLog.readAll();
-        sendJson(res, 200, entries.slice(-limit));
+        // `readTail`, not `readAll().slice()`: this file grows one line every
+        // few seconds of speech, so reading the whole history to serve the
+        // last 500 lines is work proportional to everything ever said, on
+        // every request (review feedback -- the response was bounded but the
+        // read was not).
+        const entries =
+          deps.transcriptLog === undefined ? [] : await deps.transcriptLog.readTail(limit);
+        sendJson(res, 200, entries);
       },
     },
   ];

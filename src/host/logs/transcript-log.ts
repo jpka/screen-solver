@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { openJsonlFile, type JsonlFile } from './jsonl.ts';
+import { openJsonlFile, type JsonlFile, type JsonlFileOptions } from './jsonl.ts';
 import type { TranscriptEntry } from './types.ts';
 
 export const TRANSCRIPT_LOG_FILE_NAME = 'transcript.jsonl';
@@ -10,6 +10,7 @@ export interface TranscriptLogOptions {
   readonly stateRoot: string;
   readonly appendFile?: (path: string, contents: string) => Promise<void>;
   readonly readFile?: (path: string) => Promise<string>;
+  readonly readTailBytes?: JsonlFileOptions['readTailBytes'];
 }
 
 /**
@@ -28,5 +29,6 @@ export function createTranscriptLog(options: TranscriptLogOptions): TranscriptLo
     path: join(options.stateRoot, TRANSCRIPT_LOG_FILE_NAME),
     appendFile: options.appendFile,
     readFile: options.readFile,
+    readTailBytes: options.readTailBytes,
   });
 }
