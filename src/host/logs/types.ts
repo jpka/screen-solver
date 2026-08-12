@@ -64,7 +64,16 @@ export interface UsageLogEntry {
    * limitation as `AnswerLogEntry.usage`.
    */
   readonly usage: Usage;
-  /** Present and `true` only when a `done` outcome's title was the v1 bail marker (`title.ts`). */
+  /**
+   * Present and `true` only when a `done` outcome's title was one of the bail
+   * markers (`title.ts`'s `BAIL_TITLE` or `NO_QUESTION_TITLE` -- an attempt
+   * that answered nothing, whether because the screen held no exercise or
+   * because the speech asked no question). Which of the two it was is
+   * recoverable from `answers.jsonl`... nowhere, in fact: a bail writes no
+   * answer line at all, so the marker itself is not persisted. Reach for the
+   * console or re-run if you need to know which; the two are the same fact
+   * for cost purposes, which is all this log is for.
+   */
   readonly bail?: true;
   /** Present only for an `error` outcome. */
   readonly errorKind?: ProviderErrorKind;
