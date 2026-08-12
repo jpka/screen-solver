@@ -10,7 +10,15 @@
     <header class="app-header">
       <h1>Screen Solver</h1>
       <span id="status-pill" class="status-pill" hidden></span>
-      <button id="solve-button" type="button" disabled>Solve now</button>
+      <!-- #35: record toggle + the transcript-solve button live beside the
+           original solve button, wrapped so the header's flex layout only
+           needs one auto-margin (on the wrapper) instead of relying on
+           auto-margins collapsing correctly across three separate buttons. -->
+      <div class="header-actions">
+        <button id="record-toggle" type="button" data-state="off">Start recording</button>
+        <button id="solve-transcript-button" type="button" disabled>Solve with transcript</button>
+        <button id="solve-button" type="button" disabled>Solve now</button>
+      </div>
     </header>
 
     <main>
@@ -27,6 +35,31 @@
         <div id="target-label" class="target-label"></div>
         <div id="solve-error" class="error-message" hidden></div>
         <pre id="answer-text" class="answer-text" data-state="idle">Click &quot;Solve now&quot; to analyze the target window.</pre>
+      </section>
+
+      <!-- #35: running transcript of the recorded system audio. Always
+           present (unlike #picker/#answer-pane, it doesn't toggle on the
+           target), so it lands in the second row of the left column,
+           beneath whichever of those two is currently visible. -->
+      <section id="transcript-pane" class="panel">
+        <h2>Transcript</h2>
+        <div id="recording-error" class="error-message" hidden></div>
+        <div id="transcript-list" class="transcript-list">
+          <!-- Finalized lines (app.js's addTranscriptEntry) are inserted
+               just above these two -- they stay the last two children
+               always, so the two "in progress" rows stay pinned at the
+               bottom no matter how many finals accumulate above them. One
+               per channel since `transcript-interim` replaces wholesale
+               per-channel, not globally; `me` is reserved and never
+               populated by today's server but the row exists so it's ready
+               the day it is. -->
+          <div id="transcript-interim-them" class="transcript-line transcript-interim" data-channel="them" hidden>
+            <span class="transcript-channel">Them:</span><span class="transcript-text"></span>
+          </div>
+          <div id="transcript-interim-me" class="transcript-line transcript-interim" data-channel="me" hidden>
+            <span class="transcript-channel">Me:</span><span class="transcript-text"></span>
+          </div>
+        </div>
       </section>
 
       <section id="history-pane" class="panel">

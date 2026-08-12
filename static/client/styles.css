@@ -46,8 +46,19 @@ body {
   flex: 0 0 auto;
 }
 
-.app-header button {
+/* #35: the record toggle and the two solve buttons live together so the
+   header's flex layout only needs one auto-margin (here) to push the whole
+   group right, instead of relying on several buttons' individual auto
+   margins collapsing into the same result. `flex-wrap` keeps three buttons
+   from overflowing a narrow (phone) viewport -- they wrap to a second line
+   under the title instead of clipping or forcing horizontal scroll. */
+.header-actions {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 button {
@@ -88,6 +99,29 @@ button:not(:disabled):hover {
   border-color: var(--danger);
 }
 
+/* #35: `#record-toggle`'s `data-state` mirrors the six states `GET
+   /recording` / the `recording` SSE frame can report (app.js's
+   `applyRecording`). `off` and `starting` are left on the default button
+   look -- `starting` reads fine as "about to be the accent-colored `on`
+   look" without its own color. `unavailable` needs no rule here: it's
+   covered by the generic `button:disabled` style below, same as any other
+   disabled button. */
+#record-toggle[data-state='on'] {
+  background: var(--danger);
+  color: #fff;
+}
+
+#record-toggle[data-state='reconnecting'] {
+  background: var(--warning);
+  color: #1a1300;
+}
+
+#record-toggle[data-state='error'] {
+  background: transparent;
+  border: 1px solid var(--danger);
+  color: var(--danger);
+}
+
 main {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr);
@@ -119,8 +153,25 @@ main {
   grid-column: 1;
 }
 
+/* #35: unlike #picker/#answer-pane, this one is never `hidden`, so it's
+   always the next auto-placed row in column 1 -- below whichever of those
+   two is currently showing. */
+#transcript-pane {
+  grid-column: 1;
+}
+
 #history-pane {
   grid-column: 2;
+  /* Column 1 auto-places exactly two rows: row 1 is whichever of
+     #picker/#answer-pane isn't `hidden` (they're mutually exclusive, so
+     together they only ever occupy one row), row 2 is #transcript-pane
+     (always present, so always the next one placed). `span 2` still covers
+     both now that #35 added #transcript-pane as that second row -- it
+     already spanned 2 before #35, just with one of them empty. (Grid's
+     negative-line shorthand, `1 / -1`, isn't a safe substitute here: it
+     resolves against the *explicit* grid, and this grid's rows are all
+     implicit/auto -- there's no `grid-template-rows` for `-1` to count
+     from.) */
   grid-row: 1 / span 2;
   max-height: calc(100vh - 6rem);
   overflow-y: auto;
@@ -246,4 +297,61 @@ main {
 .empty-hint {
   color: var(--text-muted);
   font-size: 0.85rem;
+}
+
+/* #35: the transcript pane's own scroll container, separate from the
+   panel's padding box -- kept to a fixed max-height (rather than growing
+   with content like #answer-pane does) specifically so it has a bottom
+   edge for "auto-scroll only when already near the bottom" (app.js's
+   `isNearTranscriptBottom`) to mean something. `min-height` keeps the pane
+   from collapsing to nothing before any line has arrived. */
+.transcript-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 18rem;
+  min-height: 4rem;
+  overflow-y: auto;
+  overflow-x: hidden;
+  font-size: 0.9rem;
+}
+
+.transcript-line {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.15rem 0;
+  /* Long unbroken transcribed words (or a narrow phone viewport) wrap
+     inside the line instead of forcing the pane to scroll sideways. */
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+
+.transcript-channel {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.transcript-line[data-channel='me'] .transcript-channel {
+  color: var(--accent);
+}
+
+.transcript-text {
+  min-width: 0;
+  white-space: pre-wrap;
+}
+
+/* The two pinned "in progress" rows (see index.html) -- same blinking-
+   cursor language `.answer-text[data-state='streaming']` already uses for
+   "more is coming", so a still-forming transcript line reads the same way
+   a still-streaming answer does. */
+.transcript-interim {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.transcript-interim .transcript-text::after {
+  content: '▍';
+  animation: blink 1s steps(1) infinite;
+  color: var(--accent);
 }
