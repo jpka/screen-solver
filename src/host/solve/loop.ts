@@ -6,7 +6,7 @@ import type { IsTargetMinimized } from '../capture/types.ts';
 import type { ConfigStore } from '../config/store.ts';
 import type { EnumerateWindows, TargetWindowIdentity } from '../config/types.ts';
 import { silentLogger, type Logger } from '../logger.ts';
-import type { Provider } from '../provider/types.ts';
+import type { Provider, SolveImage } from '../provider/types.ts';
 import type { EventBroadcaster } from './broadcaster.ts';
 import { createStatusTracker, type StatusTracker } from './status.ts';
 import type { SolveOutcome, SolveOutcomeEvent } from './types.ts';
@@ -43,22 +43,43 @@ export interface SolveLoopDeps {
    */
   readonly targetIntent?: TargetIntentTracker;
   /**
-   * The bounded recent-speech buffer `trigger({ includeTranscript: true })`
-   * reads. Left unset, that flag can still be passed but never finds anything
-   * to send, so a solve stays image-only -- the same "safe default that just
-   * does less" every other optional dep here uses.
+   * The bounded recent-speech buffer the two transcript-carrying modes read.
+   * Left unset, either mode can still be triggered but never finds anything
+   * to send -- a `screen-with-transcript` solve stays image-only, and a
+   * `transcript-only` one has nothing at all to ask about and bails out
+   * silently. The same "safe default that just does less" every other optional
+   * dep here uses.
    */
   readonly transcriptWindow?: TranscriptWindow;
   readonly logger?: Logger;
 }
 
-export interface TriggerOptions {
+/**
+ * What a triggered solve is made of -- one mode per client button, and per
+ * route in `http/routes.ts`.
+ *
+ * A union rather than the pair of booleans it would otherwise have become
+ * ("include the transcript" plus "skip the screenshot"), because two of the
+ * four combinations are not things this app does: a solve with neither a
+ * screen nor speech has no question in it, and there is no button for one.
+ * Making the mode a closed set also means `runAttempt` branches once, on a
+ * value it can exhaust, rather than twice on flags that could disagree.
+ */
+export type SolveMode =
+  /** `POST /solve`: the screenshot alone, byte-identical to what it always was. */
+  | 'screen'
+  /** `POST /solve/with-transcript`: the screenshot, plus recent speech as a hint about it. */
+  | 'screen-with-transcript'
   /**
-   * Send the recent transcript alongside the screenshot. Defaults to `false`,
-   * which is what keeps `POST /solve` byte-identical to what it always was --
-   * see `SolveLoop.trigger`.
+   * `POST /solve/transcript-only`: recent speech and no screenshot at all --
+   * the question was asked out loud. No target window is needed, and none of
+   * the capture pre-flight guards apply, since nothing is captured.
    */
-  readonly includeTranscript?: boolean;
+  | 'transcript-only';
+
+export interface TriggerOptions {
+  /** Defaults to `'screen'`, which is what keeps `POST /solve` unchanged -- see `SolveLoop.trigger`. */
+  readonly mode?: SolveMode;
 }
 
 export interface SolveLoop {
@@ -75,9 +96,9 @@ export interface SolveLoop {
    * called -- the one case where a trigger is genuinely refused rather than
    * accepted. `POST /solve` turns that into a `503` rather than a lying `202`.
    *
-   * `options` defaults to sending no transcript, so the existing `POST /solve`
-   * call site is unchanged in behavior and on the wire. Only
-   * `POST /solve/with-transcript` passes `includeTranscript`.
+   * `options` defaults to `mode: 'screen'`, so the existing `POST /solve` call
+   * site is unchanged in behavior and on the wire. The other two modes belong
+   * to the two later routes -- see {@link SolveMode}.
    */
   trigger(options?: TriggerOptions): boolean;
   /** Resolves once the most recently triggered attempt has fully settled. Mainly for tests. */
@@ -160,6 +181,8 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
   function trigger(options: TriggerOptions = {}): boolean {
     if (stopped) return false;
 
+    const mode = options.mode ?? 'screen';
+
     const previous = controller;
     const next = new AbortController();
     controller = next;
@@ -171,16 +194,26 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     // guards can take long enough (a window enumeration, a minimized check, a
     // frame grab) that re-reading the window afterwards would fold in
     // sentences spoken after the user asked.
-    const transcript =
-      options.includeTranscript === true ? (deps.transcriptWindow?.render() ?? null) : null;
+    const transcript = mode === 'screen' ? null : (deps.transcriptWindow?.render() ?? null);
 
-    const target = deps.configStore.get().targetWindow;
-    const run =
-      target === null
-        ? Promise.resolve()
-        : runAttempt(target, next.signal, transcript).catch((error: unknown) => {
-            logger.error(`solve loop: attempt failed unexpectedly: ${describeError(error)}`);
-          });
+    // A spoken-only solve is deliberately blind to the configured target: no
+    // frame is grabbed, so a vanished, minimized, or entirely unconfigured
+    // window is irrelevant to it. `null` is what tells `runAttempt` there is
+    // no screen in this attempt at all, and it is what lands in the logs --
+    // see `SolveOutcomeEvent.target`.
+    const target = mode === 'transcript-only' ? null : deps.configStore.get().targetWindow;
+
+    // A screen mode with nothing configured to watch has no attempt to make --
+    // `POST /solve` has already answered `400 no_target_configured`, and this
+    // is the loop's own matching no-op. Note this is *not* the same shape as
+    // the spoken-only mode, which reaches `runAttempt` with a deliberately
+    // null target because it never wanted a window in the first place.
+    const nothingToSolve = mode !== 'transcript-only' && target === null;
+    const run = nothingToSolve
+      ? Promise.resolve()
+      : runAttempt(target, next.signal, transcript).catch((error: unknown) => {
+          logger.error(`solve loop: attempt failed unexpectedly: ${describeError(error)}`);
+        });
 
     inFlight.add(run);
     void run.finally(() => inFlight.delete(run));
@@ -198,8 +231,18 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     await Promise.all(inFlight);
   }
 
+  /**
+   * One attempt, for all three modes.
+   *
+   * `target === null` means the spoken-only mode: there is no screen in this
+   * attempt, so the whole pre-flight block below is skipped rather than
+   * guarded field by field, and the provider is handed a `null` image. Every
+   * mode shares one commit point (`broadcaster.start()`) and one outcome
+   * report, which is what keeps "exactly one of done/interrupted/error per
+   * attempted call" true no matter which button was pressed.
+   */
   async function runAttempt(
-    target: TargetWindowIdentity,
+    target: TargetWindowIdentity | null,
     signal: AbortSignal,
     transcript: string | null,
   ): Promise<void> {
@@ -207,6 +250,18 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     // transcript" pressed during silence is, on the wire and in the logs,
     // exactly an ordinary solve -- which is the honest record of what happened.
     const withTranscript = transcript === null ? {} : { withTranscript: true as const };
+
+    if (target === null) {
+      // Spoken-only, and nothing has been said: there is no question in this
+      // request, so it is the same silent no-spend a failed capture guard is.
+      // `POST /solve/transcript-only` normally refuses this before it gets
+      // here (`400 no_transcript`) -- this is the belt to that suspenders, and
+      // it covers a window that emptied between the route's check and here.
+      if (transcript === null) return;
+
+      await callProvider(null, target, transcript, signal, withTranscript);
+      return;
+    }
 
     let status = await checkTargetStatus(target, { enumerateWindows, isTargetMinimized });
     if (signal.aborted) return;
@@ -254,13 +309,41 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     if (signal.aborted) return;
     if (frame === null || frame.quality === 'black-or-empty') return;
 
+    await callProvider(
+      { mediaType: frame.mediaType, bytes: frame.bytes },
+      target,
+      transcript,
+      signal,
+      withTranscript,
+    );
+  }
+
+  /**
+   * The committed half of an attempt: everything from the provider call
+   * onwards, shared by the screen modes and the spoken-only one.
+   *
+   * Extracted rather than duplicated per mode precisely because this is the
+   * part with the invariants -- one `start` on the wire, exactly one terminal
+   * outcome, one status transition, one `onOutcome` -- and a second copy of it
+   * is where those would drift. `image` is `null` only for the spoken-only
+   * mode, which is also the only case `target` is `null`; the two travel
+   * together but stay separate parameters, since the provider needs the image
+   * and the logs need the target.
+   */
+  async function callProvider(
+    image: SolveImage | null,
+    target: TargetWindowIdentity | null,
+    transcript: string | null,
+    signal: AbortSignal,
+    withTranscript: { readonly withTranscript?: true },
+  ): Promise<void> {
     // Committed: a provider call is genuinely attempted from here on, so the
     // wire and the outcome bus both go live for this attempt.
     deps.broadcaster.start();
     let text = '';
 
     for await (const event of deps.provider.solve(
-      { mediaType: frame.mediaType, bytes: frame.bytes },
+      image,
       // `transcript` stays absent rather than `undefined`-valued when there is
       // none, so a plain solve builds a request byte-identical to the one it
       // built before this option existed.

@@ -12,7 +12,8 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test \"test/**/*.test.ts\"",
-    "start": "npm run build && node scripts/start.mjs"
+    "start": "npm run build && node scripts/start.mjs",
+    "mock-quiz": "node scripts/mock-quiz.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.10.4",

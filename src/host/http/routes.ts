@@ -14,7 +14,7 @@ import type { TranscriptLog } from '../logs/transcript-log.ts';
 import type { Logger } from '../logger.ts';
 import type { Provider } from '../provider/types.ts';
 import { createEventBroadcaster } from '../solve/broadcaster.ts';
-import { startSolveLoop, type SolveLoop } from '../solve/loop.ts';
+import { startSolveLoop, type SolveLoop, type SolveMode } from '../solve/loop.ts';
 import type { SolveOutcomeEvent } from '../solve/types.ts';
 import { PayloadTooLargeError, readJsonBody, sendJson, type Route } from './router.ts';
 
@@ -171,20 +171,43 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
     recordingCoordinator.state();
 
   /**
-   * Both solve routes, differing only in whether the attempt carries recent
-   * speech. Everything else -- the guards, the status codes, the synchronous
-   * abort-then-202 -- is shared by construction rather than by copy, so the
-   * plain route cannot drift as the transcript one grows.
+   * All three solve routes, differing only in what the attempt is made of --
+   * see `SolveMode` in `solve/loop.ts`. Everything else (the guards, the
+   * status codes, the synchronous abort-then-202) is shared by construction
+   * rather than by copy, so the plain route cannot drift as the others grow.
+   *
+   * The two pre-flight refusals below are per-mode because what each mode
+   * needs differs: a screen mode is useless without a target window, and the
+   * spoken-only mode is useless without something having been said. Both are
+   * checked *before* `trigger()`, so a request that is going to be refused
+   * doesn't abort the solve already in flight on its way out.
    */
-  function solveHandler(includeTranscript: boolean): Route['handle'] {
+  function solveHandler(mode: SolveMode): Route['handle'] {
     return ({ res }) => {
       if (solveLoop === null || configStore === undefined) {
         sendJson(res, 503, { error: 'not_ready' });
         return;
       }
 
-      const target = configStore.get().targetWindow;
-      if (target === null) {
+      if (mode === 'transcript-only') {
+        // Deliberately not `no_target_configured`'s twin in spirit: that one
+        // means "configure something and try again", while this means "say
+        // something and try again". Refused rather than sent as an empty
+        // request, since a model handed neither a screen nor speech can only
+        // guess, and the user would still be billed for the guess.
+        //
+        // Rendering the window here and again inside `trigger()` is
+        // deliberate: this render is a *question* ("is there anything to
+        // send?"), and the one in `trigger()` is the answer that actually
+        // travels, taken at the instant of the trigger. Sharing one render
+        // across the two would mean either passing rendered text into the loop
+        // (and losing "the transcript is what was being said when the button
+        // was pressed") or trusting a value read microseconds earlier.
+        if (deps.transcriptWindow?.render() == null) {
+          sendJson(res, 400, { error: 'no_transcript' });
+          return;
+        }
+      } else if (configStore.get().targetWindow === null) {
         sendJson(res, 400, { error: 'no_target_configured' });
         return;
       }
@@ -198,7 +221,7 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
       // (`SolveLoop.stop()`): the server is still listening for the moment it
       // takes to close, but nothing is left to run or persist a new attempt,
       // so say so rather than accepting work that will silently evaporate.
-      if (!solveLoop.trigger({ includeTranscript })) {
+      if (!solveLoop.trigger({ mode })) {
         sendJson(res, 503, { error: 'shutting_down' });
         return;
       }
@@ -217,7 +240,7 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
     {
       method: 'POST',
       path: '/solve',
-      handle: solveHandler(false),
+      handle: solveHandler('screen'),
     },
     {
       // The transcript-flavoured solve.
@@ -232,7 +255,22 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
       // handlers come from the same factory so the two can't drift.
       method: 'POST',
       path: '/solve/with-transcript',
-      handle: solveHandler(true),
+      handle: solveHandler('screen-with-transcript'),
+    },
+    {
+      // The spoken-only solve: recent speech, no screenshot.
+      //
+      // A third route from the same factory rather than a body flag on either
+      // of the two above, for the reason the sibling comment already gives --
+      // and because this one differs from both in what it *requires*, not just
+      // in what it sends. It is the only solve route that answers `202` with
+      // no target window configured at all: nothing is captured, so there is
+      // nothing for a target to be. That also makes it the one solve a user
+      // can run before ever opening the picker, which is exactly the case it
+      // exists for -- a question asked out loud with no exercise on screen.
+      method: 'POST',
+      path: '/solve/transcript-only',
+      handle: solveHandler('transcript-only'),
     },
     {
       method: 'GET',

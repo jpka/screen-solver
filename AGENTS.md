@@ -392,6 +392,117 @@ live/history swap, `demoteLiveEntry`'s fold-on-next-`start` behavior, and
 both the enabled and (via a feature-detection override, simulating iPhone
 Safari) disabled fullscreen-button states.
 
+**The spoken-only solve.** A third solve mode: the user asks a question out
+loud and nothing is captured at all. `POST /solve/transcript-only` +
+`static/client/`'s "Solve speech only" button, with four decisions worth
+keeping:
+
+- **`Provider.solve` takes `SolveImage | null`, and the absence of the image
+  block is the whole signal.** No second system prompt, no flag in the body --
+  `system-prompt.ts`'s own cache argument (one prompt, one 1-hour cached
+  ~1400-token prefix, so alternating between buttons never pays a cache miss)
+  applies with more force to a third mode than it did to the second. The prompt
+  gained a "Speech only, no screenshot" section instead, and the rules that
+  used to assume a screenshot always exists are now scoped to requests that
+  carry one. `anthropic.ts` also refuses a call with neither image nor
+  transcript rather than sending it: the model could only guess, and the guess
+  would still be billed.
+- **`SolveMode` is a closed union (`screen` / `screen-with-transcript` /
+  `transcript-only`), not a pair of booleans.** "Include the transcript" plus
+  "skip the screenshot" would make four combinations out of the three things
+  this app does, and the fourth has no question in it. `runAttempt` branches
+  once on a value it can exhaust; the committed half of an attempt (the
+  provider call, the single `broadcaster.start()`, the one terminal outcome,
+  the one `onOutcome`) is factored into `callProvider` so every mode shares it
+  and none of those invariants can drift per-mode.
+- **The spoken-only mode is blind to the target window, and the logs say so
+  with `target: null`.** No frame is grabbed, so a vanished, minimized or
+  entirely unconfigured window is irrelevant -- it is the one solve route that
+  answers `202` before the picker has ever been used, which is exactly the
+  case it exists for. `AnswerLogEntry.target` / `UsageLogEntry.target` /
+  `SolveOutcomeEvent.target` are nullable rather than carrying whatever
+  happened to be configured: recording a window for an attempt that never
+  looked at one would be a claim no screenshot supports. Null rather than
+  omitted, so it can't be confused with a line written before this mode
+  existed.
+- **A second bail marker, not a reused one.** `title.ts` gained
+  `NO_QUESTION_TITLE` (`# No question in the recent speech`) for speech that
+  asks nothing, because `# No exercise on screen` would be a false statement
+  about a request that was shown no screen. `isBailTitle()` accepts either, so
+  `recorder.ts`'s dispatch table needed no new branch -- both markers mean the
+  same thing to the logs (a `usage.jsonl` line, no `answers.jsonl` line).
+  `POST /solve/transcript-only` refuses `400 no_transcript` before spending a
+  call when the window is empty, so that marker only ever comes back for
+  speech that was genuinely captured and genuinely asked nothing.
+
+The transcript window is rendered twice on that route -- once by the handler to
+ask "is there anything to send?", once inside `trigger()` for the text that
+actually travels. Deliberate: the second render is what keeps "the transcript
+is what was being said when the button was pressed" true, and threading the
+first one into the loop would trade that property for the appearance of
+tidiness.
+
+**The mock quiz** (`test/fixtures/mock-quiz/`). One fixed set of problems
+covering the three ways a question reaches this app -- on the screen, out of
+the speakers, or both at once -- read by an automated e2e suite
+(`test/e2e/mock-quiz.e2e.test.ts`) and by a human at a real Windows machine
+(`npm run mock-quiz` serves the rig). Its own `README.md` is the manual
+procedure; what belongs here is the decisions behind it.
+
+- **The quiz is `quiz.json`, not a `.ts` module.** The manual rig is a browser
+  page, and nothing served to a browser in this repo can import from `src/` or
+  `test/` -- the same constraint that put `static/renderer/preload.js` in
+  hand-written plain JS. A TypeScript module holding the problems would have
+  needed a second copy for the page to render, so the data is JSON, `fetch`ed
+  by the page and `readFile`d by `quiz.ts`. `quiz.ts` is the typed *read* side
+  only, and it validates rather than trusts: a problem whose kind, screen,
+  speech and expected outcome don't line up is a thrown error, because the
+  three-kind taxonomy is the entire point of the fixture and a quiz that
+  silently lost one of them would still pass every assertion.
+- **A voice-only problem has two right answers, and the fixture holds both.**
+  Which one is correct depends on which button was pressed, so `expected` is
+  what the problem's own route should produce and `expectedIfScreenSent` is
+  what the screen-carrying button must produce instead. Pressed with "Solve
+  speech only" a spoken question is genuinely answered; pressed with "Solve
+  with transcript" the catalogue screenshot goes along with the speech and the
+  screen is still authoritative, so `# No exercise on screen` remains the only
+  correct answer. Before the spoken-only mode existed the bail was the *only*
+  expectation these problems had -- keeping it as the second one is what stops
+  the new capability from quietly eroding the older rule, which is the
+  regression a quiz is for. (Each expectation carries its own
+  `scriptedAnswer`, so the answer a fake provider streams in an automated run
+  is still the answer a human grades a real model against.)
+- **The rig never renders the spoken script.** A page that printed the question
+  would turn a voice problem into a screen problem and quietly pass the test
+  the app should fail, so the script lives in a crib sheet that is closed by
+  default and warns that it is on screen while open. That was true when a voice
+  problem could only bail and it is more load-bearing now that one can be
+  answered: with the script visible, a "spoken-only" solve would be reading its
+  own question off the screenshot it isn't sending.
+- **The e2e harness grew the audio half rather than a second harness.**
+  `bootApp` now wires fakes for `openAudioCapture` and `transcriber` at the
+  same injection points production uses, and `E2EApp` gained the recording
+  vocabulary (`startRecording`, `say`, `pushAudio`, `getTranscript`,
+  `waitForTranscriptLines`) -- so speech enters an e2e run at the
+  transcription seam, exactly where Deepgram would put it, and everything
+  downstream is the real code path. They are wired unconditionally (a
+  `recording: false` boot option exists for the "no key" state): an app whose
+  recording toggle reports `'unavailable'` is a differently-configured app,
+  and this harness's job is the fully assembled one. `ScriptedCall` also
+  carries the whole `SolveOptions` now, not just `signal`, because the
+  difference `POST /solve` promises is between "no transcript key" and "a
+  transcript key that happens to be undefined", and only the raw object can be
+  asked which one it is.
+
+What the automated run does *not* prove is worth restating wherever this
+fixture is used: the provider is faked, so `scriptedAnswer` is what the fake
+streams and `expected.mustMention` is for a human grading a real run. The
+suite covers the plumbing between the two buttons and the disk -- which route
+carries speech, that a screenshot goes out on every solve, that the transcript
+reaching the model is the speech actually captured, and that each problem
+leaves the right pair of JSONL lines. Answer *quality* stays manual, the same
+call `solve-journey.e2e.test.ts` already documents for the prompt contract.
+
 ### Environment setup
 
 Claude Code web sessions provision the `mattpocock/skills` bundle (wayfinder, grilling, domain-modeling, ...) and a pinned, checksum-verified `gh` CLI via a `SessionStart` hook — see `.claude/hooks/session-start.sh`. Re-run it manually with `npm run setup`. `.agents/` and `.claude/skills/` are generated by that hook and gitignored, not committed; `skills-lock.json` records what was actually installed for drift-checking (the upstream skills repo has no supported way to pin an exact ref, so each run fetches its current HEAD).

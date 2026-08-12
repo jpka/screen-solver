@@ -16,10 +16,16 @@
            than relying on auto-margins collapsing correctly across four
            siblings, and the wrapper is what wraps to a second row on a narrow
            phone instead of the buttons overflowing. The two solve buttons stay
-           adjacent -- they are the same action with and without speech. -->
+           adjacent -- they are the same action with and without speech.
+           A third solve button (speech-only, this ticket) joins them for the
+           same reason: it needs no screenshot at all, just recent transcript,
+           so it starts disabled independently of `#solve-transcript-button`/
+           `#solve-button` (see app.js's enabled-ness comment on it) rather
+           than sharing their target-gated disabled state. -->
       <div class="header-actions">
         <button id="record-toggle" type="button" data-state="off">Start recording</button>
         <button id="fullscreen-button" type="button" class="icon-button" title="Fullscreen">&#9974;</button>
+        <button id="solve-voice-button" type="button" disabled>Solve speech only</button>
         <button id="solve-transcript-button" type="button" disabled>Solve with transcript</button>
         <button id="solve-button" type="button" disabled>Solve now</button>
       </div>

@@ -71,7 +71,8 @@ function fakeCaptureCoordinator(captureFrame: () => Promise<CapturedFrame | null
 }
 
 interface ScriptedCall {
-  readonly image: SolveImage;
+  /** `null` for a spoken-only solve. */
+  readonly image: SolveImage | null;
   readonly signal: AbortSignal | undefined;
   push(event: SolveEvent): void;
 }

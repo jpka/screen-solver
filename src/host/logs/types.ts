@@ -28,11 +28,21 @@ export interface AnswerLogEntry {
    * interrupted call actually cost), not a design choice.
    */
   readonly usage: Usage;
-  /** The window this answer was solved against. */
-  readonly target: TargetWindowIdentity;
+  /**
+   * The window this answer was solved against, or `null` when the question
+   * was answered from speech alone (`POST /solve/transcript-only`) and no
+   * screenshot was ever taken -- see `SolveOutcomeEvent.target` for why this
+   * is a null rather than an omission.
+   */
+  readonly target: TargetWindowIdentity | null;
   /** Present and `true` only when the outcome was `interrupted`. */
   readonly interrupted?: true;
-  /** Present and `true` only when recent speech was sent alongside the screenshot -- see `SolveOutcomeEvent`. */
+  /**
+   * Present and `true` only when recent speech was actually sent to the
+   * model with this attempt -- not exclusive to an attempt that also carried
+   * a screenshot. See `SolveOutcomeEvent.withTranscript` for the full
+   * three-combination matrix against {@link target}.
+   */
   readonly withTranscript?: true;
 }
 
@@ -44,7 +54,8 @@ export interface AnswerLogEntry {
 export interface UsageLogEntry {
   readonly timestamp: string;
   readonly model: string;
-  readonly target: TargetWindowIdentity;
+  /** `null` for a spoken-only solve -- see {@link AnswerLogEntry.target}. */
+  readonly target: TargetWindowIdentity | null;
   readonly outcome: 'done' | 'interrupted' | 'error';
   /**
    * Real token counts for `done`. `interrupted` and `error` outcomes carry
@@ -53,11 +64,25 @@ export interface UsageLogEntry {
    * limitation as `AnswerLogEntry.usage`.
    */
   readonly usage: Usage;
-  /** Present and `true` only when a `done` outcome's title was the v1 bail marker (`title.ts`). */
+  /**
+   * Present and `true` only when a `done` outcome's title was one of the bail
+   * markers (`title.ts`'s `BAIL_TITLE` or `NO_QUESTION_TITLE` -- an attempt
+   * that answered nothing, whether because the screen held no exercise or
+   * because the speech asked no question). Which of the two it was is
+   * recoverable from `answers.jsonl`... nowhere, in fact: a bail writes no
+   * answer line at all, so the marker itself is not persisted. Reach for the
+   * console or re-run if you need to know which; the two are the same fact
+   * for cost purposes, which is all this log is for.
+   */
   readonly bail?: true;
   /** Present only for an `error` outcome. */
   readonly errorKind?: ProviderErrorKind;
-  /** Present and `true` only when recent speech was sent alongside the screenshot -- see `SolveOutcomeEvent`. */
+  /**
+   * Present and `true` only when recent speech was actually sent to the
+   * model with this attempt -- not exclusive to an attempt that also carried
+   * a screenshot. See `SolveOutcomeEvent.withTranscript` for the full
+   * three-combination matrix against {@link target}.
+   */
   readonly withTranscript?: true;
 }
 

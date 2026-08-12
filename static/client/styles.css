@@ -458,7 +458,16 @@ main {
   }
   /* #35 moved the buttons into `.header-actions`, so the auto-margin that
      pushes them right now lives on the wrapper -- this is the rule that
-     un-pushes it once the title has taken a line of its own. */
+     un-pushes it once the title has taken a line of its own. Verified this
+     ticket's third button (#solve-voice-button) doesn't need anything more
+     here: at a real ~380px viewport (checked via a real Chromium, device
+     metrics overridden rather than trusting `--window-size` on a headless
+     screenshot -- that flag turned out not to actually constrain layout in
+     this sandbox, only the output canvas, which made three fine-fitting
+     buttons look clipped) `.header-actions`'s own `flex-wrap: wrap` already
+     wraps five children (record toggle, fullscreen, and three solve
+     buttons) across two rows with no overflow, same as it did with two solve
+     buttons. */
   .app-header .header-actions {
     margin-left: 0;
   }
