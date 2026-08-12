@@ -33,6 +33,55 @@
         <h2>History</h2>
         <ul id="history-list" class="history-list"></ul>
       </section>
+
+      <section id="recording-pane" class="panel">
+        <h2>Screen Recording</h2>
+
+        <div class="recording-control-row">
+          <button id="rec-button" type="button" disabled>Record</button>
+          <span id="rec-state-label" class="hint"></span>
+        </div>
+        <div id="recording-error" class="error-message" hidden></div>
+
+        <div id="recording-indicator" class="recording-indicator" hidden>
+          <span class="rec-dot" aria-hidden="true"></span>
+          <span class="recording-indicator-label">REC</span>
+          <span id="rec-elapsed"></span>
+          <span id="rec-bytes"></span>
+        </div>
+
+        <details id="recording-settings">
+          <summary>Recording settings</summary>
+          <div id="recording-settings-error" class="error-message" hidden></div>
+          <form id="recording-settings-form">
+            <label class="settings-row settings-row-checkbox">
+              <input type="checkbox" id="rec-setting-enabled" />
+              Start recording automatically whenever a window is being captured
+            </label>
+            <label class="settings-row">
+              Segment length (seconds)
+              <input type="number" id="rec-setting-segment-seconds" min="1" step="1" />
+            </label>
+            <label class="settings-row">
+              Retention size limit (bytes)
+              <input type="number" id="rec-setting-retention-bytes" min="0" step="1" />
+            </label>
+            <label class="settings-row">
+              Retention time limit (days)
+              <input type="number" id="rec-setting-retention-days" min="0" step="1" />
+            </label>
+            <div class="settings-row settings-actions">
+              <button type="submit" id="rec-settings-save">Save settings</button>
+              <span id="rec-settings-status" class="hint" hidden>Saved.</span>
+            </div>
+          </form>
+        </details>
+
+        <div id="recording-player" class="recording-player" hidden></div>
+
+        <div id="recordings-error" class="error-message" hidden></div>
+        <ul id="recordings-list" class="recordings-list"></ul>
+      </section>
     </main>
 
     <script src="/app.js"></script>

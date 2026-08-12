@@ -4,8 +4,12 @@ import type { CaptureSessionCoordinator } from '../capture/session-coordinator.t
 import type { ConfigStore } from '../config/store.ts';
 import type { EnumerateWindows, TargetWindowIdentity } from '../config/types.ts';
 import type { AnswerLog } from '../logs/answer-log.ts';
+import type { RecordingLog } from '../logs/recording-log.ts';
 import type { Logger } from '../logger.ts';
 import type { Provider } from '../provider/types.ts';
+import type { RecordingCoordinator } from '../recording/coordinator.ts';
+import { extensionFor } from '../recording/segment-writer.ts';
+import { createSegmentFileRoute } from './segment-file.ts';
 import { createEventBroadcaster } from '../solve/broadcaster.ts';
 import { startSolveLoop, type SolveLoop } from '../solve/loop.ts';
 import type { SolveOutcomeEvent } from '../solve/types.ts';
@@ -35,6 +39,12 @@ export interface HostRoutesDeps {
   readonly onOutcome?: (event: SolveOutcomeEvent) => void | Promise<void>;
   /** #31's `answers.jsonl` reader -- `GET /answers` serves its full backlog. Left unset, `GET /answers` answers `[]` (the same "nothing configured yet" default `enumerateWindows`/`isTargetMinimized` already use). */
   readonly answerLog?: AnswerLog;
+  /** #45's recorder. Left unset, every `/recording*` route answers `503 not_ready`. */
+  readonly recordingCoordinator?: RecordingCoordinator;
+  /** #45's `recordings.jsonl` reader -- backs `GET /recordings` and resolves ids for the playback route. */
+  readonly recordingLog?: RecordingLog;
+  /** `<stateRoot>/recordings`. Required alongside `recordingLog` for the playback route to exist. */
+  readonly recordingsDir?: string;
   readonly logger?: Logger;
 }
 
@@ -94,6 +104,16 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
   if (configStore !== undefined) {
     configStore.onChange((event) => {
       broadcaster.config(event.target);
+    });
+  }
+
+  // #45: same shape and same lifetime as the target-change mirror above --
+  // every recorder state change (and the once-a-second byte tick while
+  // recording) becomes a `recording` SSE frame.
+  const { recordingCoordinator } = deps;
+  if (recordingCoordinator !== undefined) {
+    recordingCoordinator.onStateChange((snapshot) => {
+      broadcaster.recording(snapshot);
     });
   }
 
@@ -238,9 +258,154 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
         sendJson(res, 200, { targetWindow: target, revision: broadcaster.currentConfigRevision() });
       },
     },
+    {
+      // #45: the recorder's state on first load, before any `recording` SSE
+      // frame has arrived. Exactly the gap `GET /config` fills for the target
+      // -- a client that only learned the state from SSE would render "not
+      // recording" until the next frame, which for this particular feature is
+      // the one wrong thing it could say.
+      method: 'GET',
+      path: '/recording',
+      handle: ({ res }) => {
+        sendJson(res, 200, recordingCoordinator?.snapshot() ?? broadcaster.currentRecording());
+      },
+    },
+    {
+      method: 'POST',
+      path: '/recording/start',
+      handle: async ({ res }) => {
+        if (recordingCoordinator === undefined || configStore === undefined) {
+          sendJson(res, 503, { error: 'not_ready' });
+          return;
+        }
+        // There is nothing to record without a capture stream, and starting
+        // anyway would sit in `starting` until the renderer's handshake timed
+        // out -- a slow, confusing way to say something the server already
+        // knows.
+        if (configStore.get().targetWindow === null) {
+          sendJson(res, 409, { error: 'no_capture_session' });
+          return;
+        }
+        sendJson(res, 200, await recordingCoordinator.start());
+      },
+    },
+    {
+      method: 'POST',
+      path: '/recording/stop',
+      handle: async ({ res }) => {
+        if (recordingCoordinator === undefined) {
+          sendJson(res, 503, { error: 'not_ready' });
+          return;
+        }
+        await recordingCoordinator.stop();
+        sendJson(res, 200, recordingCoordinator.snapshot());
+      },
+    },
+    {
+      method: 'GET',
+      path: '/recordings',
+      handle: async ({ res }) => {
+        // Read fresh per request, like `GET /answers`: a segment that rolled a
+        // moment ago has to show up without any cache to invalidate.
+        const segments = deps.recordingLog === undefined ? [] : await deps.recordingLog.readIndex();
+        sendJson(res, 200, segments);
+      },
+    },
+    {
+      method: 'GET',
+      path: '/recording/settings',
+      handle: ({ res }) => {
+        if (configStore === undefined) {
+          sendJson(res, 503, { error: 'not_ready' });
+          return;
+        }
+        sendJson(res, 200, configStore.get().recording);
+      },
+    },
+    {
+      method: 'POST',
+      path: '/recording/settings',
+      handle: async ({ req, res }) => {
+        if (configStore === undefined) {
+          sendJson(res, 503, { error: 'not_ready' });
+          return;
+        }
+
+        let body: unknown;
+        try {
+          body = await readJsonBody(req);
+        } catch (error) {
+          if (error instanceof PayloadTooLargeError) {
+            sendJson(res, 413, { error: 'payload_too_large' });
+          } else {
+            sendJson(res, 400, { error: 'bad_request' });
+          }
+          return;
+        }
+
+        const patch = parseRecordingSettingsBody(body);
+        if (patch === INVALID_SETTINGS) {
+          sendJson(res, 400, { error: 'bad_request' });
+          return;
+        }
+
+        // The store clamps and persists; the response is whatever it actually
+        // stored, not the patch, so a client that sent an out-of-range value
+        // sees the clamped truth rather than believing its own request.
+        sendJson(res, 200, await configStore.setRecordingSettings(patch));
+      },
+    },
   ];
 
+  // Only registered when both halves exist -- the route cannot serve anything
+  // useful with an index but no directory to read from, and a route that always
+  // 503s is worse than a 404 from the router's own miss.
+  if (deps.recordingLog !== undefined && deps.recordingsDir !== undefined) {
+    routes.push(
+      createSegmentFileRoute({
+        recordingLog: deps.recordingLog,
+        dir: deps.recordingsDir,
+        logger: deps.logger,
+      }),
+    );
+  }
+
   return { routes, solveLoop };
+}
+
+const INVALID_SETTINGS = Symbol('invalid-recording-settings');
+
+/**
+ * A partial {@link RecordingSettings} patch, or {@link INVALID_SETTINGS}.
+ *
+ * Unknown keys are ignored rather than rejected, and an absent key means "leave
+ * it alone" -- the client only ever moves one control at a time. A key that is
+ * *present* with the wrong type is a genuine `400`, though: silently discarding
+ * it would leave the user staring at a control that snapped back with no
+ * explanation.
+ */
+function parseRecordingSettingsBody(
+  body: unknown,
+): Partial<{ enabled: boolean; segmentSeconds: number; retentionBytes: number; retentionDays: number }> | typeof INVALID_SETTINGS {
+  if (body === null) return {};
+  if (typeof body !== 'object') return INVALID_SETTINGS;
+
+  const candidate = body as Record<string, unknown>;
+  const patch: Record<string, unknown> = {};
+
+  if ('enabled' in candidate) {
+    if (typeof candidate.enabled !== 'boolean') return INVALID_SETTINGS;
+    patch.enabled = candidate.enabled;
+  }
+  for (const key of ['segmentSeconds', 'retentionBytes', 'retentionDays'] as const) {
+    if (!(key in candidate)) continue;
+    if (typeof candidate[key] !== 'number' || !Number.isFinite(candidate[key])) {
+      return INVALID_SETTINGS;
+    }
+    patch[key] = candidate[key];
+  }
+
+  return patch;
 }
 
 const INVALID_TARGET = Symbol('invalid-target');

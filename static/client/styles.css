@@ -247,3 +247,152 @@ main {
   color: var(--text-muted);
   font-size: 0.85rem;
 }
+
+/* Screen recording (#33 follow-up) */
+
+#recording-pane {
+  grid-column: 1;
+}
+
+.recording-control-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+/* Deliberately conspicuous -- recording is never meant to be silent. A
+   pulsing dot plus live elapsed time / byte count, both refreshed every
+   second while `state === 'recording'`. */
+.recording-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: rgba(224, 85, 94, 0.12);
+  color: var(--danger);
+  font-weight: 600;
+  font-size: 0.85rem;
+  width: fit-content;
+}
+
+.recording-indicator .rec-dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--danger);
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+
+.recording-indicator #rec-elapsed,
+.recording-indicator #rec-bytes {
+  color: var(--text);
+  font-weight: 400;
+}
+
+@keyframes rec-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .recording-indicator .rec-dot {
+    animation: none;
+  }
+}
+
+#recording-settings {
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+}
+
+#recording-settings summary {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+#recording-settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+}
+
+.settings-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.settings-row-checkbox {
+  flex-direction: row;
+  align-items: center;
+}
+
+.settings-row input[type='number'] {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+  max-width: 12rem;
+}
+
+.settings-actions {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.recording-player {
+  margin-bottom: 0.75rem;
+}
+
+.recording-player video {
+  width: 100%;
+  max-width: 100%;
+  border-radius: 8px;
+  display: block;
+}
+
+.recordings-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.recordings-list li {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.recordings-list .recording-title {
+  font-weight: 600;
+}
+
+.recordings-list .recording-meta {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.recordings-list li[data-active='true'] {
+  border-color: var(--accent);
+}

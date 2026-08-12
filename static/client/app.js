@@ -9,7 +9,15 @@
 //   POST /config/target    -> { targetWindow, revision }   (#33)
 //   GET  /answers          -> AnswerLogEntry[]              (#31)
 //   POST /solve             -> 202/400/503                   (#29)
-//   GET  /events (SSE)      -> start/delta/done/error/sync/status/config{,revision}
+//   GET  /events (SSE)      -> start/delta/done/error/sync/status/config{,revision}/recording
+//
+// Continuous screen recording (server contract as of this writing):
+//   POST /recording/start   -> 200 {state,segmentId,startedAt,bytes} / 409 no_capture_session / 503
+//   POST /recording/stop    -> 200 {state:'off'}
+//   GET  /recordings        -> {id,startedAt,endedAt,bytes,durationMs,mimeType,target}[], newest first
+//   GET  /recordings/file?id=<id> -> segment bytes, Range-capable (used directly as a <video> src)
+//   GET  /recording/settings  -> {enabled,segmentSeconds,retentionBytes,retentionDays}
+//   POST /recording/settings  -> same shape, accepts any subset of the four fields
 
 (() => {
   'use strict';
@@ -32,9 +40,39 @@
   const answerText = document.getElementById('answer-text');
   const historyList = document.getElementById('history-list');
 
+  const recButton = document.getElementById('rec-button');
+  const recStateLabel = document.getElementById('rec-state-label');
+  const recordingError = document.getElementById('recording-error');
+  const recordingIndicator = document.getElementById('recording-indicator');
+  const recElapsed = document.getElementById('rec-elapsed');
+  const recBytes = document.getElementById('rec-bytes');
+  const recordingsList = document.getElementById('recordings-list');
+  const recordingsError = document.getElementById('recordings-error');
+  const recordingPlayer = document.getElementById('recording-player');
+  const recordingSettingsForm = document.getElementById('recording-settings-form');
+  const recordingSettingsError = document.getElementById('recording-settings-error');
+  const recordingSettingsStatus = document.getElementById('rec-settings-status');
+  const recSettingEnabled = document.getElementById('rec-setting-enabled');
+  const recSettingSegmentSeconds = document.getElementById('rec-setting-segment-seconds');
+  const recSettingRetentionBytes = document.getElementById('rec-setting-retention-bytes');
+  const recSettingRetentionDays = document.getElementById('rec-setting-retention-days');
+
   /** @type {{processName: string, title: string} | null} */
   let currentTarget = null;
   let liveText = '';
+
+  // The `recording` SSE frame is only replayed to a newly-connecting client
+  // when the server-side state is not `'off'` (see the contract comment up
+  // top) -- so if nothing arrives before the first render, `'off'` is the
+  // correct assumption, not an unknown/loading state. `segmentId` starts as
+  // `undefined` (not `null`) specifically so the very first frame -- even
+  // one reporting `segmentId: null` -- is still treated as "different from
+  // what we had" by {@link refreshRecordingsIfNeeded}'s `!==` check below.
+  let recordingState = { state: 'off', segmentId: undefined, bytes: 0, startedAt: null, reason: null };
+  let recordingRequestPending = false;
+  let recordingTimerId = null;
+  let currentVideoEl = null;
+  let currentVideoLi = null;
 
   // Startup snapshot-vs-stream ordering (Greptile review on #33's PR): the
   // initial `GET /config` and `GET /answers` fetches race the `GET /events`
@@ -99,6 +137,10 @@
       answerPane.hidden = false;
       targetLabel.textContent = `Watching: ${formatTarget(targetWindow)}`;
     }
+
+    // The REC control is disabled with no target configured -- reuses this
+    // existing state rather than the client re-fetching anything of its own.
+    updateRecordingUI();
   }
 
   async function loadConfig() {
@@ -311,6 +353,272 @@
     if (historyList.children.length === 0) historyList.appendChild(emptyHint('No answers yet.'));
   }
 
+  /** KB/MB/GB, one decimal place -- matches the byte counter ticking up live on the recording indicator and the size shown per row in the recordings list. */
+  function formatBytes(bytes) {
+    if (bytes == null) return '';
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let value = bytes;
+    let unitIndex = -1;
+    do {
+      value /= 1024;
+      unitIndex++;
+    } while (value >= 1024 && unitIndex < units.length - 1);
+    return `${value.toFixed(1)} ${units[unitIndex]}`;
+  }
+
+  /** `H:MM:SS`, dropping the hour segment under an hour -- shared by the live elapsed-time readout and a finished recording's duration in the list. */
+  function formatElapsedMs(ms) {
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const mm = String(minutes).padStart(2, '0');
+    const ss = String(seconds).padStart(2, '0');
+    return hours > 0 ? `${hours}:${mm}:${ss}` : `${minutes}:${ss}`;
+  }
+
+  function recordingIndicatorTick() {
+    recElapsed.textContent = recordingState.startedAt
+      ? formatElapsedMs(Date.now() - new Date(recordingState.startedAt).getTime())
+      : '';
+    recBytes.textContent = formatBytes(recordingState.bytes);
+  }
+
+  function startRecordingTimer() {
+    if (recordingTimerId !== null) return;
+    recordingTimerId = setInterval(recordingIndicatorTick, 1000);
+  }
+
+  function stopRecordingTimer() {
+    if (recordingTimerId === null) return;
+    clearInterval(recordingTimerId);
+    recordingTimerId = null;
+  }
+
+  /** The single place that renders the REC button/label/indicator from {@link recordingState} plus {@link currentTarget} -- called on every `recording` SSE frame, on every config change (the target the button depends on can change out from under it), and around the button's own click handler while its request is in flight. Never flips state on click itself; only ever reflects what the last frame or fetch actually reported. */
+  function updateRecordingUI() {
+    const { state, reason } = recordingState;
+    recordingError.hidden = true;
+
+    if (state === 'unavailable') {
+      recButton.disabled = true;
+      recButton.textContent = 'Record';
+      recStateLabel.textContent = reason
+        ? `Recording is unavailable: ${reason}`
+        : 'Recording is unavailable on this system.';
+    } else if (currentTarget === null) {
+      recButton.disabled = true;
+      recButton.textContent = 'Record';
+      recStateLabel.textContent = 'Pick a target window before recording.';
+    } else if (recordingRequestPending) {
+      recButton.disabled = true;
+      recButton.textContent = state === 'off' || state === 'error' ? 'Starting…' : 'Stopping…';
+      recStateLabel.textContent = '';
+    } else if (state === 'starting') {
+      recButton.disabled = true;
+      recButton.textContent = 'Starting…';
+      recStateLabel.textContent = 'Starting recording…';
+    } else if (state === 'recording') {
+      recButton.disabled = false;
+      recButton.textContent = 'Stop recording';
+      recStateLabel.textContent = '';
+    } else if (state === 'error') {
+      recButton.disabled = false;
+      recButton.textContent = 'Retry recording';
+      recStateLabel.textContent = '';
+      recordingError.hidden = false;
+      recordingError.textContent = reason ? `Recording error: ${reason}` : 'Recording error.';
+    } else {
+      // 'off'
+      recButton.disabled = false;
+      recButton.textContent = 'Record';
+      recStateLabel.textContent = '';
+    }
+
+    recordingIndicator.hidden = state !== 'recording';
+    if (state === 'recording') {
+      recordingIndicatorTick();
+      startRecordingTimer();
+    } else {
+      stopRecordingTimer();
+    }
+  }
+
+  recButton.addEventListener('click', async () => {
+    const action = recordingState.state === 'off' || recordingState.state === 'error' ? 'start' : 'stop';
+    recordingRequestPending = true;
+    updateRecordingUI();
+    try {
+      const res = await fetch(`/recording/${action}`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        const message =
+          body.error === 'no_capture_session'
+            ? 'no window is currently being captured'
+            : body.error === 'not_ready'
+              ? 'not ready yet -- try again in a moment'
+              : body.error === 'shutting_down'
+                ? 'the app is shutting down'
+                : body.error || `unexpected status ${res.status}`;
+        throw new Error(message);
+      }
+      // Deliberately not applied here even though the 200 body echoes the
+      // same shape as a `recording` SSE frame -- the spec calls for the
+      // control to reflect live SSE state only, never an optimistic flip on
+      // click, so this response is consulted for its error shape alone and
+      // the actual state transition is left to the frame that follows.
+    } catch (err) {
+      recordingError.hidden = false;
+      recordingError.textContent = `Could not ${action} recording: ${err.message}`;
+    } finally {
+      recordingRequestPending = false;
+      updateRecordingUI();
+    }
+  });
+
+  function renderRecordingItem(entry) {
+    const li = document.createElement('li');
+    li.dataset.recordingId = entry.id;
+
+    const title = document.createElement('div');
+    title.className = 'recording-title';
+    title.textContent = new Date(entry.startedAt).toLocaleString();
+
+    const meta = document.createElement('div');
+    meta.className = 'recording-meta';
+    const durationText = entry.durationMs == null ? 'recording…' : formatElapsedMs(entry.durationMs);
+    const targetText = entry.target ? formatTarget(entry.target) : '(unknown target)';
+    meta.textContent = [durationText, formatBytes(entry.bytes), targetText].filter(Boolean).join(' · ');
+
+    const playButton = document.createElement('button');
+    playButton.type = 'button';
+    playButton.textContent = 'Play';
+    playButton.addEventListener('click', () => openRecording(entry, li));
+
+    li.append(title, meta, playButton);
+    return li;
+  }
+
+  /** Only one `<video>` open at a time -- tears down whatever was previously playing (pause + drop `src` + `load()`, the standard way to stop a buffering `<video>` from continuing to fetch) before mounting the next one, so switching rows never leaves more than one element buffering. */
+  function openRecording(entry, li) {
+    if (currentVideoEl) {
+      currentVideoEl.pause();
+      currentVideoEl.removeAttribute('src');
+      currentVideoEl.load();
+    }
+    if (currentVideoLi) delete currentVideoLi.dataset.active;
+
+    recordingPlayer.innerHTML = '';
+    const video = document.createElement('video');
+    video.controls = true;
+    video.preload = 'metadata';
+    video.src = `/recordings/file?id=${encodeURIComponent(entry.id)}`;
+    recordingPlayer.appendChild(video);
+    recordingPlayer.hidden = false;
+
+    currentVideoEl = video;
+    currentVideoLi = li;
+    li.dataset.active = 'true';
+  }
+
+  async function loadRecordings() {
+    recordingsError.hidden = true;
+    try {
+      const res = await fetch('/recordings');
+      if (!res.ok) throw new Error(`GET /recordings -> ${res.status}`);
+      const entries = await res.json();
+
+      recordingPlayer.hidden = true;
+      recordingPlayer.innerHTML = '';
+      currentVideoEl = null;
+      currentVideoLi = null;
+
+      recordingsList.innerHTML = '';
+      if (entries.length === 0) {
+        recordingsList.appendChild(emptyHint('No recordings yet.'));
+        return;
+      }
+      // Already newest-first per the contract -- appended in that order.
+      for (const entry of entries) recordingsList.appendChild(renderRecordingItem(entry));
+    } catch (err) {
+      recordingsError.hidden = false;
+      recordingsError.textContent = `Could not load recordings: ${err.message}`;
+    }
+  }
+
+  function applyRecordingSettings(settings) {
+    recSettingEnabled.checked = Boolean(settings.enabled);
+    recSettingSegmentSeconds.value = settings.segmentSeconds;
+    recSettingRetentionBytes.value = settings.retentionBytes;
+    recSettingRetentionDays.value = settings.retentionDays;
+  }
+
+  // The recorder's state on first load. The `recording` SSE frame is replayed
+  // on connect whenever the state isn't `off`, so this is strictly a
+  // belt-and-braces read for the gap between the page rendering and the
+  // EventSource actually opening -- without it, a phone opened during a
+  // recording shows "not recording" for as long as that handshake takes, which
+  // is the one thing this UI must never say. Mirrors what `loadConfig()`
+  // already does for the target.
+  async function loadRecordingState() {
+    try {
+      const res = await fetch('/recording');
+      if (!res.ok) return;
+      const snapshot = await res.json();
+      // Never allowed to overwrite a live SSE frame that beat it here: the two
+      // are independent, unordered sources for the same fact, the same problem
+      // `GET /config`'s `revision` counter exists to solve. There is no
+      // revision on this one, so the weaker but sufficient rule is "only fill
+      // in a state nothing has reported yet".
+      if (recordingState.state !== 'off') return;
+      recordingState = snapshot;
+      updateRecordingUI();
+      if (snapshot.state !== 'off') loadRecordings();
+    } catch {
+      // A failure here costs nothing -- the SSE replay covers the same ground.
+    }
+  }
+
+  async function loadRecordingSettings() {
+    recordingSettingsError.hidden = true;
+    try {
+      const res = await fetch('/recording/settings');
+      if (!res.ok) throw new Error(`GET /recording/settings -> ${res.status}`);
+      applyRecordingSettings(await res.json());
+    } catch (err) {
+      recordingSettingsError.hidden = false;
+      recordingSettingsError.textContent = `Could not load recording settings: ${err.message}`;
+    }
+  }
+
+  recordingSettingsForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    recordingSettingsError.hidden = true;
+    recordingSettingsStatus.hidden = true;
+    try {
+      const res = await fetch('/recording/settings', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          enabled: recSettingEnabled.checked,
+          segmentSeconds: Number(recSettingSegmentSeconds.value),
+          retentionBytes: Number(recSettingRetentionBytes.value),
+          retentionDays: Number(recSettingRetentionDays.value),
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `unexpected status ${res.status}`);
+      }
+      applyRecordingSettings(await res.json());
+      recordingSettingsStatus.hidden = false;
+    } catch (err) {
+      recordingSettingsError.hidden = false;
+      recordingSettingsError.textContent = `Could not save recording settings: ${err.message}`;
+    }
+  });
+
   function setStatusPill(level, kind) {
     if (level === 'silent') {
       statusPill.hidden = true;
@@ -399,9 +707,30 @@
       const data = JSON.parse(event.data);
       applyConfigIfNewer(data.target, data.revision);
     });
+
+    // Replayed immediately on connect whenever the server-side state isn't
+    // `'off'` (see the contract comment up top), so this can fire before
+    // anything else does -- `updateRecordingUI` doesn't care which frame is
+    // "first", only what the latest one says. A changed `segmentId` (a
+    // fresh start, or a roll to the next segment while still `'recording'`)
+    // or a transition to `'off'` (a stop, which finalizes the segment that
+    // was writing) both mean the `/recordings` list is now stale, so those
+    // are the only two cases that trigger a re-fetch -- a same-segment
+    // `bytes` tick every few seconds while recording does not.
+    source.addEventListener('recording', (event) => {
+      const data = JSON.parse(event.data);
+      const shouldRefreshRecordings = data.state === 'off' || data.segmentId !== recordingState.segmentId;
+      recordingState = data;
+      updateRecordingUI();
+      if (shouldRefreshRecordings) loadRecordings();
+    });
   }
 
   loadConfig();
   loadHistory();
+  loadRecordings();
+  loadRecordingSettings();
+  loadRecordingState();
+  updateRecordingUI();
   connectEvents();
 })();

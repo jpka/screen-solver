@@ -8,7 +8,11 @@ import {
   resolveTargetWindowOnStartup,
 } from '../../src/host/config/store.ts';
 import { StartupError } from '../../src/host/errors.ts';
-import type { ConfigChangeEvent, WindowInfo } from '../../src/host/config/types.ts';
+import {
+  DEFAULT_RECORDING_SETTINGS,
+  type ConfigChangeEvent,
+  type WindowInfo,
+} from '../../src/host/config/types.ts';
 import { tempStateRoot } from '../helpers/temp-state-root.ts';
 
 const KATA_TAB = { processName: 'chrome.exe', title: 'Two Sum - LeetCode' };
@@ -20,10 +24,23 @@ describe('loadConfigStore', () => {
 
     const store = await loadConfigStore({ stateRoot });
 
-    assert.deepEqual(store.get(), { targetWindow: null, provider: null });
+    // #45 added the `recording` block to the config shape, so "a fresh
+    // config.json" is now three fields rather than two. Asserted in full
+    // rather than field-by-field, deliberately: this test's job is to pin the
+    // whole on-disk shape, and a later ticket adding a fourth field should
+    // have to come here and say so.
+    assert.deepEqual(store.get(), {
+      targetWindow: null,
+      provider: null,
+      recording: DEFAULT_RECORDING_SETTINGS,
+    });
 
     const onDisk = JSON.parse(await readFile(join(stateRoot, CONFIG_FILE_NAME), 'utf8'));
-    assert.deepEqual(onDisk, { targetWindow: null, provider: null });
+    assert.deepEqual(onDisk, {
+      targetWindow: null,
+      provider: null,
+      recording: DEFAULT_RECORDING_SETTINGS,
+    });
   });
 
   it('is a no-op on a config.json that already exists', async (t) => {
@@ -34,7 +51,11 @@ describe('loadConfigStore', () => {
 
     const store = await loadConfigStore({ stateRoot, enumerateWindows: async () => [KATA_TAB] });
 
-    assert.deepEqual(store.get(), saved);
+    // The saved file predates #45 and has no `recording` block -- exactly what
+    // every config.json written by an earlier version looks like. It loads with
+    // defaults filled in rather than refusing to start, and the file itself is
+    // still not rewritten (this test's "no-op" claim).
+    assert.deepEqual(store.get(), { ...saved, recording: DEFAULT_RECORDING_SETTINGS });
     assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')), saved);
   });
 

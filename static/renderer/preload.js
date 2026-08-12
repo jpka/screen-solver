@@ -35,6 +35,18 @@ const CAPTURE_CHANNELS = {
   frameResult: 'screen-solver:capture:frame-result',
 };
 
+// Mirrors src/main/recording-ipc-channels.ts (#45), for the same
+// can't-import-across-static reason as CAPTURE_CHANNELS above. Keep these
+// five strings in sync with recording-ipc-channels.ts by hand if either
+// changes.
+const RECORDING_CHANNELS = {
+  start: 'screen-solver:recording:start',
+  roll: 'screen-solver:recording:roll',
+  stop: 'screen-solver:recording:stop',
+  chunk: 'screen-solver:recording:chunk',
+  status: 'screen-solver:recording:status',
+};
+
 contextBridge.exposeInMainWorld('captureHost', {
   /** Fires when main wants a session opened against a desktopCapturer source id. */
   onOpen(handler) {
@@ -64,5 +76,39 @@ contextBridge.exposeInMainWorld('captureHost', {
           ipcRenderer.send(CAPTURE_CHANNELS.frameResult, requestId, message);
         });
     });
+  },
+});
+
+// A second exposeInMainWorld object, not more members bolted onto
+// captureHost, because this is a genuinely separate subscription with its
+// own lifecycle (#45's recording.ts note: "these are a subscription, not a
+// per-request round trip" -- see recording-ipc-channels.ts) rather than
+// another capture-shaped request/reply pair. Keeping the two surfaces
+// separate also means capture.js's recording code can be read on its own
+// without cross-referencing captureHost's request/reply shapes.
+contextBridge.exposeInMainWorld('recordingHost', {
+  /** Fires when main wants recording started against segmentId, at timesliceMs. */
+  onStart(handler) {
+    ipcRenderer.on(RECORDING_CHANNELS.start, (_event, segmentId, timesliceMs) => handler(segmentId, timesliceMs));
+  },
+
+  /** Fires when main wants the current segment finished and nextSegmentId begun. */
+  onRoll(handler) {
+    ipcRenderer.on(RECORDING_CHANNELS.roll, (_event, nextSegmentId) => handler(nextSegmentId));
+  },
+
+  /** Fires when main wants the open segment flushed and the recorder torn down. */
+  onStop(handler) {
+    ipcRenderer.on(RECORDING_CHANNELS.stop, () => handler());
+  },
+
+  /** Sends one dataavailable payload (base64 bytes, tagged with its segment) to main. */
+  sendChunk(message) {
+    ipcRenderer.send(RECORDING_CHANNELS.chunk, message);
+  },
+
+  /** Sends a lifecycle or failure report (started/rolled/stopped/failed) to main. */
+  sendStatus(message) {
+    ipcRenderer.send(RECORDING_CHANNELS.status, message);
   },
 });

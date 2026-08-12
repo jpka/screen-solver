@@ -1,6 +1,7 @@
 import type { ServerResponse } from 'node:http';
 import type { TargetWindowIdentity } from '../config/types.ts';
 import type { ProviderErrorKind, Usage } from '../provider/types.ts';
+import type { RecordingSnapshot } from '../recording/coordinator.ts';
 import type { StatusSnapshot } from './status.ts';
 
 /**
@@ -37,6 +38,17 @@ import type { StatusSnapshot } from './status.ts';
  * call and handed back by both `GET /config` (`routes.ts`) and this event,
  * gives the client real ordering to compare against instead of guessing from
  * arrival order.
+ *
+ * `recording{state,segmentId,bytes,startedAt,reason}` (#45) is the recorder's
+ * live state. It rides this same channel for the reason `status` already does
+ * -- the spec ruled out a second push endpoint -- and is replayed on
+ * `subscribe()` whenever the state isn't `off`, the same catch-up `sync` and
+ * `status` use. It is broadcast both on real state changes *and* once per
+ * second while recording, because `bytes` is a live counter: a client that only
+ * learned the byte total at a segment boundary would show a frozen number for
+ * minutes at a time. That makes it the one deliberately chatty event here, and
+ * it stays cheap because it is a single small frame to a handful of local
+ * clients.
  */
 export type SseEvent =
   | { readonly type: 'start' }
@@ -45,7 +57,8 @@ export type SseEvent =
   | { readonly type: 'error'; readonly kind: ProviderErrorKind }
   | { readonly type: 'sync'; readonly text: string }
   | { readonly type: 'status'; readonly level: StatusSnapshot['level']; readonly kind: StatusSnapshot['kind'] }
-  | { readonly type: 'config'; readonly target: TargetWindowIdentity | null; readonly revision: number };
+  | { readonly type: 'config'; readonly target: TargetWindowIdentity | null; readonly revision: number }
+  | ({ readonly type: 'recording' } & RecordingSnapshot);
 
 /**
  * One shared broadcast to every connected `GET /events` client -- no
@@ -111,7 +124,26 @@ export interface EventBroadcaster {
    * already applied. See the `revision` doc comment on {@link SseEvent}.
    */
   currentConfigRevision(): number;
+  /**
+   * Broadcasts the recorder's current state (#45) -- `bootstrap.ts` wires this
+   * to `RecordingCoordinator`'s `onStateChange`. Unlike `status`, no
+   * change-filtering happens here: the coordinator deliberately republishes on
+   * a timer so the client's byte counter advances, and deciding what is worth
+   * sending is its job, not this broadcaster's.
+   */
+  recording(snapshot: RecordingSnapshot): void;
+  /** The recorder's last published state -- `subscribe()` replays it when it isn't `off`, and `GET /recording` serves it. */
+  currentRecording(): RecordingSnapshot;
 }
+
+/** What a client is told before any recorder has ever reported in. */
+const IDLE_RECORDING: RecordingSnapshot = Object.freeze({
+  state: 'off',
+  segmentId: null,
+  bytes: 0,
+  startedAt: null,
+  reason: null,
+});
 
 export function createEventBroadcaster(): EventBroadcaster {
   const clients = new Set<ServerResponse>();
@@ -119,6 +151,7 @@ export function createEventBroadcaster(): EventBroadcaster {
   let inFlight = false;
   let status: StatusSnapshot = { level: 'silent', kind: null };
   let configRevision = 0;
+  let recording: RecordingSnapshot = IDLE_RECORDING;
 
   function broadcast(event: SseEvent): void {
     const frame = frameFor(event);
@@ -173,6 +206,19 @@ export function createEventBroadcaster(): EventBroadcaster {
         }
       }
 
+      if (recording.state !== 'off') {
+        // Same one-client catch-up as `sync` and `status`. A client opening
+        // mid-recording has to learn that immediately -- a REC indicator that
+        // only appeared after the next state change would leave a phone showing
+        // "not recording" while the desktop was, in fact, recording, which is
+        // the one thing this feature must never do.
+        try {
+          res.write(frameFor({ type: 'recording', ...recording }));
+        } catch {
+          clients.delete(res);
+        }
+      }
+
       return () => {
         clients.delete(res);
       };
@@ -214,6 +260,13 @@ export function createEventBroadcaster(): EventBroadcaster {
     },
 
     currentConfigRevision: () => configRevision,
+
+    recording(snapshot) {
+      recording = snapshot;
+      broadcast({ type: 'recording', ...snapshot });
+    },
+
+    currentRecording: () => recording,
   };
 }
 

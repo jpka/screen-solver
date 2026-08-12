@@ -6,6 +6,7 @@ import { createRealCaptureSessionOpener } from './capture-session.ts';
 import { createHiddenWindow } from './hidden-window.ts';
 import { isTargetMinimizedReal } from './minimized-check.ts';
 import { webClientDir } from './paths.ts';
+import { createRealRecorderOpener } from './recording.ts';
 import { enumerateOpenWindows } from './window-enumeration.ts';
 
 const EXIT_OK = 0;
@@ -50,6 +51,7 @@ async function main(): Promise<void> {
     enumerateWindows: enumerateOpenWindows,
     openCaptureSession: createRealCaptureSessionOpener(hiddenWindowReady),
     isTargetMinimized: isTargetMinimizedReal,
+    openRecorder: createRealRecorderOpener(hiddenWindowReady),
     clientStaticDir: webClientDir,
   });
 
