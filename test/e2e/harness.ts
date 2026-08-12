@@ -151,7 +151,8 @@ function createCounter(): MutableCounter {
 
 /** One in-progress `Provider.solve()` call, driven by hand from the test. */
 export interface ScriptedCall {
-  readonly image: SolveImage;
+  /** `null` for a spoken-only solve, where no screenshot was captured at all. */
+  readonly image: SolveImage | null;
   /**
    * The whole options object the loop passed, `undefined` if it passed none.
    *
@@ -461,6 +462,11 @@ export interface E2EApp {
   solve(): Promise<Response>;
   /** The second solve button: the same request, plus whatever is in the transcript window. */
   solveWithTranscript(): Promise<Response>;
+  /**
+   * The third solve button: recent speech and no screenshot at all -- no
+   * target window is required for this one, since nothing is captured.
+   */
+  solveTranscriptOnly(): Promise<Response>;
   getConfig(): Promise<{ targetWindow: TargetWindowIdentity | null; revision: number }>;
   listWindows(): Promise<WindowInfo[]>;
   setTarget(target: TargetWindowIdentity | null): Promise<Response>;
@@ -647,6 +653,7 @@ export async function bootApp(t: TestContext, options: BootOptions = {}): Promis
 
     solve: () => fetch(`${url}/solve`, { method: 'POST' }),
     solveWithTranscript: () => fetch(`${url}/solve/with-transcript`, { method: 'POST' }),
+    solveTranscriptOnly: () => fetch(`${url}/solve/transcript-only`, { method: 'POST' }),
     async getConfig() {
       const response = await fetch(`${url}/config`);
       return (await response.json()) as { targetWindow: TargetWindowIdentity | null; revision: number };

@@ -7,15 +7,34 @@ fixture, so the two can't test different quizzes.
 | Kind | On screen | Said out loud | Button | Right answer |
 | --- | --- | --- | --- | --- |
 | `screen` | the exercise | nothing | Solve now | a solution |
+| `voice` | no exercise | the whole problem | Solve speech only | a solution to the spoken question |
 | `voice` | no exercise | the whole problem | Solve with transcript | `# No exercise on screen` |
 | `voice-about-screen` | the exercise | a constraint on it | Solve with transcript | a solution shaped by what was said |
 
-The `voice` row is the one worth being clear about: a spoken-only problem is
-*expected to bail*. The system prompt makes the screenshot the sole authority
-on whether there is anything to solve ("someone talking about a problem is not
-a problem on screen"), so a run where the model answers the spoken question is
-a failing run, not an impressive one. Two of the six problems exist to catch
-exactly that.
+The `voice` row now has a button of its own, and two right answers depending
+on which one is pressed. **Solve speech only** sends nothing but the
+transcript — no screenshot exists for that request at all, so the transcript
+*is* the question, and a real answer is the correct one: an idiomatic name and
+signature the model invents itself, and a language it either takes from the
+speech or assumes and declares (a `> **Missing:**` line, same mechanism a
+partially-visible screen already uses for an assumption). **Solve with
+transcript**, pressed on the very same problem, still sends the catalogue or
+call screenshot the problem shows — and that screenshot still has no exercise
+on it, so that button must still bail with `# No exercise on screen`. The
+system prompt makes the screenshot the sole authority on whether there is
+anything to solve whenever a screenshot exists at all ("someone talking about
+a problem is not a problem on screen"), and the mock quiz is built to prove
+the new speech-only capability didn't quietly relax that: every `voice`
+problem carries both expectations, and a run where the screen-carrying button
+answers the spoken question anyway is a failing run, not an impressive one.
+
+One `voice` problem, `voice-only-no-question`, exists for the other new
+marker: its speech is small talk that asks nothing a program could answer, so
+even its own speech-only button must bail — with `# No question in the recent
+speech` rather than `# No exercise on screen`, since that request never saw a
+screen to report on. `quiz.ts`'s `expectationFor(problem, route)` is how a
+test (or a human at the crib sheet) asks "what should pressing THIS button
+produce for THIS problem" without hand-branching on kind.
 
 ## Files
 
@@ -69,15 +88,16 @@ model. That is the whole reason the rig exists.
 4. Press **Start recording** in the client. Check the transcript pane fills as
    you speak or as the rig does — the audio device the browser plays through
    has to be the one Windows is rendering to, and it must not be muted.
-5. Walk the quiz. For each problem the rig's bar says which button its kind
-   calls for:
+5. Walk the quiz. For each problem the rig's bar says which button(s) its kind
+   calls for — a `voice` problem names both, since it now has two right
+   answers to check, one per button:
    - `←` / `→` move between problems,
    - `s` speaks the current problem's lines,
    - `p` hides the rig bar for a clean screenshot,
-   - `e` opens the crib sheet — the spoken script, what a good answer contains,
-     and a worked answer to compare against.
-6. Press the button the bar names, and grade what comes back against the crib
-   sheet.
+   - `e` opens the crib sheet — the spoken script, what a good answer contains
+     for each button that applies, and a worked answer to compare against.
+6. Press the button (or, for a `voice` problem, each button in turn) the bar
+   names, and grade what comes back against the crib sheet.
 
 **Close the crib sheet before you press Solve.** It is on screen while it is
 open, which turns a voice-only problem into a screen problem and hands the
@@ -89,12 +109,23 @@ you'll be looking when it matters.
 - A `screen` problem: the heading is the title on screen, the code block
   reproduces the visible signature exactly (`positiveSum(arr)`, not
   `sumPositive(numbers)`), and the sample tests' return type is respected.
-- A `voice` problem: `# No exercise on screen` verbatim, one sentence naming
-  what is there instead, no code. Anything that solves the spoken problem is a
-  failure worth filing.
+- A `voice` problem, pressed **Solve speech only**: a real answer, headed with
+  a title the model wrote itself (there is no on-screen title to copy), a
+  signature and language it chose the same way, and — since nothing on screen
+  fixed the language — a `> **Missing:**` line naming the assumption. For
+  `voice-only-no-question`, whose speech asks nothing answerable, the right
+  answer is instead `# No question in the recent speech` verbatim, one
+  sentence naming what was said instead, no code.
+- The same `voice` problem, pressed **Solve with transcript** instead:
+  `# No exercise on screen` verbatim, one sentence naming what is there
+  instead, no code — even though the identical speech just got a real answer
+  through the other button. Anything that solves the spoken problem here is a
+  failure worth filing; the screen stays authoritative whenever a screenshot
+  is actually sent.
 - A `voice-about-screen` problem: the exercise from the screen, solved the way
   the speech asked (iteratively, in linear time), with one clause saying the
   spoken constraint steered it — and nothing invented that was only spoken.
-- Afterwards: `answers.jsonl` has a line per solved problem and none for the
-  bails, `usage.jsonl` has one per attempt with `bail: true` on the voice-only
-  ones, and `transcript.jsonl` has every line the rig said.
+- Afterwards: `answers.jsonl` has a line per solved problem (now including a
+  spoken-only one, with a `null` target) and none for the bails, `usage.jsonl`
+  has one per attempt with `bail: true` on the bails, and `transcript.jsonl`
+  has every line the rig said.

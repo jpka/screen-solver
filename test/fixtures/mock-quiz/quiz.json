@@ -1,6 +1,6 @@
 {
   "title": "Screen Solver mock quiz",
-  "description": "Six problems covering the three ways a question can reach this app: on the screen, out of the speakers, or both at once. Read by test/fixtures/mock-quiz/quiz.ts (automated) and quiz-page.js (manual) -- one source of truth, no second copy to drift.",
+  "description": "Seven problems covering the three ways a question can reach this app: on the screen, out of the speakers, or both at once -- now that a question asked purely out loud has its own solving route and its own right answer. Read by test/fixtures/mock-quiz/quiz.ts (automated) and quiz-page.js (manual) -- one source of truth, no second copy to drift.",
   "problems": [
     {
       "id": "sum-of-positive",
@@ -30,9 +30,9 @@
         "outcome": "solution",
         "title": "Sum of Positive",
         "mustMention": ["positiveSum", "arr", "0"],
-        "notes": "The signature must be the one in the editor pane -- positiveSum(arr), not sumPositive or numbers. The empty-array case is called out in the notes and the sample tests, so it has to be handled rather than assumed away."
-      },
-      "scriptedAnswer": "# Sum of Positive\n\n```javascript\nfunction positiveSum(arr) {\n  return arr.reduce((total, n) => (n > 0 ? total + n : total), 0);\n}\n```\n\nA single left-to-right pass, adding each element only when it is positive. Seeding `reduce` with `0` also gives the right answer for an empty array and for an array with no positive values, both of which the notes call out.\n\nO(n) time, O(1) extra space."
+        "notes": "The signature must be the one in the editor pane -- positiveSum(arr), not sumPositive or numbers. The empty-array case is called out in the notes and the sample tests, so it has to be handled rather than assumed away.",
+        "scriptedAnswer": "# Sum of Positive\n\n```javascript\nfunction positiveSum(arr) {\n  return arr.reduce((total, n) => (n > 0 ? total + n : total), 0);\n}\n```\n\nA single left-to-right pass, adding each element only when it is positive. Seeding `reduce` with `0` also gives the right answer for an empty array and for an array with no positive values, both of which the notes call out.\n\nO(n) time, O(1) extra space."
+      }
     },
     {
       "id": "highest-and-lowest",
@@ -63,14 +63,14 @@
         "outcome": "solution",
         "title": "Highest and Lowest",
         "mustMention": ["highAndLow", "numbers", "split"],
-        "notes": "The heading is the title on screen (\"Highest and Lowest\"), but the function is highAndLow -- the starter wins over the prose. The sample tests return a string like \"42 -9\", so an array or an object is wrong however plausible it looks."
-      },
-      "scriptedAnswer": "# Highest and Lowest\n\n```javascript\nfunction highAndLow(numbers){\n  const values = numbers.split(' ').map(Number);\n  return `${Math.max(...values)} ${Math.min(...values)}`;\n}\n```\n\nSplit on the single space the notes guarantee, convert to numbers, then take both extremes in one pass each. The result is a string of the highest and lowest separated by a space, which is what the sample tests assert.\n\nO(n) time, O(n) space for the parsed values."
+        "notes": "The heading is the title on screen (\"Highest and Lowest\"), but the function is highAndLow -- the starter wins over the prose. The sample tests return a string like \"42 -9\", so an array or an object is wrong however plausible it looks.",
+        "scriptedAnswer": "# Highest and Lowest\n\n```javascript\nfunction highAndLow(numbers){\n  const values = numbers.split(' ').map(Number);\n  return `${Math.max(...values)} ${Math.min(...values)}`;\n}\n```\n\nSplit on the single space the notes guarantee, convert to numbers, then take both extremes in one pass each. The result is a string of the highest and lowest separated by a space, which is what the sample tests assert.\n\nO(n) time, O(n) space for the parsed values."
+      }
     },
     {
       "id": "voice-only-longest-run",
       "kind": "voice",
-      "why": "The whole problem arrives as speech while the screen shows a catalogue page. The screen decides whether there is anything to solve, so the right answer is the bail -- speech never licenses inventing an exercise.",
+      "why": "The whole problem arrives as speech while the screen shows a catalogue page. Pressed with its own button (\"Solve speech only\") the transcript is the entire question, and now that a route exists for that, a real answer is the right one. Pressed with the screen-carrying button instead, the screen still holds nothing to solve, so that button must still bail -- the screen stays authoritative whenever there is one.",
       "screen": {
         "kind": "no-exercise",
         "site": "Codewars",
@@ -96,17 +96,24 @@
         }
       ],
       "expected": {
+        "outcome": "solution",
+        "title": "Longest Run of Equal Values",
+        "mustMention": ["longestRun", "values", "Missing"],
+        "notes": "No screenshot exists to fix a name, a signature or a language, so the answer has to invent all three and say so: an idiomatic name, and one `> **Missing:**` line naming the language it assumed since none was spoken. The walked example (one, one, two, two, two, three -> three) should be handled correctly, and nothing about the missing screen should be treated as an excuse to bail -- a fully-specified spoken question is a real question.",
+        "scriptedAnswer": "# Longest Run of Equal Values\n\n> **Missing:** No language was stated in the transcript, so this assumes JavaScript.\n\n```javascript\nfunction longestRun(values) {\n  let longest = 0;\n  let current = 0;\n  let previous;\n  for (const value of values) {\n    current = value === previous ? current + 1 : 1;\n    longest = Math.max(longest, current);\n    previous = value;\n  }\n  return longest;\n}\n```\n\nOne left-to-right pass, extending a running streak whenever the current value matches the one right before it and resetting the streak to one otherwise, tracking the longest streak seen so far. `[1, 1, 2, 2, 2, 3]` walks to a longest run of three, matching the example given out loud.\n\nO(n) time, O(1) extra space."
+      },
+      "expectedIfScreenSent": {
         "outcome": "bail",
         "title": "No exercise on screen",
         "mustMention": [],
-        "notes": "Exactly `# No exercise on screen` plus one sentence naming what is there instead (the kata catalogue). No code block, and no attempt at the spoken problem. This is the bail rule's sharpest edge: the transcript is a hint about what is being asked, never a source of truth about what is on screen."
-      },
-      "scriptedAnswer": "# No exercise on screen\n\nThe window is showing Codewars' kata catalogue, with no kata opened."
+        "notes": "Pressed with the screen-carrying button instead of the speech-only one, the request still carries the catalogue screenshot -- and the catalogue has no exercise on it, so this must still be exactly `# No exercise on screen` plus one sentence naming what is there instead. Answering the spoken question here would mean the screen stopped being authoritative, which it never does.",
+        "scriptedAnswer": "# No exercise on screen\n\nThe window is showing Codewars' kata catalogue, with no kata opened."
+      }
     },
     {
       "id": "voice-only-balanced-brackets",
       "kind": "voice",
-      "why": "The same rule with different furniture: a call window rather than a kata site, so nothing on screen even resembles an editor.",
+      "why": "The same rule with different furniture: a call window rather than a kata site, so nothing on screen even resembles an editor. A fully-stated spoken problem with worked examples is the most tempting thing to answer from the transcript alone when a screen is present -- and, on its own route, now the correct thing to do.",
       "screen": {
         "kind": "no-exercise",
         "site": "MeetLoop",
@@ -136,12 +143,19 @@
         }
       ],
       "expected": {
+        "outcome": "solution",
+        "title": "Balanced Brackets",
+        "mustMention": ["is_balanced", "stack", "Missing"],
+        "notes": "Nothing on screen fixes a name or a language, so both are the model's own choice, with the language assumption declared on a `> **Missing:**` line. The two worked examples (`[( )]` balances, `( ]` does not) are the check a human grader runs first. \"Talk me through the data structure\" is conversational framing, not a second request -- a stack is what the prose explanation should name, not a second code block.",
+        "scriptedAnswer": "# Balanced Brackets\n\n> **Missing:** No language was stated in the transcript, so this assumes Python.\n\n```python\ndef is_balanced(text):\n    pairs = {')': '(', ']': '[', '}': '{'}\n    stack = []\n    for character in text:\n        if character in '([{':\n            stack.append(character)\n        elif character in ')]}':\n            if not stack or stack.pop() != pairs[character]:\n                return False\n    return not stack\n```\n\nA stack holding every open bracket seen so far: each close bracket has to match the most recently opened one, and popping it off confirms the nesting closes in the right order. Anything left on the stack at the end means something was opened and never closed. `[( )]` balances to an empty stack; `( ]` fails the moment `]` doesn't match the `(` still on top.\n\nO(n) time, O(n) space for the stack."
+      },
+      "expectedIfScreenSent": {
         "outcome": "bail",
         "title": "No exercise on screen",
         "mustMention": [],
-        "notes": "Bail again. Worth running even though the previous problem covers the same rule: a fully-stated spoken problem with worked examples is the most tempting thing to answer from the transcript alone."
-      },
-      "scriptedAnswer": "# No exercise on screen\n\nThe window is showing a video call, with no exercise or editor visible."
+        "notes": "Worth running even though the previous problem covers the same guard: pressed with the screen-carrying button, a video call with no exercise on it must still produce the bail, not the balanced-brackets answer the spoken-only route gives for the identical question.",
+        "scriptedAnswer": "# No exercise on screen\n\nThe window is showing a video call, with no exercise or editor visible."
+      }
     },
     {
       "id": "reverse-string-iteratively",
@@ -181,9 +195,9 @@
         "outcome": "solution",
         "title": "Reverse String",
         "mustMention": ["def reverse(text)", "for", "empty"],
-        "notes": "The signature, the title and the language all come from the screen. The transcript only decides which of several correct solutions to write: an explicit loop, not text[::-1] and not recursion. The answer should say in one clause that the spoken constraint steered it."
-      },
-      "scriptedAnswer": "# Reverse String\n\n```python\ndef reverse(text):\n    reversed_text = \"\"\n    for character in text:\n        reversed_text = character + reversed_text\n    return reversed_text\n```\n\nBuilt iteratively rather than with a slice or recursion, as asked out loud: each character is prepended to what has been reversed so far. An empty string never enters the loop and comes back empty, which the first sample test pins.\n\nO(n) time in Python's amortized string concatenation, O(n) space for the result."
+        "notes": "The signature, the title and the language all come from the screen. The transcript only decides which of several correct solutions to write: an explicit loop, not text[::-1] and not recursion. The answer should say in one clause that the spoken constraint steered it.",
+        "scriptedAnswer": "# Reverse String\n\n```python\ndef reverse(text):\n    reversed_text = \"\"\n    for character in text:\n        reversed_text = character + reversed_text\n    return reversed_text\n```\n\nBuilt iteratively rather than with a slice or recursion, as asked out loud: each character is prepended to what has been reversed so far. An empty string never enters the loop and comes back empty, which the first sample test pins.\n\nO(n) time in Python's amortized string concatenation, O(n) space for the result."
+      }
     },
     {
       "id": "two-sum-linear",
@@ -222,9 +236,56 @@
         "outcome": "solution",
         "title": "Two Sum",
         "mustMention": ["class Solution", "def twoSum", "self, nums", "target"],
-        "notes": "The constraints panel is cut off on screen, so the uniqueness guarantee and the linear-time requirement come from the speech. Expect a single-pass hash map keyed by complement, the class-wrapped signature reproduced exactly, and one clause saying the spoken constraint chose the approach."
+        "notes": "The constraints panel is cut off on screen, so the uniqueness guarantee and the linear-time requirement come from the speech. Expect a single-pass hash map keyed by complement, the class-wrapped signature reproduced exactly, and one clause saying the spoken constraint chose the approach.",
+        "scriptedAnswer": "# Two Sum\n\n```python\nclass Solution:\n    def twoSum(self, nums: List[int], target: int) -> List[int]:\n        seen = {}\n        for index, value in enumerate(nums):\n            complement = target - value\n            if complement in seen:\n                return [seen[complement], index]\n            seen[value] = index\n        return []\n```\n\nA single pass with a map from value to index, as asked out loud: for each element the complement is looked up before the element itself is stored, so an index is never paired with itself. The guarantee of exactly one answer means the first hit can be returned immediately.\n\nO(n) time, O(n) space."
+      }
+    },
+    {
+      "id": "voice-only-no-question",
+      "kind": "voice",
+      "why": "The fixture entry for the newer marker: the screen shows nothing solvable and the speech asks nothing a program could answer either, so neither route has a question to answer. Pressed with its own button this is `# No question in the recent speech`; pressed with the screen-carrying button it falls back to the older `# No exercise on screen`, since a spoken-only request reporting on a screen it was never shown would be a false statement.",
+      "screen": {
+        "kind": "no-exercise",
+        "site": "Mailbox",
+        "windowTitle": "Inbox (14) — Mailbox",
+        "title": "Inbox",
+        "description": "An email inbox. Nothing is open.",
+        "items": [
+          "Priya — Standup notes",
+          "Sam — Re: Friday deploy",
+          "Billing — Invoice #4471",
+          "This Week in JS — Newsletter",
+          "Mailbox Team — Welcome to Mailbox!"
+        ]
       },
-      "scriptedAnswer": "# Two Sum\n\n```python\nclass Solution:\n    def twoSum(self, nums: List[int], target: int) -> List[int]:\n        seen = {}\n        for index, value in enumerate(nums):\n            complement = target - value\n            if complement in seen:\n                return [seen[complement], index]\n            seen[value] = index\n        return []\n```\n\nA single pass with a map from value to index, as asked out loud: for each element the complement is looked up before the element itself is stored, so an index is never paired with itself. The guarantee of exactly one answer means the first hit can be returned immediately.\n\nO(n) time, O(n) space."
+      "spoken": [
+        {
+          "atSeconds": 0,
+          "text": "Hey, can you hear me okay?"
+        },
+        {
+          "atSeconds": 3,
+          "text": "Yeah, sounds fine on my end. One sec, let me grab my coffee."
+        },
+        {
+          "atSeconds": 9,
+          "text": "Okay, back. Ready when you are."
+        }
+      ],
+      "expected": {
+        "outcome": "bail",
+        "title": "No question in the recent speech",
+        "mustMention": [],
+        "notes": "Exactly `# No question in the recent speech` plus one sentence naming what was said instead. No code block, and no reconstructing a programming question out of small talk -- \"can you hear me okay\" is a question, but not one a program answers.",
+        "scriptedAnswer": "# No question in the recent speech\n\nThe transcript is someone checking the call connected and stepping away for coffee, with nothing asked that a program could answer."
+      },
+      "expectedIfScreenSent": {
+        "outcome": "bail",
+        "title": "No exercise on screen",
+        "mustMention": [],
+        "notes": "Pressed with the screen-carrying button, the request now reports on the inbox it was actually shown, so the marker changes: `# No exercise on screen`, not the speech-only one, because this route does have a screen to be honest about.",
+        "scriptedAnswer": "# No exercise on screen\n\nThe window is showing an email inbox, with nothing opened."
+      }
     }
   ]
 }

@@ -33,7 +33,11 @@
 
   const PRESS_LABELS = {
     screen: 'press “Solve now”',
-    voice: 'press “Solve with transcript”',
+    // A voice problem has two right answers to check, one per button: “Solve
+    // speech only” for the real answer the spoken question now gets, “Solve
+    // with transcript” for the bail it must still produce, since that button
+    // sends this problem's no-exercise screenshot along with the same speech.
+    voice: 'press “Solve speech only” for a real answer, or “Solve with transcript” to check it still bails',
     'voice-about-screen': 'press “Solve with transcript”',
   };
 
@@ -234,17 +238,33 @@
       cribBody.append(list);
     }
 
-    cribBody.append(heading('Expected'));
-    const expected = element('p');
-    expected.textContent =
-      problem.expected.outcome === 'bail'
-        ? `Bail: the heading "# ${problem.expected.title}", no code block.`
-        : `A solution headed "# ${problem.expected.title}".`;
-    cribBody.append(expected);
+    // A `voice` problem has two buttons and two expectations; every other
+    // kind has one of each. Labelling both when both exist is what stops the
+    // crib sheet from silently describing only half of what a voice problem
+    // is supposed to do.
+    renderExpectation(
+      problem.expected,
+      problem.expectedIfScreenSent ? 'Pressed “Solve speech only”' : 'Expected',
+    );
+    if (problem.expectedIfScreenSent) {
+      renderExpectation(problem.expectedIfScreenSent, 'Pressed “Solve with transcript” instead');
+    }
+  }
 
-    if (problem.expected.mustMention.length > 0) {
+  /** One expectation's worth of crib content: what should come back, and a full worked answer. */
+  function renderExpectation(expectation, label) {
+    cribBody.append(heading(label));
+
+    const summaryLine = element('p');
+    summaryLine.textContent =
+      expectation.outcome === 'bail'
+        ? `Bail: the heading "# ${expectation.title}", no code block.`
+        : `A solution headed "# ${expectation.title}".`;
+    cribBody.append(summaryLine);
+
+    if (expectation.mustMention.length > 0) {
       const list = element('ul', 'crib-checklist');
-      for (const fragment of problem.expected.mustMention) {
+      for (const fragment of expectation.mustMention) {
         const item = element('li');
         item.textContent = fragment;
         list.append(item);
@@ -253,14 +273,14 @@
     }
 
     const notes = element('p', 'crib-notes');
-    notes.textContent = problem.expected.notes;
+    notes.textContent = expectation.notes;
     cribBody.append(notes);
 
     const answer = element('details', 'crib-answer');
     const summary = document.createElement('summary');
     summary.textContent = 'A good answer, for comparison';
     const pre = element('pre');
-    pre.textContent = problem.scriptedAnswer;
+    pre.textContent = expectation.scriptedAnswer;
     answer.append(summary, pre);
     cribBody.append(answer);
   }

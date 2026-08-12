@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import type { TargetWindowIdentity } from '../../../src/host/config/types.ts';
+import { BAIL_TITLE, NO_QUESTION_TITLE } from '../../../src/host/logs/title.ts';
 
 /**
  * The mock quiz: a fixed set of problems covering the three ways a question
@@ -21,13 +22,25 @@ import type { TargetWindowIdentity } from '../../../src/host/config/types.ts';
  * back something a test would then assert confusing things about:
  *
  * - ids are unique, and every one of the three kinds is represented;
- * - a `screen` problem has an exercise on screen and says nothing out loud;
- * - a `voice` problem says something out loud, shows no exercise, and expects
- *   the bail -- see `expected.outcome` for why that is the right answer;
- * - a `voice-about-screen` problem has both, and expects a real solution;
- * - each `scriptedAnswer` leads with the heading `expected.title` names, so
- *   the answer a fake provider streams in an automated run is the same answer
- *   a human grades a real model against in a manual one.
+ * - a `screen` problem has an exercise on screen, says nothing out loud, and
+ *   expects a solution -- there is only one button for it, so only one
+ *   `expected`;
+ * - a `voice-about-screen` problem has both an exercise on screen and speech,
+ *   and expects a solution shaped by what was said -- also only one button;
+ * - a `voice` problem says something out loud and shows no exercise. It now
+ *   has *two* expectations, because it has two buttons: `expected` is what
+ *   its own route (`/solve/transcript-only`) should produce -- a real
+ *   solution to the spoken question, or, when the speech itself asks
+ *   nothing, the newer bail (`NO_QUESTION_TITLE`) -- and
+ *   `expectedIfScreenSent` is what pressing the screen-carrying button
+ *   (`/solve/with-transcript`) must produce instead: always the older bail
+ *   (`BAIL_TITLE`), because the screen it would send has no exercise on it
+ *   and the screen stays authoritative whenever there is one;
+ * - each expectation's `scriptedAnswer` leads with the heading its own
+ *   `title` names, so the answer a fake provider streams in an automated run
+ *   is the same answer a human grades a real model against in a manual one;
+ * - both bail markers are exercised somewhere in the quiz, so a change that
+ *   silently broke either one has a fixture entry to catch it.
  */
 
 /** How this problem is put to the user -- the axis the whole fixture exists to cover. */
@@ -103,6 +116,15 @@ export interface MockQuizExpectation {
   readonly mustMention: readonly string[];
   /** What a human grading a real run should look for, in prose. */
   readonly notes: string;
+  /**
+   * What the fake provider streams for this expectation in an automated run
+   * -- and, written out in full, what a good real answer looks like for a
+   * human comparing against a manual one. Lives on the expectation, not the
+   * problem, because a `voice` problem has two of these (see
+   * {@link MockQuizProblem.expectedIfScreenSent}) and each button gets its
+   * own scripted answer to match its own outcome.
+   */
+  readonly scriptedAnswer: string;
 }
 
 export interface MockQuizProblem {
@@ -112,13 +134,16 @@ export interface MockQuizProblem {
   readonly why: string;
   readonly screen: MockQuizScreen;
   readonly spoken: readonly SpokenLine[];
+  /** What pressing this problem's own route (`solveRoute(problem)`) should produce. */
   readonly expected: MockQuizExpectation;
   /**
-   * What the fake provider streams for this problem in an automated run --
-   * and, written out in full, what a good real answer looks like for a human
-   * comparing against a manual one.
+   * What pressing the *other*, screen-carrying button produces instead --
+   * present only for a `voice` problem, whose own route
+   * (`/solve/transcript-only`) is not its only reachable route. A `screen` or
+   * `voice-about-screen` problem has one button and therefore only one
+   * expectation, so this is `undefined` for both.
    */
-  readonly scriptedAnswer: string;
+  readonly expectedIfScreenSent?: MockQuizExpectation;
 }
 
 export interface MockQuiz {
@@ -144,16 +169,49 @@ export async function loadMockQuiz(): Promise<MockQuiz> {
   return validateQuiz(JSON.parse(raw) as unknown);
 }
 
+/** Every solve route the quiz can press -- the client's whole vocabulary of buttons. */
+export type MockQuizRoute = '/solve' | '/solve/with-transcript' | '/solve/transcript-only';
+
 /**
  * Which solve route this problem is pressed with.
  *
  * Derived rather than stored in `quiz.json`: it is a function of the kind,
  * and a stored copy could disagree with one. A `screen` problem goes through
  * the plain route precisely so a run proves speech never reaches the model on
- * it -- see the "Solve while recording" case in the e2e suite.
+ * it -- see the "Solve while recording" case in the e2e suite. A `voice`
+ * problem goes through the spoken-only route, since the whole point of that
+ * kind is a question with no screen behind it; `expectedIfScreenSent` is what
+ * the *other* route (`/solve/with-transcript`) produces for one instead, see
+ * {@link expectationFor}.
  */
-export function solveRoute(problem: MockQuizProblem): '/solve' | '/solve/with-transcript' {
-  return problem.kind === 'screen' ? '/solve' : '/solve/with-transcript';
+export function solveRoute(problem: MockQuizProblem): MockQuizRoute {
+  switch (problem.kind) {
+    case 'screen':
+      return '/solve';
+    case 'voice':
+      return '/solve/transcript-only';
+    case 'voice-about-screen':
+      return '/solve/with-transcript';
+  }
+}
+
+/**
+ * What pressing `route` should produce for `problem`.
+ *
+ * `problem.expected` for the problem's own route, `problem.expectedIfScreenSent`
+ * for a `voice` problem pressed with the screen-carrying route instead --
+ * the one other combination the fixture defines. Anything else throws,
+ * since a test asking about a route the fixture never scripted an answer for
+ * is a test with a bug in it, not a quiz with a missing case.
+ */
+export function expectationFor(problem: MockQuizProblem, route: MockQuizRoute): MockQuizExpectation {
+  if (route === solveRoute(problem)) return problem.expected;
+  if (problem.kind === 'voice' && route === '/solve/with-transcript' && problem.expectedIfScreenSent) {
+    return problem.expectedIfScreenSent;
+  }
+  throw new Error(
+    `No expectation for mock quiz problem "${problem.id}" (kind "${problem.kind}") pressed with ${route}.`,
+  );
 }
 
 /** The window Screen Solver is watching while this problem is up. */
@@ -207,6 +265,22 @@ function validateQuiz(value: unknown): MockQuiz {
     }
   }
 
+  // Both bail markers, not just one -- a quiz that only ever exercised
+  // BAIL_TITLE (or only ever NO_QUESTION_TITLE) would still pass every
+  // per-problem check above while quietly losing coverage of the other
+  // marker, which is the whole reason `title.ts` grew a second one.
+  const expectations = problems.flatMap((entry) =>
+    entry.expectedIfScreenSent === undefined ? [entry.expected] : [entry.expected, entry.expectedIfScreenSent],
+  );
+  if (!expectations.some((entry) => entry.outcome === 'bail' && entry.title === BAIL_TITLE)) {
+    throw new Error(`quiz.json: no expectation exercises "${BAIL_TITLE}" -- the screen-authoritative bail is untested.`);
+  }
+  if (!expectations.some((entry) => entry.outcome === 'bail' && entry.title === NO_QUESTION_TITLE)) {
+    throw new Error(
+      `quiz.json: no expectation exercises "${NO_QUESTION_TITLE}" -- the spoken-only bail is untested.`,
+    );
+  }
+
   return {
     title: string(root.title, 'title'),
     description: string(root.description, 'description'),
@@ -227,7 +301,10 @@ function validateProblem(value: unknown, path: string): MockQuizProblem {
     validateSpokenLine(entry, `${path}.spoken[${index}]`),
   );
   const expected = validateExpectation(raw.expected, `${path}.expected`);
-  const scriptedAnswer = string(raw.scriptedAnswer, `${path}.scriptedAnswer`);
+  const expectedIfScreenSent =
+    raw.expectedIfScreenSent === undefined
+      ? undefined
+      : validateExpectation(raw.expectedIfScreenSent, `${path}.expectedIfScreenSent`);
 
   for (let i = 1; i < spoken.length; i += 1) {
     const previous = spoken[i - 1];
@@ -237,37 +314,76 @@ function validateProblem(value: unknown, path: string): MockQuizProblem {
     }
   }
 
-  const shape = KIND_SHAPES[kind];
-  if (shape.screen !== screen.kind) {
-    throw new Error(`${path}: a "${kind}" problem must show a "${shape.screen}" screen, not "${screen.kind}".`);
-  }
-  if (shape.speaks !== spoken.length > 0) {
+  const requiredScreenKind = SCREEN_KIND_BY_PROBLEM_KIND[kind];
+  if (requiredScreenKind !== screen.kind) {
     throw new Error(
-      shape.speaks
+      `${path}: a "${kind}" problem must show a "${requiredScreenKind}" screen, not "${screen.kind}".`,
+    );
+  }
+  const mustSpeak = SPEAKS_BY_PROBLEM_KIND[kind];
+  if (mustSpeak !== spoken.length > 0) {
+    throw new Error(
+      mustSpeak
         ? `${path}: a "${kind}" problem must say something out loud.`
         : `${path}: a "${kind}" problem must say nothing out loud -- it is the control for "speech never reaches a plain solve".`,
     );
   }
-  if (shape.outcome !== expected.outcome) {
-    throw new Error(`${path}: a "${kind}" problem must expect "${shape.outcome}", not "${expected.outcome}".`);
-  }
-  if (!scriptedAnswer.startsWith(`# ${expected.title}`)) {
-    throw new Error(
-      `${path}.scriptedAnswer must lead with "# ${expected.title}", so the scripted answer and the graded expectation are the same answer.`,
-    );
+
+  if (kind === 'screen' || kind === 'voice-about-screen') {
+    // Exactly one button, so exactly one expectation, and it always solves --
+    // the exercise (screen-only or screen-plus-speech) is right there to
+    // answer.
+    if (expected.outcome !== 'solution') {
+      throw new Error(
+        `${path}.expected.outcome must be "solution" for a "${kind}" problem, not "${expected.outcome}" -- the exercise is right there on screen.`,
+      );
+    }
+    if (expectedIfScreenSent !== undefined) {
+      throw new Error(
+        `${path}.expectedIfScreenSent is only meaningful for a "voice" problem, which is the only kind with a second button -- a "${kind}" problem must not define one.`,
+      );
+    }
+  } else {
+    // voice: two buttons, so two expectations. The screen-carrying one
+    // (`/solve/with-transcript`) always sees the same no-exercise screen this
+    // problem shows, so it must always bail with the older marker; the
+    // problem's own route (`/solve/transcript-only`) has no screen to be
+    // wrong about, so it may solve the spoken question for real, or, if the
+    // speech itself asks nothing, bail with the newer marker -- but never the
+    // older one, since a spoken-only request reporting "no exercise on
+    // screen" would be describing a screen it was never shown.
+    if (expectedIfScreenSent === undefined) {
+      throw new Error(
+        `${path}.expectedIfScreenSent is required for a "voice" problem: pressing the screen-carrying button must still bail with "${BAIL_TITLE}", since the screen it sends has no exercise on it and stays authoritative whenever there is one.`,
+      );
+    }
+    if (expectedIfScreenSent.outcome !== 'bail' || expectedIfScreenSent.title !== BAIL_TITLE) {
+      throw new Error(
+        `${path}.expectedIfScreenSent must be a bail titled exactly "${BAIL_TITLE}" -- that is the only thing the screen-carrying button can honestly produce for a voice-only problem.`,
+      );
+    }
+    if (expected.outcome === 'bail' && expected.title !== NO_QUESTION_TITLE) {
+      throw new Error(
+        `${path}.expected: a "voice" problem's own route has no screen to report on, so a bail on it must be titled exactly "${NO_QUESTION_TITLE}", not "${expected.title}" -- "${BAIL_TITLE}" would be a false statement about a request that carried no screenshot.`,
+      );
+    }
   }
 
-  return { id, kind, why: string(raw.why, `${path}.why`), screen, spoken, expected, scriptedAnswer };
+  return { id, kind, why: string(raw.why, `${path}.why`), screen, spoken, expected, expectedIfScreenSent };
 }
 
-/** What each kind's other fields have to be, so the taxonomy can't quietly rot. */
-const KIND_SHAPES: Record<
-  MockQuizProblemKind,
-  { readonly screen: MockQuizScreen['kind']; readonly speaks: boolean; readonly outcome: MockQuizOutcome }
-> = {
-  screen: { screen: 'exercise', speaks: false, outcome: 'solution' },
-  voice: { screen: 'no-exercise', speaks: true, outcome: 'bail' },
-  'voice-about-screen': { screen: 'exercise', speaks: true, outcome: 'solution' },
+/** What screen kind each problem kind must show, so the taxonomy can't quietly rot. */
+const SCREEN_KIND_BY_PROBLEM_KIND: Record<MockQuizProblemKind, MockQuizScreen['kind']> = {
+  screen: 'exercise',
+  voice: 'no-exercise',
+  'voice-about-screen': 'exercise',
+};
+
+/** Whether each problem kind must say something out loud. */
+const SPEAKS_BY_PROBLEM_KIND: Record<MockQuizProblemKind, boolean> = {
+  screen: false,
+  voice: true,
+  'voice-about-screen': true,
 };
 
 function validateScreen(value: unknown, path: string): MockQuizScreen {
@@ -318,11 +434,19 @@ function validateExpectation(value: unknown, path: string): MockQuizExpectation 
   if (raw.outcome !== 'solution' && raw.outcome !== 'bail') {
     throw new Error(`${path}.outcome must be "solution" or "bail", got ${JSON.stringify(raw.outcome)}.`);
   }
+  const title = string(raw.title, `${path}.title`);
+  const scriptedAnswer = string(raw.scriptedAnswer, `${path}.scriptedAnswer`);
+  if (!scriptedAnswer.startsWith(`# ${title}`)) {
+    throw new Error(
+      `${path}.scriptedAnswer must lead with "# ${title}", so the scripted answer and the graded expectation are the same answer.`,
+    );
+  }
   return {
     outcome: raw.outcome,
-    title: string(raw.title, `${path}.title`),
+    title,
     mustMention: strings(raw.mustMention, `${path}.mustMention`),
     notes: string(raw.notes, `${path}.notes`),
+    scriptedAnswer,
   };
 }
 
