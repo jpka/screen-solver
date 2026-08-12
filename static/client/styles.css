@@ -537,3 +537,152 @@ main {
   animation: blink 1s steps(1) infinite;
   color: var(--accent);
 }
+
+/* Screen recording (#33 follow-up) */
+
+#screen-recording-pane {
+  grid-column: 1;
+}
+
+.screen-recording-control-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+/* Deliberately conspicuous -- recording is never meant to be silent. A
+   pulsing dot plus live elapsed time / byte count, both refreshed every
+   second while `state === 'recording'`. */
+.screen-recording-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: rgba(224, 85, 94, 0.12);
+  color: var(--danger);
+  font-weight: 600;
+  font-size: 0.85rem;
+  width: fit-content;
+}
+
+.screen-recording-indicator .screen-rec-dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--danger);
+  animation: screen-rec-pulse 1.4s ease-in-out infinite;
+}
+
+.screen-recording-indicator #screen-rec-elapsed,
+.screen-recording-indicator #screen-rec-bytes {
+  color: var(--text);
+  font-weight: 400;
+}
+
+@keyframes screen-rec-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .screen-recording-indicator .screen-rec-dot {
+    animation: none;
+  }
+}
+
+#screen-recording-settings {
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+}
+
+#screen-recording-settings summary {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+#screen-recording-settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+}
+
+.settings-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.settings-row-checkbox {
+  flex-direction: row;
+  align-items: center;
+}
+
+.settings-row input[type='number'] {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+  max-width: 12rem;
+}
+
+.settings-actions {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.screen-recording-player {
+  margin-bottom: 0.75rem;
+}
+
+.screen-recording-player video {
+  width: 100%;
+  max-width: 100%;
+  border-radius: 8px;
+  display: block;
+}
+
+.screen-recordings-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.screen-recordings-list li {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.screen-recordings-list .recording-title {
+  font-weight: 600;
+}
+
+.screen-recordings-list .recording-meta {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.screen-recordings-list li[data-active='true'] {
+  border-color: var(--accent);
+}

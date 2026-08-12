@@ -1,6 +1,20 @@
 import type { ConfigChangeEvent } from '../config/types.ts';
 import { silentLogger, type Logger } from '../logger.ts';
+import { settlesWithin } from '../settles-within.ts';
 import type { CapturedFrame, CaptureSession, OpenCaptureSession, TargetWindowIdentity } from './types.ts';
+
+/**
+ * How long a target change will wait for an {@link CaptureSessionCoordinatorOptions.onSessionChange}
+ * listener before tearing the stream down anyway.
+ *
+ * The listener exists so a recorder can flush its final chunk while the tracks
+ * it is reading are still alive. That is worth waiting for -- it's the
+ * difference between a clean last segment and one truncated mid-chunk -- but
+ * only briefly: a wedged renderer must not be able to freeze target switching,
+ * and a truncated segment is still a playable segment (see
+ * `screen-recording/segment-writer.ts`), so the cost of giving up here is small.
+ */
+const SESSION_LISTENER_TIMEOUT_MS = 3_000;
 
 export interface CaptureSessionCoordinatorOptions {
   /** Opens a live session for one target. `src/main/capture-session.ts` supplies the real WGC-backed implementation. */
@@ -9,6 +23,25 @@ export interface CaptureSessionCoordinatorOptions {
   readonly initialTarget: TargetWindowIdentity | null;
   /** #28's `ConfigStore.onChange` — the one signal this coordinator reacts to. */
   readonly onChange: (listener: (event: ConfigChangeEvent) => void) => () => void;
+  /**
+   * Notified whenever the live capture stream changes: `null` immediately
+   * *before* a session is closed, and the new target immediately *after* one is
+   * opened (#47).
+   *
+   * The before/after asymmetry is the whole point. #47's recorder sits on top
+   * of this coordinator's stream, and if it only learned about a target change
+   * after the tracks were already stopped, its final chunk would be flushed
+   * against a dead stream — a truncated last segment on every window switch.
+   * Being told first lets it stop cleanly while the stream is still alive.
+   * Awaited (bounded by {@link SESSION_LISTENER_TIMEOUT_MS}) rather than
+   * fire-and-forget, since "flushed cleanly" is precisely what can't be
+   * guaranteed without waiting for it.
+   *
+   * Left unset, nothing is notified and this coordinator behaves exactly as it
+   * did before #47 — the same "safe default that just does less" shape as every
+   * other optional dependency in `src/host`.
+   */
+  readonly onSessionChange?: (target: TargetWindowIdentity | null) => void | Promise<void>;
   readonly logger?: Logger;
 }
 
@@ -63,12 +96,16 @@ export function startCaptureSessionCoordinator(
     transition = (async () => {
       const previousSession = await previousTransition.catch(() => null);
       if (previousSession) {
+        // Told *before* the close, so anything reading this stream can wind
+        // down against live tracks rather than dead ones. See `onSessionChange`.
+        await notifySessionChange(null);
         await previousSession.close().catch((error: unknown) => {
           logger.error(`capture: failed to close the previous session: ${describeError(error)}`);
         });
       }
 
       if (stopped || target === null || myGeneration !== generation) {
+        if (target === null && !stopped) await notifySessionChange(null);
         return null;
       }
 
@@ -86,8 +123,33 @@ export function startCaptureSessionCoordinator(
         await session.close().catch(() => {});
         return null;
       }
+      // Told *after* the open, so a listener that reacts by starting to read
+      // the stream finds one actually there.
+      await notifySessionChange(target);
       return session;
     })();
+  }
+
+  /**
+   * Runs the listener, bounded and never allowed to throw. A listener that
+   * fails or hangs is its own subsystem's problem; it must not be able to wedge
+   * or abort a target change, which is load-bearing for solving.
+   */
+  async function notifySessionChange(target: TargetWindowIdentity | null): Promise<void> {
+    if (options.onSessionChange === undefined) return;
+    let work: Promise<void>;
+    try {
+      work = Promise.resolve(options.onSessionChange(target));
+    } catch (error) {
+      logger.error(`capture: a session-change listener threw: ${describeError(error)}`);
+      return;
+    }
+    const settled = await settlesWithin(work, SESSION_LISTENER_TIMEOUT_MS);
+    if (!settled) {
+      logger.warn(
+        `capture: a session-change listener did not finish within ${SESSION_LISTENER_TIMEOUT_MS}ms; continuing without it.`,
+      );
+    }
   }
 
   applyTarget(options.initialTarget);

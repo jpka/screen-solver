@@ -20,7 +20,10 @@ import { TRANSCRIPT_LOG_FILE_NAME } from '../../src/host/logs/transcript-log.ts'
 import type { TranscriptEntry } from '../../src/host/logs/types.ts';
 import type { CapturedFrame } from '../../src/host/capture/types.ts';
 import { CONFIG_FILE_NAME } from '../../src/host/config/store.ts';
-import type { TargetWindowIdentity } from '../../src/host/config/types.ts';
+import {
+  DEFAULT_SCREEN_RECORDING_SETTINGS,
+  type TargetWindowIdentity,
+} from '../../src/host/config/types.ts';
 import { StartupError } from '../../src/host/errors.ts';
 import { silentLogger, type Logger } from '../../src/host/logger.ts';
 import { startHttpServer } from '../../src/host/http/server.ts';
@@ -234,7 +237,11 @@ describe('bootstrapHost', () => {
     if (result.status !== 'started') return;
     t.after(() => result.host.shutdown());
 
-    assert.deepEqual(result.host.configStore.get(), { targetWindow: null, provider: null });
+    assert.deepEqual(result.host.configStore.get(), {
+      targetWindow: null,
+      provider: null,
+      screenRecording: DEFAULT_SCREEN_RECORDING_SETTINGS,
+    });
     assert.deepEqual(
       await result.host.configStore.listWindows(),
       injectedWindows,

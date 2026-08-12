@@ -79,6 +79,55 @@
           </div>
         </div>
       </section>
+
+      <section id="screen-recording-pane" class="panel">
+        <h2>Screen Recording</h2>
+
+        <div class="screen-recording-control-row">
+          <button id="screen-rec-button" type="button" disabled>Record</button>
+          <span id="screen-rec-state-label" class="hint"></span>
+        </div>
+        <div id="screen-recording-error" class="error-message" hidden></div>
+
+        <div id="screen-recording-indicator" class="screen-recording-indicator" hidden>
+          <span class="screen-rec-dot" aria-hidden="true"></span>
+          <span class="screen-recording-indicator-label">REC</span>
+          <span id="screen-rec-elapsed"></span>
+          <span id="screen-rec-bytes"></span>
+        </div>
+
+        <details id="screen-recording-settings">
+          <summary>Recording settings</summary>
+          <div id="screen-recording-settings-error" class="error-message" hidden></div>
+          <form id="screen-recording-settings-form">
+            <label class="settings-row settings-row-checkbox">
+              <input type="checkbox" id="screen-rec-setting-enabled" />
+              Start recording automatically whenever a window is being captured
+            </label>
+            <label class="settings-row">
+              Segment length (seconds)
+              <input type="number" id="screen-rec-setting-segment-seconds" min="1" step="1" />
+            </label>
+            <label class="settings-row">
+              Retention size limit (bytes)
+              <input type="number" id="screen-rec-setting-retention-bytes" min="0" step="1" />
+            </label>
+            <label class="settings-row">
+              Retention time limit (days)
+              <input type="number" id="screen-rec-setting-retention-days" min="0" step="1" />
+            </label>
+            <div class="settings-row settings-actions">
+              <button type="submit" id="rec-settings-save">Save settings</button>
+              <span id="screen-rec-settings-status" class="hint" hidden>Saved.</span>
+            </div>
+          </form>
+        </details>
+
+        <div id="screen-recording-player" class="screen-recording-player" hidden></div>
+
+        <div id="screen-recordings-error" class="error-message" hidden></div>
+        <ul id="screen-recordings-list" class="screen-recordings-list"></ul>
+      </section>
     </main>
 
     <script src="/app.js"></script>

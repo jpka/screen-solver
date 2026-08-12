@@ -5,7 +5,7 @@
 // (no bundler, no framework) per this repo's static/ convention -- see
 // AGENTS.md's "Product code: toolchain and layout".
 //
-// Talks to the wire contract built by #28/#29/#31/#32/#33/#35:
+// Talks to the wire contract built by #28/#29/#31/#32/#33/#35/#47:
 //   GET  /config              -> { targetWindow, revision }    (#33)
 //   GET  /windows              -> WindowInfo[]                 (#33)
 //   POST /config/target        -> { targetWindow, revision }   (#33)
@@ -18,6 +18,18 @@
 //   POST /solve/transcript-only -> 202/400/503, speech only, no target needed
 //   GET  /events (SSE)  -> start/delta/done/error/sync/status/config{,revision}
 //                          /recording/transcript/transcript-interim (#35)
+//                          /screen-recording (#47)
+//
+// Continuous screen recording (#47) -- note the `/screen-recording` prefix
+// throughout: `/recording` above is the *audio transcript* toggle (#35), a
+// genuinely different feature that happens to share the English word.
+//   GET  /screen-recording        -> {state,segmentId,bytes,startedAt,reason}
+//   POST /screen-recording/start  -> 200 same shape / 409 no_capture_session / 503
+//   POST /screen-recording/stop   -> 200 {state:'off'}
+//   GET  /screen-recordings       -> {id,startedAt,endedAt,bytes,durationMs,mimeType,target}[], newest first
+//   GET  /screen-recordings/file?id=<id> -> segment bytes, Range-capable (used directly as a <video> src)
+//   GET  /screen-recording/settings  -> {enabled,segmentSeconds,retentionBytes,retentionDays}
+//   POST /screen-recording/settings  -> same shape, accepts any subset of the four fields
 
 (() => {
   'use strict';
@@ -87,6 +99,23 @@
   const transcriptList = document.getElementById('transcript-list');
   const transcriptInterimThem = document.getElementById('transcript-interim-them');
   const transcriptInterimMe = document.getElementById('transcript-interim-me');
+
+  const recButton = document.getElementById('screen-rec-button');
+  const recStateLabel = document.getElementById('screen-rec-state-label');
+  const screenRecordingError = document.getElementById('screen-recording-error');
+  const recordingIndicator = document.getElementById('screen-recording-indicator');
+  const recElapsed = document.getElementById('screen-rec-elapsed');
+  const recBytes = document.getElementById('screen-rec-bytes');
+  const recordingsList = document.getElementById('screen-recordings-list');
+  const recordingsError = document.getElementById('screen-recordings-error');
+  const recordingPlayer = document.getElementById('screen-recording-player');
+  const recordingSettingsForm = document.getElementById('screen-recording-settings-form');
+  const recordingSettingsError = document.getElementById('screen-recording-settings-error');
+  const recordingSettingsStatus = document.getElementById('screen-rec-settings-status');
+  const recSettingEnabled = document.getElementById('screen-rec-setting-enabled');
+  const recSettingSegmentSeconds = document.getElementById('screen-rec-setting-segment-seconds');
+  const recSettingRetentionBytes = document.getElementById('screen-rec-setting-retention-bytes');
+  const recSettingRetentionDays = document.getElementById('screen-rec-setting-retention-days');
 
   /** @type {{processName: string, title: string} | null} */
   let currentTarget = null;
@@ -161,6 +190,19 @@
 
   /** @type {'off' | 'starting' | 'on' | 'reconnecting' | 'unavailable' | 'error'} */
   let currentRecordingState = 'off';
+
+  // The `recording` SSE frame is only replayed to a newly-connecting client
+  // when the server-side state is not `'off'` (see the contract comment up
+  // top) -- so if nothing arrives before the first render, `'off'` is the
+  // correct assumption, not an unknown/loading state. `segmentId` starts as
+  // `undefined` (not `null`) specifically so the very first frame -- even
+  // one reporting `segmentId: null` -- is still treated as "different from
+  // what we had" by {@link refreshRecordingsIfNeeded}'s `!==` check below.
+  let screenRecordingState = { state: 'off', segmentId: undefined, bytes: 0, startedAt: null, reason: null };
+  let screenRecordingRequestPending = false;
+  let screenRecordingTimerId = null;
+  let currentVideoEl = null;
+  let currentVideoLi = null;
 
   // Startup snapshot-vs-stream ordering (Greptile review on #33's PR): the
   // initial `GET /config` and `GET /answers` fetches race the `GET /events`
@@ -263,6 +305,9 @@
     // target configured at all must not disable it the way it disables the
     // other two.
     if (targetWindow === null) loadWindows();
+    // The REC control is disabled with no target configured (#47) -- reuses
+    // this existing state rather than re-fetching anything of its own.
+    updateScreenRecordingUI();
     render();
   }
 
@@ -816,6 +861,272 @@
     queuedLiveTranscriptEntries.length = 0;
   }
 
+  /** KB/MB/GB, one decimal place -- matches the byte counter ticking up live on the recording indicator and the size shown per row in the recordings list. */
+  function formatBytes(bytes) {
+    if (bytes == null) return '';
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let value = bytes;
+    let unitIndex = -1;
+    do {
+      value /= 1024;
+      unitIndex++;
+    } while (value >= 1024 && unitIndex < units.length - 1);
+    return `${value.toFixed(1)} ${units[unitIndex]}`;
+  }
+
+  /** `H:MM:SS`, dropping the hour segment under an hour -- shared by the live elapsed-time readout and a finished recording's duration in the list. */
+  function formatElapsedMs(ms) {
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const mm = String(minutes).padStart(2, '0');
+    const ss = String(seconds).padStart(2, '0');
+    return hours > 0 ? `${hours}:${mm}:${ss}` : `${minutes}:${ss}`;
+  }
+
+  function screenRecordingIndicatorTick() {
+    recElapsed.textContent = screenRecordingState.startedAt
+      ? formatElapsedMs(Date.now() - new Date(screenRecordingState.startedAt).getTime())
+      : '';
+    recBytes.textContent = formatBytes(screenRecordingState.bytes);
+  }
+
+  function startScreenRecordingTimer() {
+    if (screenRecordingTimerId !== null) return;
+    screenRecordingTimerId = setInterval(screenRecordingIndicatorTick, 1000);
+  }
+
+  function stopScreenRecordingTimer() {
+    if (screenRecordingTimerId === null) return;
+    clearInterval(screenRecordingTimerId);
+    screenRecordingTimerId = null;
+  }
+
+  /** The single place that renders the REC button/label/indicator from {@link screenRecordingState} plus {@link currentTarget} -- called on every `recording` SSE frame, on every config change (the target the button depends on can change out from under it), and around the button's own click handler while its request is in flight. Never flips state on click itself; only ever reflects what the last frame or fetch actually reported. */
+  function updateScreenRecordingUI() {
+    const { state, reason } = screenRecordingState;
+    screenRecordingError.hidden = true;
+
+    if (state === 'unavailable') {
+      recButton.disabled = true;
+      recButton.textContent = 'Record';
+      recStateLabel.textContent = reason
+        ? `Recording is unavailable: ${reason}`
+        : 'Recording is unavailable on this system.';
+    } else if (currentTarget === null) {
+      recButton.disabled = true;
+      recButton.textContent = 'Record';
+      recStateLabel.textContent = 'Pick a target window before recording.';
+    } else if (screenRecordingRequestPending) {
+      recButton.disabled = true;
+      recButton.textContent = state === 'off' || state === 'error' ? 'Starting…' : 'Stopping…';
+      recStateLabel.textContent = '';
+    } else if (state === 'starting') {
+      recButton.disabled = true;
+      recButton.textContent = 'Starting…';
+      recStateLabel.textContent = 'Starting recording…';
+    } else if (state === 'recording') {
+      recButton.disabled = false;
+      recButton.textContent = 'Stop recording';
+      recStateLabel.textContent = '';
+    } else if (state === 'error') {
+      recButton.disabled = false;
+      recButton.textContent = 'Retry recording';
+      recStateLabel.textContent = '';
+      screenRecordingError.hidden = false;
+      screenRecordingError.textContent = reason ? `Recording error: ${reason}` : 'Recording error.';
+    } else {
+      // 'off'
+      recButton.disabled = false;
+      recButton.textContent = 'Record';
+      recStateLabel.textContent = '';
+    }
+
+    recordingIndicator.hidden = state !== 'recording';
+    if (state === 'recording') {
+      screenRecordingIndicatorTick();
+      startScreenRecordingTimer();
+    } else {
+      stopScreenRecordingTimer();
+    }
+  }
+
+  recButton.addEventListener('click', async () => {
+    const action = screenRecordingState.state === 'off' || screenRecordingState.state === 'error' ? 'start' : 'stop';
+    screenRecordingRequestPending = true;
+    updateScreenRecordingUI();
+    try {
+      const res = await fetch(`/screen-recording/${action}`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        const message =
+          body.error === 'no_capture_session'
+            ? 'no window is currently being captured'
+            : body.error === 'not_ready'
+              ? 'not ready yet -- try again in a moment'
+              : body.error === 'shutting_down'
+                ? 'the app is shutting down'
+                : body.error || `unexpected status ${res.status}`;
+        throw new Error(message);
+      }
+      // Deliberately not applied here even though the 200 body echoes the
+      // same shape as a `recording` SSE frame -- the spec calls for the
+      // control to reflect live SSE state only, never an optimistic flip on
+      // click, so this response is consulted for its error shape alone and
+      // the actual state transition is left to the frame that follows.
+    } catch (err) {
+      screenRecordingError.hidden = false;
+      screenRecordingError.textContent = `Could not ${action} recording: ${err.message}`;
+    } finally {
+      screenRecordingRequestPending = false;
+      updateScreenRecordingUI();
+    }
+  });
+
+  function renderScreenRecordingItem(entry) {
+    const li = document.createElement('li');
+    li.dataset.recordingId = entry.id;
+
+    const title = document.createElement('div');
+    title.className = 'recording-title';
+    title.textContent = new Date(entry.startedAt).toLocaleString();
+
+    const meta = document.createElement('div');
+    meta.className = 'recording-meta';
+    const durationText = entry.durationMs == null ? 'recording…' : formatElapsedMs(entry.durationMs);
+    const targetText = entry.target ? formatTarget(entry.target) : '(unknown target)';
+    meta.textContent = [durationText, formatBytes(entry.bytes), targetText].filter(Boolean).join(' · ');
+
+    const playButton = document.createElement('button');
+    playButton.type = 'button';
+    playButton.textContent = 'Play';
+    playButton.addEventListener('click', () => openScreenRecording(entry, li));
+
+    li.append(title, meta, playButton);
+    return li;
+  }
+
+  /** Only one `<video>` open at a time -- tears down whatever was previously playing (pause + drop `src` + `load()`, the standard way to stop a buffering `<video>` from continuing to fetch) before mounting the next one, so switching rows never leaves more than one element buffering. */
+  function openScreenRecording(entry, li) {
+    if (currentVideoEl) {
+      currentVideoEl.pause();
+      currentVideoEl.removeAttribute('src');
+      currentVideoEl.load();
+    }
+    if (currentVideoLi) delete currentVideoLi.dataset.active;
+
+    recordingPlayer.innerHTML = '';
+    const video = document.createElement('video');
+    video.controls = true;
+    video.preload = 'metadata';
+    video.src = `/screen-recordings/file?id=${encodeURIComponent(entry.id)}`;
+    recordingPlayer.appendChild(video);
+    recordingPlayer.hidden = false;
+
+    currentVideoEl = video;
+    currentVideoLi = li;
+    li.dataset.active = 'true';
+  }
+
+  async function loadScreenRecordings() {
+    recordingsError.hidden = true;
+    try {
+      const res = await fetch('/screen-recordings');
+      if (!res.ok) throw new Error(`GET /recordings -> ${res.status}`);
+      const entries = await res.json();
+
+      recordingPlayer.hidden = true;
+      recordingPlayer.innerHTML = '';
+      currentVideoEl = null;
+      currentVideoLi = null;
+
+      recordingsList.innerHTML = '';
+      if (entries.length === 0) {
+        recordingsList.appendChild(emptyHint('No recordings yet.'));
+        return;
+      }
+      // Already newest-first per the contract -- appended in that order.
+      for (const entry of entries) recordingsList.appendChild(renderScreenRecordingItem(entry));
+    } catch (err) {
+      recordingsError.hidden = false;
+      recordingsError.textContent = `Could not load recordings: ${err.message}`;
+    }
+  }
+
+  function applyScreenRecordingSettings(settings) {
+    recSettingEnabled.checked = Boolean(settings.enabled);
+    recSettingSegmentSeconds.value = settings.segmentSeconds;
+    recSettingRetentionBytes.value = settings.retentionBytes;
+    recSettingRetentionDays.value = settings.retentionDays;
+  }
+
+  // The recorder's state on first load. The `recording` SSE frame is replayed
+  // on connect whenever the state isn't `off`, so this is strictly a
+  // belt-and-braces read for the gap between the page rendering and the
+  // EventSource actually opening -- without it, a phone opened during a
+  // recording shows "not recording" for as long as that handshake takes, which
+  // is the one thing this UI must never say. Mirrors what `loadConfig()`
+  // already does for the target.
+  async function loadScreenRecordingState() {
+    try {
+      const res = await fetch('/screen-recording');
+      if (!res.ok) return;
+      const snapshot = await res.json();
+      // Never allowed to overwrite a live SSE frame that beat it here: the two
+      // are independent, unordered sources for the same fact, the same problem
+      // `GET /config`'s `revision` counter exists to solve. There is no
+      // revision on this one, so the weaker but sufficient rule is "only fill
+      // in a state nothing has reported yet".
+      if (screenRecordingState.state !== 'off') return;
+      screenRecordingState = snapshot;
+      updateScreenRecordingUI();
+      if (snapshot.state !== 'off') loadScreenRecordings();
+    } catch {
+      // A failure here costs nothing -- the SSE replay covers the same ground.
+    }
+  }
+
+  async function loadScreenRecordingSettings() {
+    recordingSettingsError.hidden = true;
+    try {
+      const res = await fetch('/screen-recording/settings');
+      if (!res.ok) throw new Error(`GET /screen-recording/settings -> ${res.status}`);
+      applyScreenRecordingSettings(await res.json());
+    } catch (err) {
+      recordingSettingsError.hidden = false;
+      recordingSettingsError.textContent = `Could not load recording settings: ${err.message}`;
+    }
+  }
+
+  recordingSettingsForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    recordingSettingsError.hidden = true;
+    recordingSettingsStatus.hidden = true;
+    try {
+      const res = await fetch('/screen-recording/settings', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          enabled: recSettingEnabled.checked,
+          segmentSeconds: Number(recSettingSegmentSeconds.value),
+          retentionBytes: Number(recSettingRetentionBytes.value),
+          retentionDays: Number(recSettingRetentionDays.value),
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `unexpected status ${res.status}`);
+      }
+      applyScreenRecordingSettings(await res.json());
+      recordingSettingsStatus.hidden = false;
+    } catch (err) {
+      recordingSettingsError.hidden = false;
+      recordingSettingsError.textContent = `Could not save recording settings: ${err.message}`;
+    }
+  });
+
   function setStatusPill(level, kind) {
     if (level === 'silent') {
       statusPill.hidden = true;
@@ -1236,12 +1547,36 @@
       interimEl.querySelector('.transcript-text').textContent = data.text;
       if (wasNearBottom) transcriptList.scrollTop = transcriptList.scrollHeight;
     });
+
+    // The *video* recorder (#47) -- a separate frame from `recording` above,
+    // which is the audio transcript toggle. Replayed immediately on connect
+    // whenever the server-side state isn't `'off'` (see the contract comment
+    // up top), so this can fire before anything else does;
+    // `updateScreenRecordingUI` doesn't care which frame is "first", only what
+    // the latest one says. A changed `segmentId` (a fresh start, or a roll to
+    // the next segment while still `'recording'`) or a transition to `'off'`
+    // (a stop, which finalizes the segment that was writing) both mean the
+    // `/screen-recordings` list is now stale, so those are the only two cases
+    // that trigger a re-fetch -- a same-segment `bytes` tick every second
+    // while recording does not.
+    source.addEventListener('screen-recording', (event) => {
+      const data = JSON.parse(event.data);
+      const shouldRefresh =
+        data.state === 'off' || data.segmentId !== screenRecordingState.segmentId;
+      screenRecordingState = data;
+      updateScreenRecordingUI();
+      if (shouldRefresh) loadScreenRecordings();
+    });
   }
 
   loadConfig();
   loadHistory();
   loadRecording();
   loadTranscript();
+  loadScreenRecordings();
+  loadScreenRecordingSettings();
+  loadScreenRecordingState();
+  updateScreenRecordingUI();
   connectEvents();
   render();
 })();

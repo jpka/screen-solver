@@ -4,6 +4,7 @@ import type { TranscriptChannel } from '../audio/types.ts';
 import type { TargetWindowIdentity } from '../config/types.ts';
 import type { TranscriptEntry } from '../logs/types.ts';
 import type { ProviderErrorKind, Usage } from '../provider/types.ts';
+import type { ScreenRecordingSnapshot } from '../screen-recording/coordinator.ts';
 import type { StatusSnapshot } from './status.ts';
 
 /**
@@ -61,6 +62,25 @@ import type { StatusSnapshot } from './status.ts';
  * more current. Its own counter, not `config`'s -- recording state is
  * deliberately not part of the persisted config, and one counter serving two
  * unrelated things would make both of them lie.
+ *
+ * `screen-recording{state,segmentId,bytes,startedAt,reason}` (#47) is the
+ * *video* recorder's live state -- a deliberately different event from the
+ * `recording` frame above, which belongs to the audio/transcript feature.
+ * Both were built as "the recorder", independently, and the collision is
+ * resolved by naming rather than by merging them: they have different
+ * lifecycles (one follows the capture session, the other a manual toggle),
+ * different persistence (`screenRecording` settings survive a restart,
+ * transcript recording deliberately does not), and a client shows them in
+ * different places.
+ *
+ * It carries no `revision` counter, unlike `config` and `recording`. Those
+ * need one because their state can be learned from two unordered sources and
+ * arrival order says nothing about which is fresher. This frame is also
+ * readable via `GET /screen-recording`, but it is republished on a timer while
+ * recording (`bytes` is a live counter that would otherwise sit frozen between
+ * segment boundaries), so a stale snapshot self-corrects within a second
+ * rather than persisting. The client's own load-time read gives way to any
+ * frame it has already seen instead -- see `loadScreenRecordingState()`.
  */
 export type SseEvent =
   | { readonly type: 'start' }
@@ -72,7 +92,8 @@ export type SseEvent =
   | { readonly type: 'config'; readonly target: TargetWindowIdentity | null; readonly revision: number }
   | { readonly type: 'transcript'; readonly entry: TranscriptEntry }
   | { readonly type: 'transcript-interim'; readonly channel: TranscriptChannel; readonly text: string }
-  | { readonly type: 'recording'; readonly state: RecordingState; readonly revision: number };
+  | { readonly type: 'recording'; readonly state: RecordingState; readonly revision: number }
+  | ({ readonly type: 'screen-recording' } & ScreenRecordingSnapshot);
 
 /**
  * One shared broadcast to every connected `GET /events` client -- no
@@ -155,7 +176,29 @@ export interface EventBroadcaster {
   /** Records the recording lifecycle's new state, assigns the next revision, and broadcasts it. */
   recording(state: RecordingState): void;
   recordingSnapshot(): { readonly state: RecordingState; readonly revision: number };
+  /**
+   * Broadcasts the *screen* recorder's current state (#47) -- `routes.ts` wires
+   * this to `ScreenRecordingCoordinator`'s `onStateChange`. Distinct from
+   * {@link recording} above, which is the audio/transcript recorder; see the
+   * `screen-recording` note on {@link SseEvent} for why the two stayed separate.
+   *
+   * Unlike `status`, no change-filtering happens here: the coordinator
+   * deliberately republishes on a timer so the client's byte counter advances,
+   * and deciding what is worth sending is its job, not this broadcaster's.
+   */
+  screenRecording(snapshot: ScreenRecordingSnapshot): void;
+  /** The screen recorder's last published state -- `subscribe()` replays it when it isn't `off`, and `GET /screen-recording` serves it. */
+  currentScreenRecording(): ScreenRecordingSnapshot;
 }
+
+/** What a client is told before any screen recorder has ever reported in. */
+const IDLE_SCREEN_RECORDING: ScreenRecordingSnapshot = Object.freeze({
+  state: 'off',
+  segmentId: null,
+  bytes: 0,
+  startedAt: null,
+  reason: null,
+});
 
 export function createEventBroadcaster(): EventBroadcaster {
   const clients = new Set<ServerResponse>();
@@ -166,6 +209,7 @@ export function createEventBroadcaster(): EventBroadcaster {
   let recordingState: RecordingState = 'off';
   let recordingRevision = 0;
   const interim = new Map<TranscriptChannel, string>();
+  let screenRecording: ScreenRecordingSnapshot = IDLE_SCREEN_RECORDING;
 
   function broadcast(event: SseEvent): void {
     const frame = frameFor(event);
@@ -229,6 +273,17 @@ export function createEventBroadcaster(): EventBroadcaster {
         // for the status pill.
         try {
           res.write(frameFor({ type: 'recording', state: recordingState, revision: recordingRevision }));
+        } catch {
+          clients.delete(res);
+        }
+      }
+
+      if (screenRecording.state !== 'off') {
+        // The same one-client catch-up, for the video recorder. A phone opened
+        // mid-recording that displayed "not recording" while the desktop was in
+        // fact recording is the one thing this feature must never do.
+        try {
+          res.write(frameFor({ type: 'screen-recording', ...screenRecording }));
         } catch {
           clients.delete(res);
         }
@@ -317,6 +372,13 @@ export function createEventBroadcaster(): EventBroadcaster {
     },
 
     recordingSnapshot: () => ({ state: recordingState, revision: recordingRevision }),
+
+    screenRecording(snapshot) {
+      screenRecording = snapshot;
+      broadcast({ type: 'screen-recording', ...snapshot });
+    },
+
+    currentScreenRecording: () => screenRecording,
   };
 }
 

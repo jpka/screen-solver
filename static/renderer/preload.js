@@ -17,13 +17,15 @@
 // world without giving the page's own scripts any access to `ipcRenderer`,
 // `require`, or anything else this file can see.
 //
-// Two surfaces, exposed separately rather than merged into one object:
+// Three surfaces, exposed separately rather than merged into one object:
 // `window.captureHost` (#30) is three inbound events (open, close,
 // request-frame) and one outbound reply (frame-result), all capture-shaped;
-// `window.audioHost` is the recording pipeline's own four. They stay apart
-// because the modules behind them do -- capture-ipc-channels.ts and
-// audio-ipc-channels.ts are separate for reasons the latter spells out -- and
-// because capture.js and audio.js should each see only what they use.
+// `window.screenRecordingHost` (#47) is the video recorder's five;
+// `window.audioHost` is the transcript pipeline's own four. They stay apart
+// because the modules behind them do -- capture-ipc-channels.ts,
+// screen-recording-ipc-channels.ts and audio-ipc-channels.ts are separate for
+// reasons each spells out -- and because capture.js and audio.js should each
+// see only what they use.
 'use strict';
 
 const { contextBridge, ipcRenderer } = require('electron');
@@ -38,6 +40,18 @@ const CAPTURE_CHANNELS = {
   close: 'screen-solver:capture:close',
   requestFrame: 'screen-solver:capture:request-frame',
   frameResult: 'screen-solver:capture:frame-result',
+};
+
+// Mirrors src/main/screen-recording-ipc-channels.ts (#47), for the same
+// can't-import-across-static reason as CAPTURE_CHANNELS above. Keep these
+// five strings in sync with screen-recording-ipc-channels.ts by hand if either
+// changes.
+const SCREEN_RECORDING_CHANNELS = {
+  start: 'screen-solver:screen-recording:start',
+  roll: 'screen-solver:screen-recording:roll',
+  stop: 'screen-solver:screen-recording:stop',
+  chunk: 'screen-solver:screen-recording:chunk',
+  status: 'screen-solver:screen-recording:status',
 };
 
 contextBridge.exposeInMainWorld('captureHost', {
@@ -69,6 +83,44 @@ contextBridge.exposeInMainWorld('captureHost', {
           ipcRenderer.send(CAPTURE_CHANNELS.frameResult, requestId, message);
         });
     });
+  },
+});
+
+// A second exposeInMainWorld object, not more members bolted onto
+// captureHost, because this is a genuinely separate subscription with its
+// own lifecycle (#47's screen-recording.ts note: "these are a subscription, not a
+// per-request round trip" -- see screen-recording-ipc-channels.ts) rather than
+// another capture-shaped request/reply pair. Keeping the two surfaces
+// separate also means capture.js's recording code can be read on its own
+// without cross-referencing captureHost's request/reply shapes.
+contextBridge.exposeInMainWorld('screenRecordingHost', {
+  /** Fires when main wants recording started against segmentId, at timesliceMs. */
+  onStart(handler) {
+    ipcRenderer.on(SCREEN_RECORDING_CHANNELS.start, (_event, sessionId, segmentId, timesliceMs) =>
+      handler(sessionId, segmentId, timesliceMs),
+    );
+  },
+
+  /** Fires when main wants the current segment finished and nextSegmentId begun. */
+  onRoll(handler) {
+    ipcRenderer.on(SCREEN_RECORDING_CHANNELS.roll, (_event, sessionId, nextSegmentId) =>
+      handler(sessionId, nextSegmentId),
+    );
+  },
+
+  /** Fires when main wants the open segment flushed and the recorder torn down. */
+  onStop(handler) {
+    ipcRenderer.on(SCREEN_RECORDING_CHANNELS.stop, (_event, sessionId) => handler(sessionId));
+  },
+
+  /** Sends one dataavailable payload (base64 bytes, tagged with its segment) to main. */
+  sendChunk(message) {
+    ipcRenderer.send(SCREEN_RECORDING_CHANNELS.chunk, message);
+  },
+
+  /** Sends a lifecycle or failure report (started/rolled/stopped/failed) to main. */
+  sendStatus(message) {
+    ipcRenderer.send(SCREEN_RECORDING_CHANNELS.status, message);
   },
 });
 

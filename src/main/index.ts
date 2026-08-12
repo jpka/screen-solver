@@ -7,6 +7,7 @@ import { createRealCaptureSessionOpener } from './capture-session.ts';
 import { createHiddenWindow } from './hidden-window.ts';
 import { isTargetMinimizedReal } from './minimized-check.ts';
 import { webClientDir } from './paths.ts';
+import { createRealScreenRecorderOpener } from './screen-recording.ts';
 import { enumerateOpenWindows } from './window-enumeration.ts';
 
 const EXIT_OK = 0;
@@ -56,6 +57,7 @@ async function main(): Promise<void> {
     // it, by which point the window has long existed.
     openAudioCapture: createRealAudioCaptureOpener(hiddenWindowReady),
     isTargetMinimized: isTargetMinimizedReal,
+    openRecorder: createRealScreenRecorderOpener(hiddenWindowReady),
     clientStaticDir: webClientDir,
   });
 

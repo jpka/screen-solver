@@ -29,6 +29,34 @@
   /** @type {CanvasRenderingContext2D|null} */
   let ctx = null;
 
+  // Recording state (#47). This MediaRecorder sits on top of `stream` --
+  // whatever getUserMedia grab is already live for the capture feature above
+  // -- rather than opening a second one. A second getUserMedia against the
+  // same desktopCapturer source would light a second OS capture session (a
+  // second indicator border for one window) and would drift out of sync with
+  // whatever the capture side thinks it's watching, since stopStream()/
+  // openSession() above can swap `stream` out from under a long-lived
+  // recorder that grabbed its own.
+  /** @type {MediaRecorder|null} */
+  let recorder = null;
+  /** Segment id the currently-live `recorder` is tagging its chunks with. */
+  let currentSegmentId = null;
+  /** Negotiated once at startRecording() and reused for every later segment. */
+  let recordingMimeType = null;
+  /** Session key main minted for the live recording; echoed on every status so a
+   *  superseded session's late messages can be told apart from this one's. */
+  let currentRecordingSession = null;
+  /** Timeslice main asked for at startRecording() time; every roll reuses it. */
+  let recordingTimesliceMs = null;
+
+  const RECORDING_MIME_CANDIDATES = [
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm',
+    'video/mp4;codecs=h264',
+    'video/mp4',
+  ];
+
   // Bumped by every open/close request. `openSession` is async (it awaits
   // getUserMedia, which is not instantaneous), so a `close` -- or a newer
   // `open` -- can arrive from main while a previous `openSession` call is
@@ -44,7 +72,31 @@
   // capture-indicator border lit for a target that was already deselected.
   let sessionToken = 0;
 
-  function stopStream() {
+  // stopStream() is `async` (#47) so it can flush a live recorder before it
+  // rips the tracks that recorder is reading out from under it. Its callers
+  // (openSession, closeSession) were already fine awaiting it -- openSession
+  // is async itself, and closeSession's caller below already tolerates a
+  // promise -- so making this async cost nothing and closes a real hole: a
+  // MediaRecorder.stop() only flushes its buffered data on the next
+  // `dataavailable`/`onstop` pair, which needs the tracks it's reading from
+  // to still be alive to fire. Stopping tracks first would truncate whatever
+  // was still buffered, silently losing the tail of a segment.
+  async function stopStream() {
+    const hadActiveRecorder = recorder !== null;
+    await stopCurrentRecorder();
+    if (hadActiveRecorder) {
+      // The stream a live recording was riding on is going away with no
+      // stop/roll from main -- a target change, or the session simply
+      // closing. Report it the same way any other mid-session recorder
+      // failure is reported (RecorderFailure's channel, per
+      // src/host/recording/types.ts): once stopCurrentRecorder() above has
+      // returned there is no more MediaRecorder for main to talk to, and
+      // main has no other way to learn that.
+      recordingMimeType = null;
+      recordingTimesliceMs = null;
+      reportCurrentStatus({ state: 'failed', reason: 'capture stream stopped underneath the active recording' });
+      currentRecordingSession = null;
+    }
     if (stream) {
       for (const track of stream.getTracks()) track.stop();
       stream = null;
@@ -65,7 +117,7 @@
    */
   async function openSession(sourceId) {
     const token = (sessionToken += 1);
-    stopStream();
+    await stopStream();
 
     // getUserMedia's legacy `mandatory` constraint syntax is what Electron's
     // desktopCapturer integration actually requires; there is no standard
@@ -101,13 +153,13 @@
 
     if (token !== sessionToken) {
       // Superseded again while awaiting play() -- tear down what was just built.
-      stopStream();
+      await stopStream();
     }
   }
 
-  function closeSession() {
+  async function closeSession() {
     sessionToken += 1;
-    stopStream();
+    await stopStream();
   }
 
   /**
@@ -174,6 +226,179 @@
     return btoa(binary);
   }
 
+  // --- Continuous recording (#47) -------------------------------------
+  //
+  // A MediaRecorder over the same `stream` the capture feature above already
+  // owns -- see stopStream()'s comment for why this never calls getUserMedia
+  // a second time. Everything here is mechanism: main (src/main/recording.ts,
+  // driven by src/host/recording/) decides when to start, when to roll to a
+  // new segment, and when to stop; this file just does whatever it's told
+  // and reports back what actually happened.
+
+  /**
+   * Base64-encodes one recorder chunk and sends it to main over
+   * window.screenRecordingHost, tagged with the segment it belongs to.
+   */
+  async function sendChunk(segmentId, blob, last) {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    window.screenRecordingHost.sendChunk({ segmentId, bytesBase64: bytesToBase64(bytes), last });
+  }
+
+  // Every status carries the session it belongs to. Main drops anything whose
+  // session it doesn't recognise, which is what stops a slow teardown -- one
+  // main already timed out on and moved past -- from landing in the *next*
+  // session's start handshake. See src/main/screen-recording-ipc-channels.ts.
+  function reportStatus(sessionId, message) {
+    window.screenRecordingHost.sendStatus({ ...message, sessionId });
+  }
+
+  /** Reports against whatever session is live right now, for unsolicited failures. */
+  function reportCurrentStatus(message) {
+    if (currentRecordingSession === null) return;
+    reportStatus(currentRecordingSession, message);
+  }
+
+  /**
+   * Stops whatever recorder is currently live and resolves once its final
+   * chunk (tagged `last: true`, with the segment id it was still recording)
+   * has been handed to main -- awaiting both the flushing `dataavailable`
+   * and the subsequent `onstop`, since a MediaRecorder's buffered data isn't
+   * final until both have fired. A no-op (resolves immediately, sends
+   * nothing) when no recorder is live, so callers -- roll, stop, and
+   * stopStream()'s teardown path -- don't each need their own "is there
+   * even a recorder" guard.
+   */
+  function stopCurrentRecorder() {
+    const activeRecorder = recorder;
+    const activeSegmentId = currentSegmentId;
+    recorder = null;
+    currentSegmentId = null;
+
+    if (!activeRecorder || activeRecorder.state === 'inactive') {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve) => {
+      let finalBlob = null;
+      let stopped = false;
+
+      function maybeFinish() {
+        if (finalBlob === null || !stopped) return;
+        // Best-effort: even if the base64 encode/send somehow throws, this
+        // stop is still complete from the caller's point of view.
+        Promise.resolve(sendChunk(activeSegmentId, finalBlob, true)).then(resolve, resolve);
+      }
+
+      // A stopped MediaRecorder is guaranteed to fire a final
+      // `dataavailable` (even with an empty blob) before `onstop`, but the
+      // two-flag join below doesn't assume an order beyond that guarantee.
+      activeRecorder.ondataavailable = (event) => {
+        finalBlob = event.data;
+        maybeFinish();
+      };
+      activeRecorder.onstop = () => {
+        stopped = true;
+        if (finalBlob === null) finalBlob = new Blob([]);
+        maybeFinish();
+      };
+      activeRecorder.onerror = () => {
+        stopped = true;
+        if (finalBlob === null) finalBlob = new Blob([]);
+        maybeFinish();
+      };
+      activeRecorder.stop();
+    });
+  }
+
+  /**
+   * Constructs and starts a fresh MediaRecorder tagged with `segmentId`,
+   * using whatever mime type/timeslice startRecording() already negotiated.
+   * Used both for the initial start and for the second half of a roll.
+   */
+  function createRecorder(segmentId) {
+    const newRecorder = new MediaRecorder(stream, { mimeType: recordingMimeType });
+    recorder = newRecorder;
+    currentSegmentId = segmentId;
+
+    newRecorder.ondataavailable = (event) => {
+      // Dropped silently rather than thrown: a stale event from a recorder
+      // that roll()/stop() has already replaced (its handlers would have
+      // been overwritten by stopCurrentRecorder() first, so this only fires
+      // for the still-current recorder) or an empty timeslice tick.
+      if (recorder !== newRecorder || !event.data || event.data.size === 0) return;
+      sendChunk(segmentId, event.data, false);
+    };
+    newRecorder.onerror = (event) => {
+      if (recorder !== newRecorder) return;
+      recorder = null;
+      currentSegmentId = null;
+      reportCurrentStatus({
+        state: 'failed',
+        reason: event && event.error && event.error.message ? event.error.message : 'MediaRecorder error',
+      });
+    };
+
+    newRecorder.start(recordingTimesliceMs);
+  }
+
+  async function startRecording(sessionId, segmentId, timesliceMs) {
+    if (!stream) {
+      reportStatus(sessionId, { state: 'failed', reason: 'no active capture stream to record' });
+      return;
+    }
+
+    const mimeType = RECORDING_MIME_CANDIDATES.find((candidate) => MediaRecorder.isTypeSupported(candidate));
+    if (!mimeType) {
+      reportStatus(sessionId, { state: 'failed', reason: 'no supported MediaRecorder mime type on this platform' });
+      return;
+    }
+
+    recordingMimeType = mimeType;
+    recordingTimesliceMs = timesliceMs;
+    currentRecordingSession = sessionId;
+    createRecorder(segmentId);
+    reportStatus(sessionId, { state: 'started', mimeType });
+  }
+
+  /**
+   * Finishes the outgoing segment and begins the next one. Deliberately a
+   * stop *and* a fresh start rather than trying to keep one MediaRecorder
+   * running and split its output at a cluster boundary: a fresh start() is
+   * what emits a new container header, which is what makes each segment
+   * file independently playable on its own -- splitting mid-container would
+   * need a remuxer, and this repo has zero runtime dependencies to build one
+   * from. Main -- not a timer in here -- decides when to roll, since only it
+   * knows the byte count each segment has reached (it's the one writing
+   * segments to disk); this file just carries out the roll it's told to do.
+   */
+  async function rollRecording(sessionId, nextSegmentId) {
+    if (sessionId !== currentRecordingSession) return;
+    await stopCurrentRecorder(); // sends the outgoing segment's final chunk, last: true
+    if (sessionId !== currentRecordingSession) return; // superseded while flushing
+    createRecorder(nextSegmentId);
+    reportStatus(sessionId, { state: 'rolled', segmentId: nextSegmentId });
+  }
+
+  async function stopRecording(sessionId) {
+    await stopCurrentRecorder(); // sends the final chunk, last: true
+
+    // Only tear down the shared module state if this stop still owns it.
+    // `stopCurrentRecorder()` above awaits a real `dataavailable`/`onstop`
+    // pair, which can outlast main's bounded wait for `stopped` -- and once
+    // main gives up it is free to start a *new* session, which writes these
+    // same globals. Clearing them unconditionally here would null out the new
+    // session's mime type and timeslice from inside the old session's
+    // teardown (review). The `stopped` below is still reported either way, but
+    // tagged with this session, so main drops it unless it is still the one
+    // waiting.
+    if (sessionId === currentRecordingSession) {
+      recordingMimeType = null;
+      recordingTimesliceMs = null;
+      currentRecordingSession = null;
+    }
+    reportStatus(sessionId, { state: 'stopped' });
+  }
+
   window.captureHost.onOpen((sourceId) => {
     openSession(sourceId).catch((error) => {
       console.error('screen-solver capture: failed to open session', error);
@@ -181,8 +406,35 @@
   });
 
   window.captureHost.onClose(() => {
-    closeSession();
+    closeSession().catch((error) => {
+      console.error('screen-solver capture: failed to close session', error);
+    });
   });
 
   window.captureHost.onRequestFrame(() => captureFrame());
+
+  window.screenRecordingHost.onStart((sessionId, segmentId, timesliceMs) => {
+    startRecording(sessionId, segmentId, timesliceMs).catch((error) => {
+      reportStatus(sessionId, {
+        state: 'failed',
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+  });
+
+  window.screenRecordingHost.onRoll((sessionId, nextSegmentId) => {
+    rollRecording(sessionId, nextSegmentId).catch((error) => {
+      reportStatus(sessionId, {
+        state: 'failed',
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+  });
+
+  window.screenRecordingHost.onStop((sessionId) => {
+    stopRecording(sessionId).catch((error) => {
+      console.error('screen-solver recording: failed to stop cleanly', error);
+      reportStatus(sessionId, { state: 'stopped' });
+    });
+  });
 })();

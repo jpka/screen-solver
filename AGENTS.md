@@ -268,8 +268,112 @@ client simply never set it, and get no static routes at all — the same
 "safe default that does less" shape every other optional `HostRuntime` field
 already has.
 
+**Two different things are called "recording".** #35's audio/transcript feature
+and #47's video feature were built in parallel and independently arrived at the
+same word. They are kept apart by name rather than merged, because they are
+genuinely different: one follows the capture session and persists its settings
+across restarts, the other is a manual toggle that deliberately never persists;
+one writes `transcript.jsonl`, the other writes video segments plus
+`recordings.jsonl`. The convention, wherever they meet:
+
+| | audio/transcript (#35) | video (#47) |
+|---|---|---|
+| host dir | `src/host/audio/` | `src/host/screen-recording/` |
+| coordinator | `RecordingCoordinator` | `ScreenRecordingCoordinator` |
+| HTTP | `/recording`, `/transcript` | `/screen-recording*`, `/screen-recordings*` |
+| SSE frame | `recording{state,revision}` | `screen-recording{state,segmentId,bytes,…}` |
+| IPC channels | `screen-solver:audio:*` | `screen-solver:screen-recording:*` |
+| preload surface | `window.audioHost` | `window.screenRecordingHost` |
+| config key | *(not persisted)* | `screenRecording` |
+
+If a third thing ever wants the word, give it its own prefix too rather than
+overloading either of these.
+
+**Continuous screen recording** (established by #47). A `MediaRecorder` attached to
+the capture session's *existing* stream (`static/renderer/capture.js`), not a
+second `getUserMedia` grab -- a second grab would light a second OS capture
+session for one window, and would drift out of sync with the target the rest of
+the app believes it is watching. `src/host/screen-recording/` holds every decision
+(`coordinator.ts`'s state machine, `segment-policy.ts`, `retention.ts`,
+`segment-writer.ts`); `src/main/screen-recording.ts` and the two `static/renderer/`
+files hold only mechanism. Five things worth carrying forward:
+
+- **Push, not pull.** `capture/types.ts`'s session is pulled one frame at a
+  time; a recorder is pushed, because video arrives on the device's clock
+  whether anyone asked or not. So chunks land in a `VideoChunkSink` and the
+  "what if nobody is keeping up" question gets an explicit answer
+  (`MAX_QUEUED_BYTES`, which stops recording and says so) instead of an
+  unbounded queue nobody noticed. `feat/audio-transcript` reached the same
+  conclusion independently for audio; read `src/host/audio/` before writing a
+  third subsystem shaped like this.
+- **Append as you go.** Every chunk is `appendFile`d on arrival rather than
+  accumulated and written at `stop()`. A `kill -9` therefore loses at most one
+  timeslice and leaves a segment that still plays up to that point, and the
+  `opened` index line is written *before* any bytes exist so a killed segment
+  is still a listed recording rather than an orphan file. `reconcile()` on the
+  next launch measures the survivor and writes the `closed` line the crash
+  skipped, flagged `recovered`. This is the property the whole design is
+  arranged around; anything that trades it away for convenience is the wrong
+  trade.
+- **Rolling is main's decision, and is a real stop/start.** Only the host knows
+  the byte count (only the host writes), and a fresh `MediaRecorder.start()` is
+  what emits a new container header -- which is what makes each segment
+  independently playable, prunable, and seekable. Splitting one recorder's
+  output at cluster boundaries instead would need a remuxer, and this repo has
+  no runtime dependencies.
+- **`recordings.jsonl` is an event log, not a record log** -- `opened` /
+  `closed` / `pruned` folded by `foldRecordingLog`, unlike `answers.jsonl` and
+  `usage.jsonl` where one line is one record. Forced by two things `jsonl.ts`
+  can't do: a segment's size isn't known when it starts, and retention deletes
+  things while `openJsonlFile` has no delete. A `pruned` tombstone keeps the
+  file strictly append-only rather than introducing a rewrite path that a crash
+  could truncate. Known limit, stated rather than hidden: the index is never
+  compacted, so it grows ~3 lines per segment forever even as segments are
+  pruned. Immaterial next to the video; cheap to compact later behind the same
+  fold.
+- **The capture session tells its listeners *before* it closes a stream.**
+  `CaptureSessionCoordinator`'s new `onSessionChange` fires `null` before a
+  close and the new target after an open, and the `null` call is awaited
+  (bounded by `SESSION_LISTENER_TIMEOUT_MS`, via the newly-extracted
+  `settles-within.ts`). Without the "before", a target change would stop the
+  tracks underneath a live recorder and truncate its last segment on every
+  window switch. The renderer still honestly reports "the stream stopped
+  underneath me" as a failure when it loses that race, so `coordinator.ts`
+  carries a `stopping` flag to keep that expected noise from latching the user
+  into `error` -- notify-first is the fix, the flag is the backstop.
+
+Retention is genuinely new ground: nothing in this repo pruned anything before
+#45, because a line of text is nothing and video is not. An unattended recorder
+with no retention fills the disk, and that is a failure that reaches well past
+this app -- it is what makes "leave it running" a safe thing to say. The one
+ordering rule that isn't obvious: **drain the writer before reading the index
+for retention.** The segment that just rolled only gets its byte total when its
+`closed` line lands, so pruning first computes the budget against a total that
+is permanently one segment short (found via a test that was flaky for exactly
+that reason).
+
+Recording settings are **persisted**, unlike `feat/audio-transcript`'s
+deliberately-never-persisted toggle. The premise of #47 is *automatic*
+recording, and a recorder that forgot it was enabled on every restart would
+fail its own acceptance criterion. What the audio branch was protecting is kept
+another way: `enabled` defaults to `false`, the OS capture border is lit
+throughout, and the client shows a conspicuous live REC state with elapsed time
+and a growing byte count. The `recording` SSE frame is replayed on
+`subscribe()` whenever the state isn't `off`, for the same reason `sync` and
+`status` are -- a phone opened mid-recording that displayed "not recording"
+would be the one genuinely unacceptable thing this feature could do.
+
+`GET /screen-recordings/file?id=…` is the first endpoint in this codebase that needs a
+parameter. It takes it in the **query string** rather than teaching `router.ts`
+path patterns, so "the v1 HTTP surface has no path parameters" stays true and
+the route table stays a `Map` lookup. Two things it must keep doing: resolve the
+id through the index (never treat it as a filename) *and* re-check containment
+in `safeSegmentPath`, which rejects separators outright so its contract holds
+without depending on the route's own guards; and support `Range`, without which
+`<video>` cannot seek.
+
 **Shutdown ordering** (established by #31, tightened across three rounds of
-review). Anything that persists on its way out has to be drained by
+review; #47 joined the same phase). Anything that persists on its way out has to be drained by
 `StartedHost.shutdown()` (`bootstrap.ts`) *before* the resources it depends on
 are torn down, and the drain itself has to be bounded. The worked example is
 the solve loop: `SolveLoop.stop()` aborts the in-flight attempt (rather than

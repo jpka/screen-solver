@@ -1,13 +1,16 @@
 import { readFile as readFileFs, writeFile as writeFileFs } from 'node:fs/promises';
 import { join } from 'node:path';
 import { StartupError } from '../errors.ts';
-import type {
-  ConfigChangeEvent,
-  EnumerateWindows,
-  ProviderSelection,
-  ScreenSolverConfig,
-  TargetWindowIdentity,
-  WindowInfo,
+import {
+  DEFAULT_SCREEN_RECORDING_SETTINGS,
+  type ConfigChangeEvent,
+  type EnumerateWindows,
+  type ProviderSelection,
+  type ScreenRecordingSettings,
+  type ScreenRecordingSettingsChangeEvent,
+  type ScreenSolverConfig,
+  type TargetWindowIdentity,
+  type WindowInfo,
 } from './types.ts';
 
 export const CONFIG_FILE_NAME = 'config.json';
@@ -15,6 +18,7 @@ export const CONFIG_FILE_NAME = 'config.json';
 const EMPTY_CONFIG: ScreenSolverConfig = Object.freeze({
   targetWindow: null,
   provider: null,
+  screenRecording: DEFAULT_SCREEN_RECORDING_SETTINGS,
 });
 
 /** No enumerator was injected. Nothing ever resolves, which is the same as the documented "no target configured" fallback. */
@@ -43,8 +47,20 @@ export interface ConfigStore {
    */
   setTargetWindow(target: TargetWindowIdentity | null): Promise<void>;
 
+  /**
+   * Updates any subset of the recording settings (#47), persisting and
+   * broadcasting them the same write-then-publish way {@link setTargetWindow}
+   * does. A partial patch rather than a whole-object setter because the client
+   * only ever moves one control at a time, and a whole-object setter would let
+   * a stale client silently revert a limit it never displayed.
+   */
+  setScreenRecordingSettings(patch: Partial<ScreenRecordingSettings>): Promise<ScreenRecordingSettings>;
+
   /** Subscribes to target-window changes. Call the returned function to unsubscribe. */
   onChange(listener: (event: ConfigChangeEvent) => void): () => void;
+
+  /** Subscribes to recording-settings changes -- a separate bus; see {@link ScreenRecordingSettingsChangeEvent}. */
+  onScreenRecordingSettingsChange(listener: (event: ScreenRecordingSettingsChangeEvent) => void): () => void;
 }
 
 export interface LoadConfigStoreOptions {
@@ -91,6 +107,7 @@ export async function loadConfigStore(options: LoadConfigStoreOptions): Promise<
   };
 
   const listeners = new Set<(event: ConfigChangeEvent) => void>();
+  const recordingListeners = new Set<(event: ScreenRecordingSettingsChangeEvent) => void>();
 
   return Object.freeze({
     get: () => current,
@@ -106,10 +123,35 @@ export async function loadConfigStore(options: LoadConfigStoreOptions): Promise<
       for (const listener of listeners) listener(event);
     },
 
+    async setScreenRecordingSettings(patch: Partial<ScreenRecordingSettings>): Promise<ScreenRecordingSettings> {
+      // Same write-then-publish ordering as `setTargetWindow`, for the same
+      // reason: a failed write must not leave the live settings and the file
+      // disagreeing. Sanitized on the way in so a bad value can't be persisted
+      // and then re-read as a startup-time surprise -- `parseConfig` below
+      // applies the identical rules to whatever is already on disk.
+      const settings = sanitizeScreenRecordingSettings({ ...current.screenRecording, ...patch });
+      const next: ScreenSolverConfig = { ...current, screenRecording: settings };
+      await writeFileImpl(configPath, JSON.stringify(next, null, 2));
+      current = next;
+
+      const event: ScreenRecordingSettingsChangeEvent = { type: 'screen-recording-settings', settings };
+      for (const listener of recordingListeners) listener(event);
+      return settings;
+    },
+
     onChange(listener: (event: ConfigChangeEvent) => void): () => void {
       listeners.add(listener);
       return () => {
         listeners.delete(listener);
+      };
+    },
+
+    onScreenRecordingSettingsChange(
+      listener: (event: ScreenRecordingSettingsChangeEvent) => void,
+    ): () => void {
+      recordingListeners.add(listener);
+      return () => {
+        recordingListeners.delete(listener);
       };
     },
   });
@@ -195,7 +237,55 @@ function parseConfig(raw: string, configPath: string): ScreenSolverConfig {
   return {
     targetWindow: isTargetWindowIdentity(candidate.targetWindow) ? candidate.targetWindow : null,
     provider: isProviderSelection(candidate.provider) ? candidate.provider : null,
+    screenRecording: readScreenRecordingSettings(candidate.screenRecording),
   };
+}
+
+/**
+ * Reads the `recording` block field-by-field, defaulting anything missing or
+ * malformed rather than throwing.
+ *
+ * Deliberately *not* the `config-invalid` startup refusal `parseConfig` uses
+ * for a whole-file parse failure: this block didn't exist before #47, so every
+ * `config.json` written by an earlier version is missing it entirely, and
+ * upgrading the app must not turn into a refusal to start. Per-field
+ * defaulting also matches how `targetWindow`/`provider` above already treat a
+ * malformed value (fall back to `null`, don't throw).
+ */
+function readScreenRecordingSettings(value: unknown): ScreenRecordingSettings {
+  if (typeof value !== 'object' || value === null) return DEFAULT_SCREEN_RECORDING_SETTINGS;
+  const candidate = value as Partial<Record<keyof ScreenRecordingSettings, unknown>>;
+  return sanitizeScreenRecordingSettings({
+    enabled:
+      typeof candidate.enabled === 'boolean' ? candidate.enabled : DEFAULT_SCREEN_RECORDING_SETTINGS.enabled,
+    segmentSeconds: numberOr(candidate.segmentSeconds, DEFAULT_SCREEN_RECORDING_SETTINGS.segmentSeconds),
+    retentionBytes: numberOr(candidate.retentionBytes, DEFAULT_SCREEN_RECORDING_SETTINGS.retentionBytes),
+    retentionDays: numberOr(candidate.retentionDays, DEFAULT_SCREEN_RECORDING_SETTINGS.retentionDays),
+  });
+}
+
+/** Smallest segment length worth rolling. Below this, rolling costs more than it buys. */
+const MIN_SEGMENT_SECONDS = 5;
+
+/**
+ * Clamps the three limits into ranges the rest of the subsystem can rely on.
+ *
+ * `segment-policy.ts` and `retention.ts` are pure functions that trust their
+ * arguments; a `segmentSeconds` of `0` would roll on every chunk and a negative
+ * `retentionBytes` would prune every segment the instant it was written. Both
+ * are far better caught here, once, than defended against at each use site.
+ */
+function sanitizeScreenRecordingSettings(settings: ScreenRecordingSettings): ScreenRecordingSettings {
+  return {
+    enabled: settings.enabled,
+    segmentSeconds: Math.max(MIN_SEGMENT_SECONDS, Math.floor(settings.segmentSeconds)),
+    retentionBytes: Math.max(0, Math.floor(settings.retentionBytes)),
+    retentionDays: Math.max(0, Math.floor(settings.retentionDays)),
+  };
+}
+
+function numberOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
 function isTargetWindowIdentity(value: unknown): value is TargetWindowIdentity {

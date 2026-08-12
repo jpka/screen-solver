@@ -10,9 +10,12 @@ import type { CaptureSessionCoordinator } from '../capture/session-coordinator.t
 import type { ConfigStore } from '../config/store.ts';
 import type { EnumerateWindows, TargetWindowIdentity } from '../config/types.ts';
 import type { AnswerLog } from '../logs/answer-log.ts';
+import type { ScreenRecordingLog } from '../logs/screen-recording-log.ts';
 import type { TranscriptLog } from '../logs/transcript-log.ts';
 import type { Logger } from '../logger.ts';
 import type { Provider } from '../provider/types.ts';
+import type { ScreenRecordingCoordinator } from '../screen-recording/coordinator.ts';
+import { createSegmentFileRoute } from './segment-file.ts';
 import { createEventBroadcaster } from '../solve/broadcaster.ts';
 import { startSolveLoop, type SolveLoop, type SolveMode } from '../solve/loop.ts';
 import type { SolveOutcomeEvent } from '../solve/types.ts';
@@ -54,6 +57,12 @@ export interface HostRoutesDeps {
   readonly onOutcome?: (event: SolveOutcomeEvent) => void | Promise<void>;
   /** #31's `answers.jsonl` reader -- `GET /answers` serves its full backlog. Left unset, `GET /answers` answers `[]` (the same "nothing configured yet" default `enumerateWindows`/`isTargetMinimized` already use). */
   readonly answerLog?: AnswerLog;
+  /** #47's screen recorder. Left unset, every `/screen-recording*` route answers `503 not_ready`. */
+  readonly screenRecordingCoordinator?: ScreenRecordingCoordinator;
+  /** #47's `recordings.jsonl` reader -- backs `GET /screen-recordings` and resolves ids for the playback route. */
+  readonly screenRecordingLog?: ScreenRecordingLog;
+  /** `<stateRoot>/recordings`. Required alongside `screenRecordingLog` for the playback route to exist. */
+  readonly recordingsDir?: string;
   /**
    * The transcription seam. `bootstrap.ts` builds a real Deepgram transcriber
    * when a key is present. Left unset, recording reports `'unavailable'` and
@@ -136,6 +145,19 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
   if (configStore !== undefined) {
     configStore.onChange((event) => {
       broadcaster.config(event.target);
+    });
+  }
+
+  // #47: same shape and same lifetime as the target-change mirror above --
+  // every screen-recorder state change (and the once-a-second byte tick while
+  // recording) becomes a `screen-recording` SSE frame. Note this coordinator is
+  // *injected*, unlike the audio one built just below: it has to exist before
+  // the capture session coordinator does, because that coordinator notifies it
+  // on every stream change, so `bootstrap.ts` owns its construction.
+  const { screenRecordingCoordinator } = deps;
+  if (screenRecordingCoordinator !== undefined) {
+    screenRecordingCoordinator.onStateChange((snapshot) => {
+      broadcaster.screenRecording(snapshot);
     });
   }
 
@@ -463,7 +485,127 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
         sendJson(res, 200, entries);
       },
     },
+    // #47's screen recorder. Namespaced under `/screen-recording` rather than
+    // sharing `/recording` above: that surface belongs to the audio/transcript
+    // recorder, and the two are genuinely different features that happen to
+    // have both been called "recording" -- different lifecycles, different
+    // persistence, shown in different places in the client.
+    {
+      // The state a client needs on first load, before any `screen-recording`
+      // SSE frame has arrived. Exactly the gap `GET /config` fills for the
+      // target: a client that only learned this from SSE would render "not
+      // recording" until the next frame, which for this feature is the one
+      // wrong thing it could say.
+      method: 'GET',
+      path: '/screen-recording',
+      handle: ({ res }) => {
+        sendJson(
+          res,
+          200,
+          screenRecordingCoordinator?.snapshot() ?? broadcaster.currentScreenRecording(),
+        );
+      },
+    },
+    {
+      method: 'POST',
+      path: '/screen-recording/start',
+      handle: async ({ res }) => {
+        if (screenRecordingCoordinator === undefined || configStore === undefined) {
+          sendJson(res, 503, { error: 'not_ready' });
+          return;
+        }
+        // There is nothing to record without a capture stream, and starting
+        // anyway would sit in `starting` until the renderer's handshake timed
+        // out -- a slow, confusing way to say something the server already
+        // knows.
+        if (configStore.get().targetWindow === null) {
+          sendJson(res, 409, { error: 'no_capture_session' });
+          return;
+        }
+        sendJson(res, 200, await screenRecordingCoordinator.start());
+      },
+    },
+    {
+      method: 'POST',
+      path: '/screen-recording/stop',
+      handle: async ({ res }) => {
+        if (screenRecordingCoordinator === undefined) {
+          sendJson(res, 503, { error: 'not_ready' });
+          return;
+        }
+        await screenRecordingCoordinator.stop();
+        sendJson(res, 200, screenRecordingCoordinator.snapshot());
+      },
+    },
+    {
+      method: 'GET',
+      path: '/screen-recordings',
+      handle: async ({ res }) => {
+        // Read fresh per request, like `GET /answers`: a segment that rolled a
+        // moment ago has to show up without any cache to invalidate.
+        const segments =
+          deps.screenRecordingLog === undefined ? [] : await deps.screenRecordingLog.readIndex();
+        sendJson(res, 200, segments);
+      },
+    },
+    {
+      method: 'GET',
+      path: '/screen-recording/settings',
+      handle: ({ res }) => {
+        if (configStore === undefined) {
+          sendJson(res, 503, { error: 'not_ready' });
+          return;
+        }
+        sendJson(res, 200, configStore.get().screenRecording);
+      },
+    },
+    {
+      method: 'POST',
+      path: '/screen-recording/settings',
+      handle: async ({ req, res }) => {
+        if (configStore === undefined) {
+          sendJson(res, 503, { error: 'not_ready' });
+          return;
+        }
+
+        let body: unknown;
+        try {
+          body = await readJsonBody(req);
+        } catch (error) {
+          if (error instanceof PayloadTooLargeError) {
+            sendJson(res, 413, { error: 'payload_too_large' });
+          } else {
+            sendJson(res, 400, { error: 'bad_request' });
+          }
+          return;
+        }
+
+        const patch = parseScreenRecordingSettingsBody(body);
+        if (patch === INVALID_SETTINGS) {
+          sendJson(res, 400, { error: 'bad_request' });
+          return;
+        }
+
+        // The store clamps and persists; the response is whatever it actually
+        // stored, not the patch, so a client that sent an out-of-range value
+        // sees the clamped truth rather than believing its own request.
+        sendJson(res, 200, await configStore.setScreenRecordingSettings(patch));
+      },
+    },
   ];
+
+  // Only registered when both halves exist -- the route cannot serve anything
+  // useful with an index but no directory to read from, and a route that always
+  // 503s is worse than a 404 from the router's own miss.
+  if (deps.screenRecordingLog !== undefined && deps.recordingsDir !== undefined) {
+    routes.push(
+      createSegmentFileRoute({
+        screenRecordingLog: deps.screenRecordingLog,
+        dir: deps.recordingsDir,
+        logger: deps.logger,
+      }),
+    );
+  }
 
   return { routes, solveLoop, recordingCoordinator };
 }
@@ -482,6 +624,41 @@ function parseLimit(raw: string | null): number | null {
   const value = Number(raw);
   if (value < 1) return null;
   return Math.min(value, MAX_TRANSCRIPT_LIMIT);
+}
+
+const INVALID_SETTINGS = Symbol('invalid-recording-settings');
+
+/**
+ * A partial {@link RecordingSettings} patch, or {@link INVALID_SETTINGS}.
+ *
+ * Unknown keys are ignored rather than rejected, and an absent key means "leave
+ * it alone" -- the client only ever moves one control at a time. A key that is
+ * *present* with the wrong type is a genuine `400`, though: silently discarding
+ * it would leave the user staring at a control that snapped back with no
+ * explanation.
+ */
+function parseScreenRecordingSettingsBody(
+  body: unknown,
+): Partial<{ enabled: boolean; segmentSeconds: number; retentionBytes: number; retentionDays: number }> | typeof INVALID_SETTINGS {
+  if (body === null) return {};
+  if (typeof body !== 'object') return INVALID_SETTINGS;
+
+  const candidate = body as Record<string, unknown>;
+  const patch: Record<string, unknown> = {};
+
+  if ('enabled' in candidate) {
+    if (typeof candidate.enabled !== 'boolean') return INVALID_SETTINGS;
+    patch.enabled = candidate.enabled;
+  }
+  for (const key of ['segmentSeconds', 'retentionBytes', 'retentionDays'] as const) {
+    if (!(key in candidate)) continue;
+    if (typeof candidate[key] !== 'number' || !Number.isFinite(candidate[key])) {
+      return INVALID_SETTINGS;
+    }
+    patch[key] = candidate[key];
+  }
+
+  return patch;
 }
 
 const INVALID_TARGET = Symbol('invalid-target');

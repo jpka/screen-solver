@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import { API_KEY_ENV_VAR, DEEPGRAM_API_KEY_ENV_VAR, takeApiKey, takeDeepgramApiKey } from './api-key.ts';
 import { createDeepgramTranscriber } from './audio/deepgram.ts';
 import type { RecordingCoordinator } from './audio/recording-coordinator.ts';
@@ -16,8 +17,16 @@ import type { Route } from './http/router.ts';
 import { createStaticRoutes } from './http/static.ts';
 import { createAnswerLog } from './logs/answer-log.ts';
 import { createSolveLogRecorder } from './logs/recorder.ts';
+import { createScreenRecordingLog, RECORDINGS_DIR_NAME } from './logs/screen-recording-log.ts';
 import { createTranscriptLog } from './logs/transcript-log.ts';
 import { createUsageLog } from './logs/usage-log.ts';
+import {
+  createScreenRecordingCoordinator,
+  type ScreenRecordingCoordinator,
+} from './screen-recording/coordinator.ts';
+import { createSegmentWriter } from './screen-recording/segment-writer.ts';
+import type { OpenRecorder } from './screen-recording/types.ts';
+import { settlesWithin } from './settles-within.ts';
 import {
   startHttpServer as defaultStartHttpServer,
   type ListeningHttpServer,
@@ -130,6 +139,15 @@ export interface HostRuntime {
    * touching the network -- the same shape as `provider`.
    */
   readonly transcriber?: Transcriber;
+  /**
+   * Opens a `MediaRecorder` over the live capture stream (#47) -- the *video*
+   * recorder, distinct from `openAudioCapture` above. Electron supplies the
+   * real implementation (`src/main/screen-recording.ts`); tests supply a fake.
+   * Left unset, the screen-recording coordinator is still constructed and its
+   * routes still exist, but it reports `unavailable` and never records -- the
+   * same "safe default that just does less" shape as `openCaptureSession`.
+   */
+  readonly openRecorder?: OpenRecorder;
 }
 
 /** The state the app lives in for the rest of its life. */
@@ -145,6 +163,8 @@ export interface StartedHost {
   readonly captureSessionCoordinator: CaptureSessionCoordinator;
   /** The recording lifecycle: off until a client toggles it on, `'unavailable'` with no transcription key. */
   readonly recordingCoordinator: RecordingCoordinator;
+  /** #47's continuous *screen* recorder, riding on top of that same capture session. */
+  readonly screenRecordingCoordinator: ScreenRecordingCoordinator;
   shutdown(): Promise<void>;
 }
 
@@ -220,6 +240,33 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   const transcriptLog = createTranscriptLog({ stateRoot });
   const transcriptWindow = createTranscriptWindow();
 
+  // #47's screen recorder. Built before the capture coordinator because that
+  // coordinator's `onSessionChange` hook needs something to notify -- the
+  // recorder follows the capture session, not the other way round. This is also
+  // why it is constructed here rather than inside `createHostRoutes` the way
+  // the audio recording coordinator is: by the time the routes exist, the
+  // capture coordinator already needs it.
+  const screenRecordingLog = createScreenRecordingLog({ stateRoot });
+  const recordingsDir = join(stateRoot, RECORDINGS_DIR_NAME);
+  const screenRecordingCoordinator = createScreenRecordingCoordinator({
+    writer: createSegmentWriter({
+      dir: recordingsDir,
+      screenRecordingLog,
+      // Routed back through the coordinator so a write failure lands in the
+      // same `error` state a renderer failure does -- from the user's side
+      // "the disk stopped accepting video" and "the recorder stopped producing
+      // it" are the same event, and both must stop the recording rather than
+      // let it appear to continue into nothing.
+      onError: (reason) => screenRecordingCoordinator.fail(reason),
+      logger,
+    }),
+    screenRecordingLog,
+    openRecorder: runtime.openRecorder,
+    settings: () => configStore.get().screenRecording,
+    currentTarget: () => captureSessionCoordinator.currentTarget(),
+    logger,
+  });
+
   // Not awaited: opening a session can take a moment (in production it waits
   // on the hidden renderer), and there is no reason to hold the HTTP bind
   // hostage to it. It's still "opened at startup" in the sense the spec
@@ -228,7 +275,18 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
     initialTarget: configStore.get().targetWindow,
     onChange: configStore.onChange,
     openSession: runtime.openCaptureSession ?? NEVER_OPENS,
+    // #45: awaited (bounded) so the recorder flushes its last chunk against a
+    // live stream rather than a stopped one. See `onSessionChange`'s own doc.
+    onSessionChange: (target) => screenRecordingCoordinator.onCaptureSessionChange(target),
     logger,
+  });
+
+  // Repairs any segment left unclosed by an unclean exit, then applies
+  // retention. Not awaited, for the same reason the capture session isn't:
+  // reading the index and stat-ing files has nothing to do with whether the
+  // HTTP surface can accept its first request.
+  void screenRecordingCoordinator.reconcile().catch((error: unknown) => {
+    logger.error(`screen recording: startup reconciliation failed: ${describeError(error)}`);
   });
 
   // `solveLoop` is `null` when `runtime.routes` was injected directly (tests
@@ -256,6 +314,9 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
         openAudioCapture: runtime.openAudioCapture,
         transcriptLog,
         transcriptWindow,
+        screenRecordingCoordinator,
+        screenRecordingLog,
+        recordingsDir,
         logger,
       });
 
@@ -284,6 +345,7 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
       server,
       configStore,
       captureSessionCoordinator,
+      screenRecordingCoordinator,
       recordingCoordinator,
       shutdown: async () => {
         // Let whatever solve attempt is currently in flight reach a terminal
@@ -312,16 +374,33 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
         // transcription stream bounds its own close (`CLOSE_TIMEOUT_MS`,
         // 1.5s), which is what keeps two subsystems fitting inside one 5s
         // budget instead of the audio half starving the solve half.
+        //
+        // #47's screen recorder joins the same phase for the same reason, and
+        // its ordering is load-bearing in the same way: `stop()` is what makes
+        // the renderer flush the segment's final chunk, and `drain()` waits for
+        // that chunk and its `closed` index line to reach disk. Both run
+        // *before* `captureSessionCoordinator.stop()` below, because stopping
+        // the capture session kills the very stream being flushed from -- the
+        // same ordering the target-change path gets from `onSessionChange`,
+        // applied to shutdown.
+        //
+        // Losing the video tail is survivable in a way losing the last answer
+        // line isn't: the segment's bytes are already on disk, and the next
+        // launch's `reconcile()` writes the `closed` line this gave up on.
         const drained = (async () => {
           await solveLoop?.stop();
           await recordingCoordinator.stop();
+          await screenRecordingCoordinator.stop();
           await solveLogRecorder.drain();
           await recordingCoordinator.drain();
+          await screenRecordingCoordinator.drain();
         })();
         if (!(await settlesWithin(drained, runtime.solveDrainTimeoutMs ?? SOLVE_DRAIN_TIMEOUT_MS))) {
           logger.warn(
             'Shutting down without waiting any longer for in-flight work to finish persisting. ' +
-              'The last answers.jsonl / usage.jsonl / transcript.jsonl line may be missing or truncated.',
+              'The last answers.jsonl / usage.jsonl / transcript.jsonl line may be missing or ' +
+              'truncated, and any screen recording in progress will be closed out on the next ' +
+              'launch instead.',
           );
         }
 
@@ -332,27 +411,8 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   };
 }
 
-/**
- * Resolves `true` once `work` settles, or `false` if `timeoutMs` elapses
- * first. The timer is cleared on the happy path, so a shutdown that drains
- * immediately doesn't hold the event loop open for the rest of the timeout.
- *
- * `work` is caught rather than propagated: everything it awaits already
- * handles its own failures (`trigger()` catches the attempt, `record()`
- * catches each chained write), and a rejection arriving *after* a timeout has
- * already moved shutdown on would otherwise surface as an unhandled rejection
- * with nobody left to receive it.
- */
-function settlesWithin(work: Promise<void>, timeoutMs: number): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    const timer = setTimeout(() => resolve(false), timeoutMs);
-    void work
-      .catch(() => {})
-      .then(() => {
-        clearTimeout(timer);
-        resolve(true);
-      });
-  });
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** True once the key has been taken — asserted by tests, and cheap insurance. */
