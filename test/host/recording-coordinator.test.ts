@@ -1,470 +1,388 @@
 import assert from 'node:assert/strict';
-import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { describe, it, type TestContext } from 'node:test';
-import type { TargetWindowIdentity } from '../../src/host/config/types.ts';
-import { createRecordingLog, RECORDINGS_DIR_NAME } from '../../src/host/logs/recording-log.ts';
+import { describe, it } from 'node:test';
 import {
   createRecordingCoordinator,
-  type RecordingCoordinator,
-  type RecordingSnapshot,
-} from '../../src/host/recording/coordinator.ts';
-import { createSegmentWriter } from '../../src/host/recording/segment-writer.ts';
-import type { OpenRecorder, Recorder, VideoChunk } from '../../src/host/recording/types.ts';
-import { tempStateRoot } from '../helpers/temp-state-root.ts';
+  type RecordingCoordinatorDeps,
+  type RecordingState,
+} from '../../src/host/audio/recording-coordinator.ts';
+import type {
+  AudioChunkSink,
+  OpenAudioCapture,
+  Transcriber,
+  TranscriberStream,
+  TranscriptChannel,
+  TranscriptEvent,
+} from '../../src/host/audio/types.ts';
+import { createTranscriptWindow } from '../../src/host/audio/window.ts';
+import type { TranscriptLog } from '../../src/host/logs/transcript-log.ts';
+import type { TranscriptEntry } from '../../src/host/logs/types.ts';
 
-const KATA_TAB: TargetWindowIdentity = { processName: 'chrome.exe', title: 'Two Sum - LeetCode' };
+const SOCKET_OPENED_AT = new Date('2026-08-11T09:00:00.000Z');
+/** A "now" a few seconds into the fixture session, so window assertions don't race the real clock. */
+const DURING_SESSION = SOCKET_OPENED_AT.getTime() + 10_000;
 
-/**
- * A stand-in for the hidden renderer's `MediaRecorder`.
- *
- * The only fake in this file. Everything below it -- the segment writer, the
- * JSONL index, the files themselves -- is the real implementation running
- * against a temp state root, because the interesting failures in this subsystem
- * live in the seams between those pieces (does the roll's final chunk get
- * counted before the new segment opens? does a `closed` line actually reach
- * disk?) and a faked writer would assert those seams away.
- *
- * The renderer half itself -- `getUserMedia`, `MediaRecorder`, the WGC pipeline
- * -- stays manual/E2E-verified, per this repo's standing policy for anything
- * needing a real composited desktop.
- */
-function fakeRenderer() {
-  let sink: ((chunk: VideoChunk) => void) | null = null;
-  let onFailure: ((failure: { reason: string }) => void) | null = null;
-  let currentId: string | null = null;
-  let closed = false;
-  const opens: string[] = [];
+interface FakeStream extends TranscriberStream {
+  readonly channel: TranscriptChannel;
+  readonly pcm: Uint8Array[];
+  closeCalls: number;
+  emit(event: TranscriptEvent): void;
+}
 
-  const open: OpenRecorder = async (options) => {
-    sink = options.sink;
-    onFailure = options.onFailure;
-    currentId = options.segmentId;
-    closed = false;
-    opens.push(options.segmentId);
-
-    const recorder: Recorder = {
-      mimeType: 'video/webm;codecs=vp9',
-      async roll(next: string): Promise<void> {
-        // Mirrors the real renderer's ordering: the outgoing segment's final
-        // chunk is sent *before* the roll is acknowledged, which is what makes
-        // `Recorder.roll()`'s "resolves once the final chunk has been handed to
-        // the sink" contract true.
-        sink?.({ segmentId: currentId!, bytes: new Uint8Array([0xff]), last: true });
-        currentId = next;
-      },
-      async close(): Promise<void> {
-        if (closed) return;
-        closed = true;
-        sink?.({ segmentId: currentId!, bytes: new Uint8Array([0xee]), last: true });
-      },
-    };
-    return recorder;
-  };
-
-  return {
-    open,
-    opens,
-    /** One `dataavailable` tick of `size` bytes on the currently-open segment. */
-    emit(size: number): void {
-      sink?.({ segmentId: currentId!, bytes: new Uint8Array(size), last: false });
-    },
-    /** The out-of-band mid-session failure channel. */
-    fail(reason: string): void {
-      onFailure?.({ reason });
-    },
-  };
+interface FakeCapture {
+  closeCalls: number;
+  push(channel: TranscriptChannel, pcm: Uint8Array): void;
 }
 
 interface Harness {
-  readonly coordinator: RecordingCoordinator;
-  readonly renderer: ReturnType<typeof fakeRenderer>;
-  readonly states: RecordingSnapshot[];
-  readonly stateRoot: string;
-  readonly recordingsDir: string;
-  /** Moves the injected clock forward. Nothing here waits on real time. */
-  advance(ms: number): void;
-  readIndex(): ReturnType<ReturnType<typeof createRecordingLog>['readIndex']>;
+  readonly deps: RecordingCoordinatorDeps;
+  readonly streams: FakeStream[];
+  readonly appended: TranscriptEntry[];
+  readonly broadcast: TranscriptEntry[];
+  readonly interims: { channel: TranscriptChannel; text: string }[];
+  readonly states: RecordingState[];
+  readonly captures: FakeCapture[];
+  stream(channel: TranscriptChannel): FakeStream;
+  capture(): FakeCapture;
 }
 
-async function harness(
-  t: TestContext,
+function harness(
   options: {
-    readonly enabled?: boolean;
-    readonly segmentSeconds?: number;
-    readonly retentionBytes?: number;
-    readonly retentionDays?: number;
-    readonly withRecorder?: boolean;
-    readonly maxSegmentBytes?: number;
+    withTranscriber?: boolean;
+    withCapture?: boolean;
+    captureThrows?: boolean;
+    appendThrows?: boolean;
   } = {},
-): Promise<Harness> {
-  const stateRoot = await tempStateRoot(t);
-  const recordingsDir = join(stateRoot, RECORDINGS_DIR_NAME);
-  const recordingLog = createRecordingLog({ stateRoot });
-  const renderer = fakeRenderer();
-  const states: RecordingSnapshot[] = [];
+): Harness {
+  const streams: FakeStream[] = [];
+  const captures: FakeCapture[] = [];
+  const appended: TranscriptEntry[] = [];
+  const broadcast: TranscriptEntry[] = [];
+  const interims: { channel: TranscriptChannel; text: string }[] = [];
+  const states: RecordingState[] = [];
 
-  let clock = Date.parse('2026-08-12T09:00:00.000Z');
-  let nextId = 0;
+  const transcriber: Transcriber = {
+    model: 'nova-3',
+    open({ channel, onEvent }) {
+      const stream: FakeStream = {
+        channel,
+        pcm: [],
+        closeCalls: 0,
+        send(pcm) {
+          stream.pcm.push(pcm);
+        },
+        async close() {
+          stream.closeCalls += 1;
+        },
+        emit: onEvent,
+      };
+      streams.push(stream);
+      return stream;
+    },
+  };
 
-  let coordinator: RecordingCoordinator;
-  const writer = createSegmentWriter({
-    dir: recordingsDir,
-    recordingLog,
-    onError: (reason) => coordinator.fail(reason),
-    now: () => new Date(clock),
-  });
+  const openAudioCapture: OpenAudioCapture = async (sink: AudioChunkSink) => {
+    if (options.captureThrows === true) throw new Error('no audio device');
+    const capture: FakeCapture = {
+      closeCalls: 0,
+      push: (channel, pcm) => sink({ channel, pcm }),
+    };
+    captures.push(capture);
+    return {
+      async close() {
+        capture.closeCalls += 1;
+      },
+    };
+  };
 
-  coordinator = createRecordingCoordinator({
-    writer,
-    recordingLog,
-    openRecorder: options.withRecorder === false ? undefined : renderer.open,
-    settings: () => ({
-      enabled: options.enabled ?? false,
-      segmentSeconds: options.segmentSeconds ?? 300,
-      retentionBytes: options.retentionBytes ?? 2 * 1024 * 1024 * 1024,
-      retentionDays: options.retentionDays ?? 7,
-    }),
-    currentTarget: () => KATA_TAB,
-    now: () => new Date(clock),
-    newSegmentId: () => `seg-${(nextId += 1)}`,
-    maxSegmentBytes: options.maxSegmentBytes,
-  });
-
-  coordinator.onStateChange((snapshot) => states.push(snapshot));
-  t.after(() => coordinator.stop());
+  const transcriptLog = {
+    async append(entry: TranscriptEntry) {
+      if (options.appendThrows === true) throw new Error('disk is full');
+      appended.push(entry);
+    },
+    async readAll() {
+      return appended;
+    },
+    async readTail(maxEntries: number) {
+      return appended.slice(-maxEntries);
+    },
+  } satisfies TranscriptLog;
 
   return {
-    coordinator,
-    renderer,
-    states,
-    stateRoot,
-    recordingsDir,
-    advance: (ms) => {
-      clock += ms;
+    deps: {
+      transcriber: options.withTranscriber === false ? undefined : transcriber,
+      openAudioCapture: options.withCapture === false ? undefined : openAudioCapture,
+      transcriptLog,
+      transcriptWindow: createTranscriptWindow(),
+      onTranscript: (entry) => broadcast.push(entry),
+      onInterim: (channel, text) => interims.push({ channel, text }),
+      onStateChange: (state) => states.push(state),
+      now: () => SOCKET_OPENED_AT,
+      newSessionId: (() => {
+        let n = 0;
+        return () => `session-${(n += 1)}`;
+      })(),
     },
-    readIndex: () => recordingLog.readIndex(),
+    streams,
+    captures,
+    appended,
+    broadcast,
+    interims,
+    states,
+    stream(channel) {
+      const found = streams.find((s) => s.channel === channel);
+      assert.ok(found !== undefined, `no stream opened for channel "${channel}"`);
+      return found;
+    },
+    capture() {
+      const found = captures[captures.length - 1];
+      assert.ok(found !== undefined, 'no capture was opened');
+      return found;
+    },
   };
 }
 
-describe('RecordingCoordinator', () => {
-  it('is unavailable, and stays off, when no recorder opener was wired', async (t) => {
-    const { coordinator } = await harness(t, { withRecorder: false });
+describe('createRecordingCoordinator', () => {
+  describe('availability', () => {
+    it('reports unavailable and opens nothing when there is no transcriber', async () => {
+      const h = harness({ withTranscriber: false });
+      const coordinator = createRecordingCoordinator(h.deps);
 
-    assert.equal(coordinator.snapshot().state, 'unavailable');
-    const after = await coordinator.start();
-    assert.equal(after.state, 'unavailable');
-  });
-
-  it('opens a segment on start and writes its chunks to disk as they arrive', async (t) => {
-    const h = await harness(t);
-
-    await h.coordinator.start();
-    assert.equal(h.coordinator.snapshot().state, 'recording');
-    assert.equal(h.coordinator.snapshot().segmentId, 'seg-1');
-
-    h.renderer.emit(1_000);
-    h.renderer.emit(500);
-    await h.coordinator.drain();
-
-    // The crash-safety property, asserted directly: the bytes are on disk
-    // *while* the recording is still going, not only once it stops.
-    const bytes = await readFile(join(h.recordingsDir, 'seg-1.webm'));
-    assert.equal(bytes.byteLength, 1_500);
-    assert.equal(h.coordinator.snapshot().state, 'recording');
-  });
-
-  it("writes the segment's index line before any of its bytes exist, so a crashed segment is still listed", async (t) => {
-    const h = await harness(t);
-
-    await h.coordinator.start();
-    // Nothing emitted yet, nothing drained -- and the index already knows.
-    const index = await h.readIndex();
-    assert.equal(index.length, 1);
-    assert.equal(index[0]?.id, 'seg-1');
-    assert.equal(index[0]?.endedAt, null);
-    assert.equal(index[0]?.mimeType, 'video/webm;codecs=vp9');
-    assert.deepEqual(index[0]?.target, KATA_TAB);
-  });
-
-  it('is idempotent while already recording', async (t) => {
-    const h = await harness(t);
-
-    await h.coordinator.start();
-    await h.coordinator.start();
-
-    assert.deepEqual(h.renderer.opens, ['seg-1']);
-    assert.equal(h.coordinator.snapshot().segmentId, 'seg-1');
-  });
-
-  it('rolls to a fresh segment once the configured duration elapses, closing out the old one', async (t) => {
-    const h = await harness(t, { segmentSeconds: 60 });
-
-    await h.coordinator.start();
-    h.renderer.emit(2_000);
-
-    h.advance(30_000);
-    await h.coordinator.tick();
-    assert.equal(h.coordinator.snapshot().segmentId, 'seg-1', 'not yet at the boundary');
-
-    h.advance(30_000);
-    await h.coordinator.tick();
-    await h.coordinator.drain();
-
-    assert.equal(h.coordinator.snapshot().segmentId, 'seg-2');
-    assert.equal(h.coordinator.snapshot().state, 'recording');
-
-    const index = await h.readIndex();
-    const first = index.find((segment) => segment.id === 'seg-1');
-    const second = index.find((segment) => segment.id === 'seg-2');
-
-    // The outgoing segment is complete: closed, with its final chunk counted.
-    assert.notEqual(first?.endedAt, null);
-    assert.equal(first?.bytes, 2_001, 'the 2000-byte tick plus the 1-byte final flush');
-    assert.equal(first?.durationMs, 60_000);
-    // And the incoming one is open, so the two never overlap.
-    assert.equal(second?.endedAt, null);
-  });
-
-  it('rolls on the byte cap even when almost no time has passed', async (t) => {
-    // A real 256 MiB segment is not something to write in a unit test, and
-    // emitting it as one synchronous chunk would trip the writer's *queue*
-    // bound long before the segment bound -- the two measure different things
-    // (see `maxSegmentBytes`'s doc comment). A small injected cap reaches the
-    // branch honestly.
-    const h = await harness(t, { segmentSeconds: 3_600, maxSegmentBytes: 4_096 });
-
-    await h.coordinator.start();
-    h.renderer.emit(5_000);
-    h.advance(1_000);
-    await h.coordinator.tick();
-    await h.coordinator.drain();
-
-    assert.equal(h.coordinator.snapshot().segmentId, 'seg-2');
-    assert.equal(h.coordinator.snapshot().state, 'recording');
-  });
-
-  it('stops and reports an error when the disk falls far enough behind to threaten memory', async (t) => {
-    const h = await harness(t);
-
-    await h.coordinator.start();
-    // One synchronous burst past the queue bound, with nothing draining it --
-    // the shape a stalled disk produces. The recorder must refuse rather than
-    // grow until the process dies.
-    h.renderer.emit(65 * 1024 * 1024);
-
-    const snapshot = h.coordinator.snapshot();
-    assert.equal(snapshot.state, 'error');
-    assert.match(snapshot.reason ?? '', /not keeping up/);
-  });
-
-  it('flushes the final chunk and returns to off on stop', async (t) => {
-    const h = await harness(t);
-
-    await h.coordinator.start();
-    h.renderer.emit(4_000);
-    await h.coordinator.stop();
-    await h.coordinator.drain();
-
-    assert.equal(h.coordinator.snapshot().state, 'off');
-    assert.equal(h.coordinator.snapshot().segmentId, null);
-
-    const index = await h.readIndex();
-    assert.equal(index[0]?.bytes, 4_001, 'the tick plus the close flush');
-    assert.notEqual(index[0]?.endedAt, null);
-  });
-
-  it('goes to error when the renderer reports a mid-session failure', async (t) => {
-    const h = await harness(t);
-
-    await h.coordinator.start();
-    h.renderer.fail('the MediaRecorder errored');
-
-    const snapshot = h.coordinator.snapshot();
-    assert.equal(snapshot.state, 'error');
-    assert.equal(snapshot.reason, 'the MediaRecorder errored');
-  });
-
-  it('ignores the renderer failure that a deliberate stop provokes, rather than latching error', async (t) => {
-    const h = await harness(t);
-    await h.coordinator.start();
-
-    // The real renderer reports "capture stream stopped underneath the active
-    // recording" whenever tracks are torn down while a recorder is live --
-    // including during a stop we asked for. That must not strand the user in
-    // `error` after an ordinary stop.
-    const stopping = h.coordinator.stop();
-    h.renderer.fail('capture stream stopped underneath the active recording');
-    await stopping;
-
-    assert.equal(h.coordinator.snapshot().state, 'off');
-    assert.equal(h.coordinator.snapshot().reason, null);
-  });
-
-  it('clears a standing error on the next deliberate stop, so a fresh start is possible', async (t) => {
-    const h = await harness(t);
-
-    await h.coordinator.start();
-    h.renderer.fail('disk went away');
-    assert.equal(h.coordinator.snapshot().state, 'error');
-
-    await h.coordinator.stop();
-    assert.equal(h.coordinator.snapshot().state, 'off');
-
-    await h.coordinator.start();
-    assert.equal(h.coordinator.snapshot().state, 'recording');
-  });
-
-  describe('following the capture session', () => {
-    it('stops when the capture stream goes away', async (t) => {
-      const h = await harness(t, { enabled: true });
-
-      await h.coordinator.start();
-      await h.coordinator.onCaptureSessionChange(null);
-
-      assert.equal(h.coordinator.snapshot().state, 'off');
-      // Called *before* the stream actually closes, so the flush landed.
-      await h.coordinator.drain();
-      const index = await h.readIndex();
-      assert.notEqual(index[0]?.endedAt, null, 'the segment was closed out cleanly, not left dangling');
+      assert.equal(coordinator.state(), 'unavailable');
+      assert.equal(await coordinator.start(), 'unavailable');
+      assert.equal(h.streams.length, 0);
+      assert.equal(h.captures.length, 0);
     });
 
-    it('starts automatically on a fresh stream when enabled', async (t) => {
-      const h = await harness(t, { enabled: true });
+    it('reports unavailable when there is no capture opener', async () => {
+      const h = harness({ withCapture: false });
+      const coordinator = createRecordingCoordinator(h.deps);
 
-      await h.coordinator.onCaptureSessionChange(KATA_TAB);
-
-      assert.equal(h.coordinator.snapshot().state, 'recording');
+      assert.equal(coordinator.state(), 'unavailable');
+      assert.equal(await coordinator.start(), 'unavailable');
+      assert.equal(h.streams.length, 0);
     });
 
-    it('does not start itself on a fresh stream when disabled', async (t) => {
-      const h = await harness(t, { enabled: false });
-
-      await h.coordinator.onCaptureSessionChange(KATA_TAB);
-
-      assert.equal(h.coordinator.snapshot().state, 'off');
-      assert.deepEqual(h.renderer.opens, []);
-    });
-
-    it('restarts into a new segment when the target changes, so one segment is never two windows', async (t) => {
-      const h = await harness(t, { enabled: true });
-
-      await h.coordinator.start();
-      h.renderer.emit(1_000);
-      await h.coordinator.onCaptureSessionChange(null);
-      await h.coordinator.onCaptureSessionChange(KATA_TAB);
-      await h.coordinator.drain();
-
-      assert.deepEqual(h.renderer.opens, ['seg-1', 'seg-2']);
-      const index = await h.readIndex();
-      assert.equal(index.length, 2);
-      assert.notEqual(
-        index.find((segment) => segment.id === 'seg-1')?.endedAt,
-        null,
-        'the pre-change segment is complete',
-      );
+    it('starts off when fully wired', () => {
+      const h = harness();
+      assert.equal(createRecordingCoordinator(h.deps).state(), 'off');
     });
   });
 
-  describe('retention', () => {
-    it('prunes the oldest segments past the byte budget, and never the open one', async (t) => {
-      const h = await harness(t, { segmentSeconds: 60, retentionBytes: 5_000 });
+  describe('starting and stopping', () => {
+    it('opens exactly one capture and one stream per recorded channel', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
 
-      await h.coordinator.start();
-      // Three complete segments of ~3000 bytes each, then a fourth left open.
-      for (let i = 0; i < 3; i += 1) {
-        h.renderer.emit(3_000);
-        h.advance(60_000);
-        await h.coordinator.tick();
-        await h.coordinator.drain();
-      }
-
-      const index = await h.readIndex();
-      const ids = index.map((segment) => segment.id).sort();
-      // seg-1 and seg-2 are past the 5000-byte budget; seg-3 fits; seg-4 is
-      // open and exempt regardless.
-      assert.deepEqual(ids, ['seg-3', 'seg-4']);
-
-      await assert.rejects(readFile(join(h.recordingsDir, 'seg-1.webm')), 'the file itself is gone');
+      assert.equal(h.captures.length, 1);
+      assert.deepEqual(h.streams.map((s) => s.channel), ['them']);
     });
 
-    it('leaves everything alone when the budget is generous', async (t) => {
-      const h = await harness(t, { segmentSeconds: 60, retentionBytes: 1_000_000 });
+    it('is starting until the socket reports itself open, then on', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
+      assert.equal(coordinator.state(), 'starting');
 
-      await h.coordinator.start();
-      h.renderer.emit(3_000);
-      h.advance(60_000);
-      await h.coordinator.tick();
-      await h.coordinator.drain();
+      h.stream('them').emit({ type: 'open' });
+      assert.equal(coordinator.state(), 'on');
+      assert.deepEqual(h.states, ['starting', 'on']);
+    });
 
-      assert.equal((await h.readIndex()).length, 2);
+    it('mints a fresh session id per start', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
+      assert.equal(coordinator.sessionId(), 'session-1');
+
+      await coordinator.stop();
+      assert.equal(coordinator.sessionId(), null);
+
+      await coordinator.start();
+      assert.equal(coordinator.sessionId(), 'session-2');
+    });
+
+    it('a second start while already recording is a no-op, never a second set of sockets', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
+      h.stream('them').emit({ type: 'open' });
+
+      await coordinator.start();
+      await coordinator.start();
+
+      assert.equal(h.streams.length, 1);
+      assert.equal(h.captures.length, 1);
+    });
+
+    it('two overlapping starts still open only one session', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await Promise.all([coordinator.start(), coordinator.start()]);
+
+      assert.equal(h.streams.length, 1);
+      assert.equal(h.captures.length, 1);
+    });
+
+    it('stop() closes the capture and every stream, and returns to off', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
+      h.stream('them').emit({ type: 'open' });
+      await coordinator.stop();
+
+      assert.equal(h.capture().closeCalls, 1);
+      assert.equal(h.stream('them').closeCalls, 1);
+      assert.equal(coordinator.state(), 'off');
+    });
+
+    it('stop() on a coordinator that never started does nothing', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.stop();
+      assert.equal(coordinator.state(), 'off');
+      assert.equal(h.captures.length, 0);
+    });
+
+    it('goes to error and tears down when audio capture cannot be opened', async () => {
+      const h = harness({ captureThrows: true });
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
+
+      assert.equal(coordinator.state(), 'error');
+      // The streams that were already opened must not be left dangling.
+      assert.equal(h.stream('them').closeCalls, 1);
     });
   });
 
-  describe('reconcile', () => {
-    it('closes out a segment left open by an unclean exit, measuring the file that survived', async (t) => {
-      const h = await harness(t);
+  describe('routing audio', () => {
+    it('sends each chunk to the stream for its own channel', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
 
-      // Exactly the on-disk state a `kill -9` mid-segment leaves behind: an
-      // `opened` line, real bytes, and no `closed` line.
-      await h.coordinator.start();
-      h.renderer.emit(7_000);
-      await h.coordinator.drain();
+      h.capture().push('them', new Uint8Array([1, 2]));
+      h.capture().push('them', new Uint8Array([3, 4]));
 
-      const revived = await harness(t, {});
-      await writeFile(join(revived.recordingsDir, 'seg-1.webm'), Buffer.alloc(7_000)).catch(
-        () => {},
-      );
-
-      await h.coordinator.reconcile();
-
-      const index = await h.readIndex();
-      const segment = index.find((candidate) => candidate.id === 'seg-1');
-      assert.notEqual(segment?.endedAt, null, 'it was closed out');
-      assert.equal(segment?.bytes, 7_000, 'measured from the file, not guessed');
-      assert.equal(segment?.recovered, true, '"the process died" stays distinguishable from "the user stopped"');
+      assert.deepEqual(h.stream('them').pcm, [new Uint8Array([1, 2]), new Uint8Array([3, 4])]);
     });
 
-    it('tombstones an indexed segment whose file no longer exists', async (t) => {
-      const h = await harness(t);
+    it('drops a chunk for a channel this session did not open, rather than throwing in the audio callback', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
 
-      await h.coordinator.start();
-      await h.coordinator.drain();
-      // The `opened` line outlived its file -- a hand-deleted recording.
-      await h.coordinator.stop();
-      await h.coordinator.drain();
-      const { unlink } = await import('node:fs/promises');
-      await unlink(join(h.recordingsDir, 'seg-1.webm'));
+      assert.doesNotThrow(() => h.capture().push('me', new Uint8Array([9])));
+      assert.equal(h.stream('them').pcm.length, 0);
+    });
+  });
 
-      // Re-open the segment's index state by appending a fresh `opened` with no
-      // file behind it at all.
-      const log = createRecordingLog({ stateRoot: h.stateRoot });
-      await log.append({
-        type: 'opened',
-        id: 'ghost',
-        startedAt: '2026-08-12T08:00:00.000Z',
-        mimeType: 'video/webm',
-        target: null,
+  describe('transcript events', () => {
+    it('persists, broadcasts, and windows exactly one entry per final', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
+      const stream = h.stream('them');
+      stream.emit({ type: 'open' });
+
+      stream.emit({ type: 'final', text: 'reverse a linked list', startSeconds: 2, endSeconds: 4 });
+      await coordinator.drain();
+
+      assert.equal(h.appended.length, 1);
+      assert.equal(h.broadcast.length, 1);
+      assert.deepEqual(h.appended[0], {
+        recordingSessionId: 'session-1',
+        channel: 'them',
+        text: 'reverse a linked list',
+        // The socket opened at 09:00:00 and the segment ends 4s in.
+        timestamp: '2026-08-11T09:00:04.000Z',
+        startSeconds: 2,
+        endSeconds: 4,
+        model: 'nova-3',
       });
-
-      await h.coordinator.reconcile();
-
-      const index = await h.readIndex();
-      assert.equal(
-        index.some((segment) => segment.id === 'ghost'),
-        false,
-        'the index stops advertising a recording that cannot be played',
-      );
+      assert.equal(h.deps.transcriptWindow?.render(DURING_SESSION), 'Them: reverse a linked list');
     });
-  });
 
-  it('publishes a snapshot on every state change, for the SSE wire', async (t) => {
-    const h = await harness(t);
+    it('broadcasts an interim without persisting or windowing it', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
+      const stream = h.stream('them');
+      stream.emit({ type: 'open' });
 
-    await h.coordinator.start();
-    await h.coordinator.stop();
+      stream.emit({ type: 'interim', text: 'reverse a link' });
+      await coordinator.drain();
 
-    const states = h.states.map((snapshot) => snapshot.state);
-    assert.deepEqual(states.slice(0, 3), ['starting', 'recording', 'off']);
+      assert.deepEqual(h.interims, [{ channel: 'them', text: 'reverse a link' }]);
+      assert.equal(h.appended.length, 0);
+      assert.equal(h.deps.transcriptWindow?.render(DURING_SESSION), null);
+    });
+
+    it('writes in call order even when finals arrive back to back', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
+      const stream = h.stream('them');
+      stream.emit({ type: 'open' });
+
+      for (const text of ['one', 'two', 'three', 'four']) {
+        stream.emit({ type: 'final', text, startSeconds: 0, endSeconds: 1 });
+      }
+      await coordinator.drain();
+
+      assert.deepEqual(h.appended.map((e) => e.text), ['one', 'two', 'three', 'four']);
+    });
+
+    it('one failed append does not wedge the chain for later lines', async () => {
+      const h = harness({ appendThrows: true });
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
+      const stream = h.stream('them');
+      stream.emit({ type: 'open' });
+
+      stream.emit({ type: 'final', text: 'first', startSeconds: 0, endSeconds: 1 });
+      stream.emit({ type: 'final', text: 'second', startSeconds: 1, endSeconds: 2 });
+
+      // The whole point: drain() still resolves rather than rejecting or hanging.
+      await coordinator.drain();
+      assert.equal(h.broadcast.length, 2, 'the wire is unaffected by a disk failure');
+    });
+
+    it('moves to reconnecting and back to on across a dropped socket', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
+      const stream = h.stream('them');
+      stream.emit({ type: 'open' });
+
+      stream.emit({ type: 'reconnecting', attempt: 1 });
+      assert.equal(coordinator.state(), 'reconnecting');
+
+      stream.emit({ type: 'open' });
+      assert.equal(coordinator.state(), 'on');
+      assert.deepEqual(h.states, ['starting', 'on', 'reconnecting', 'on']);
+    });
+
+    it('goes to error on a rejected key', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
+
+      h.stream('them').emit({ type: 'error', kind: 'auth', message: 'bad key' });
+      assert.equal(coordinator.state(), 'error');
+    });
+
+    it('clears the solve window when recording stops, so the next session starts clean', async () => {
+      const h = harness();
+      const coordinator = createRecordingCoordinator(h.deps);
+      await coordinator.start();
+      const stream = h.stream('them');
+      stream.emit({ type: 'open' });
+      stream.emit({ type: 'final', text: 'last session', startSeconds: 0, endSeconds: 1 });
+      await coordinator.drain();
+
+      await coordinator.stop();
+      assert.equal(h.deps.transcriptWindow?.render(DURING_SESSION), null);
+    });
   });
 });

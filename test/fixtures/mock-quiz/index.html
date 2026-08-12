@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Replaced per problem by quiz-page.js with that problem's own
+         `screen.windowTitle`, so the browser window Screen Solver is asked to
+         watch is named the same thing the fixture calls it. -->
+    <title>Screen Solver mock quiz</title>
+    <link rel="stylesheet" href="./quiz-page.css" />
+  </head>
+  <body>
+    <!--
+      The rig bar. Everything in here is furniture, not the exercise -- the
+      system prompt tells the model to ignore site navigation and chrome, and
+      this is deliberately shaped like more of it.
+
+      What it must never show while a problem is being solved: the spoken
+      script, and the expected answer. A voice-only problem whose script is
+      printed on the page is a screen problem wearing a disguise, and it would
+      quietly pass a test the app should fail. Both live behind the panel at
+      the bottom, closed by default, with a warning when it is open.
+    -->
+    <header id="rig" class="rig">
+      <div class="rig-row">
+        <span class="rig-brand">mock quiz</span>
+        <span id="rig-position" class="rig-position"></span>
+        <span id="rig-kind" class="rig-kind"></span>
+        <span id="rig-press" class="rig-press"></span>
+        <div class="rig-actions">
+          <button id="prev-problem" type="button" title="Previous problem (←)">←</button>
+          <button id="next-problem" type="button" title="Next problem (→)">→</button>
+          <button id="speak" type="button" title="Speak this problem's lines (s)">Speak</button>
+          <button id="stop-speaking" type="button" title="Stop speaking" disabled>Stop</button>
+          <button id="present" type="button" title="Hide this bar (p)">Hide bar</button>
+        </div>
+      </div>
+      <div class="rig-row rig-row-secondary">
+        <label class="rig-field">
+          Voice
+          <select id="voice-select"></select>
+        </label>
+        <label class="rig-field">
+          Rate
+          <input id="rate" type="range" min="0.6" max="1.4" step="0.05" value="1" />
+        </label>
+        <span id="speech-status" class="rig-status">Idle.</span>
+      </div>
+    </header>
+
+    <!-- The problem itself: a fake kata page, or a fake page with no kata on
+         it. Drawn entirely by quiz-page.js from quiz.json. -->
+    <main id="stage" class="stage" aria-live="off"></main>
+
+    <details id="crib" class="crib">
+      <summary>Script &amp; expected answer — visible on screen while open</summary>
+      <div class="crib-warning">
+        Close this before pressing Solve. Anything in here is in the screenshot,
+        which turns a voice problem into a screen problem and a graded run into
+        a copy of the answer key.
+      </div>
+      <div id="crib-body"></div>
+    </details>
+
+    <script src="./quiz-page.js"></script>
+  </body>
+</html>

@@ -88,7 +88,7 @@ export function createProvider(config: ProviderConfig): Provider {
   };
   const system: readonly SystemBlock[] = Object.freeze([systemBlock]);
 
-  function buildRequest(image: SolveImage): MessagesRequest {
+  function buildRequest(image: SolveImage | null, transcript: string | undefined): MessagesRequest {
     return {
       model,
       max_tokens: maxTokens,
@@ -96,18 +96,40 @@ export function createProvider(config: ProviderConfig): Provider {
       system,
       // The image differs every call and so sits after the cached prefix,
       // which is where the render order (tools → system → messages) puts it.
+      //
+      // The transcript, when there is one, follows the image rather than
+      // preceding it: images before text matches Anthropic's own guidance, and
+      // it keeps the screenshot — which the system prompt names as
+      // authoritative — as the first thing the model reads. Both blocks sit
+      // after the cached system prefix, so adding one costs nothing in cache
+      // hits; a request with no transcript is byte-identical to what this
+      // built before the option existed.
+      //
+      // A spoken-only solve (`image === null`) simply omits the image block,
+      // leaving the transcript as the whole user turn. That absence is the
+      // *only* signal the model gets that there is no screen — there is no
+      // second system prompt and no flag in the body, for the cache reason
+      // `system-prompt.ts` documents. Dropping the block rather than sending a
+      // placeholder image also means a spoken-only call costs no image tokens.
       messages: [
         {
           role: 'user',
           content: [
-            {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: image.mediaType,
-                data: Buffer.from(image.bytes).toString('base64'),
-              },
-            },
+            ...(image === null
+              ? []
+              : [
+                  {
+                    type: 'image' as const,
+                    source: {
+                      type: 'base64' as const,
+                      media_type: image.mediaType,
+                      data: Buffer.from(image.bytes).toString('base64'),
+                    },
+                  },
+                ]),
+            ...(transcript === undefined || transcript === ''
+              ? []
+              : [{ type: 'text' as const, text: wrapTranscript(transcript) }]),
           ],
         },
       ],
@@ -115,12 +137,31 @@ export function createProvider(config: ProviderConfig): Provider {
     };
   }
 
-  async function* solve(image: SolveImage, options: SolveOptions = {}): AsyncGenerator<SolveEvent> {
+  async function* solve(
+    image: SolveImage | null,
+    options: SolveOptions = {},
+  ): AsyncGenerator<SolveEvent> {
     const signal = options.signal;
     // A call, not a comparison: the abort can land between any two statements,
     // so the check must be re-evaluated rather than narrowed away.
     const aborted = (): boolean => signal?.aborted === true;
-    const body = buildRequest(image);
+
+    // Neither a screen nor speech: there is no question in this request at
+    // all. Refused here rather than sent, since the model can only answer it
+    // with a guess and the caller would still be billed for asking. Callers
+    // are expected to have checked (`POST /solve/transcript-only` answers
+    // `400 no_transcript`), so this is a bug guard, not a user-facing path --
+    // hence `transient`, the taxonomy's own catch-all, rather than a new kind.
+    if (image === null && (options.transcript === undefined || options.transcript === '')) {
+      yield {
+        type: 'error',
+        kind: 'transient',
+        message: 'A solve needs either a screenshot or a transcript; this request had neither.',
+      };
+      return;
+    }
+
+    const body = buildRequest(image, options.transcript);
 
     for (let attempt = 0; ; attempt += 1) {
       if (aborted()) return;
@@ -212,6 +253,15 @@ export function createProvider(config: ProviderConfig): Provider {
   }
 
   return Object.freeze({ model, solve });
+}
+
+/**
+ * The tag pair the system prompt tells the model to expect. Fixed here rather
+ * than in `system-prompt.ts` because it is request mechanics — the two have to
+ * agree, and this is the side that actually emits it.
+ */
+function wrapTranscript(transcript: string): string {
+  return `<recent_transcript>\n${transcript}\n</recent_transcript>`;
 }
 
 interface MutableUsage {

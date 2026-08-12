@@ -11,6 +11,7 @@ import { startHttpServer, type ListeningHttpServer } from '../../src/host/http/s
 import { silentLogger } from '../../src/host/logger.ts';
 import { ANSWER_LOG_FILE_NAME, createAnswerLog } from '../../src/host/logs/answer-log.ts';
 import { createSolveLogRecorder } from '../../src/host/logs/recorder.ts';
+import { NO_QUESTION_TITLE } from '../../src/host/logs/title.ts';
 import type { AnswerLogEntry, UsageLogEntry } from '../../src/host/logs/types.ts';
 import { createUsageLog, USAGE_LOG_FILE_NAME } from '../../src/host/logs/usage-log.ts';
 import type { Provider, SolveEvent, SolveImage } from '../../src/host/provider/types.ts';
@@ -56,7 +57,8 @@ function fakeCaptureCoordinator(captureFrame: () => Promise<CapturedFrame | null
 }
 
 interface ScriptedCall {
-  readonly image: SolveImage;
+  /** `null` for a spoken-only solve. */
+  readonly image: SolveImage | null;
   readonly signal: AbortSignal | undefined;
   push(event: SolveEvent): void;
 }
@@ -422,6 +424,70 @@ describe('answers.jsonl / usage.jsonl', () => {
     const response = await fetch(`${h.server.url}/answers`);
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), []);
+  });
+});
+
+describe('recorder: target: null for a spoken-only solve', () => {
+  // Recorder-level rather than HTTP-level -- `SolveOutcomeEvent.target` is the
+  // fact under test, and `createSolveLogRecorder` is the one thing that reads
+  // it, so these build the event by hand instead of driving a full
+  // `/solve/transcript-only` request through the loop.
+
+  it('a done outcome with target: null writes target: null into both usage.jsonl and answers.jsonl, as a real field rather than an omission', async (t) => {
+    const stateRoot = await tempStateRoot(t);
+    const answerLog = createAnswerLog({ stateRoot });
+    const usageLog = createUsageLog({ stateRoot });
+    const recorder = createSolveLogRecorder({ answerLog, usageLog, logger: silentLogger });
+
+    const event: SolveOutcomeEvent = {
+      outcome: {
+        type: 'done',
+        text: '# What is the time complexity of quicksort\nO(n log n) on average.',
+        usage: USAGE,
+        stopReason: 'end_turn',
+      },
+      target: null,
+      model: MODEL,
+    };
+    await recorder.record(event);
+
+    const answers = await readJsonlLines<AnswerLogEntry>(join(stateRoot, ANSWER_LOG_FILE_NAME));
+    assert.equal(answers.length, 1);
+    assert.ok(answers[0] !== undefined && 'target' in answers[0], 'the field is present, not omitted');
+    assert.equal(answers[0]?.target, null);
+
+    const usageEntries = await readJsonlLines<UsageLogEntry>(join(stateRoot, USAGE_LOG_FILE_NAME));
+    assert.equal(usageEntries.length, 1);
+    assert.ok(usageEntries[0] !== undefined && 'target' in usageEntries[0], 'the field is present, not omitted');
+    assert.equal(usageEntries[0]?.target, null);
+  });
+
+  it('a done outcome titled "# No question in the recent speech" is a bail, exactly like "# No exercise on screen": usage.jsonl gets bail:true and no answers.jsonl line', async (t) => {
+    const stateRoot = await tempStateRoot(t);
+    const answerLog = createAnswerLog({ stateRoot });
+    const usageLog = createUsageLog({ stateRoot });
+    const recorder = createSolveLogRecorder({ answerLog, usageLog, logger: silentLogger });
+
+    const event: SolveOutcomeEvent = {
+      outcome: {
+        type: 'done',
+        text: `# ${NO_QUESTION_TITLE}\nNothing was asked.`,
+        usage: USAGE,
+        stopReason: 'end_turn',
+      },
+      target: null,
+      model: MODEL,
+    };
+    await recorder.record(event);
+
+    const answers = await readJsonlLines<AnswerLogEntry>(join(stateRoot, ANSWER_LOG_FILE_NAME));
+    assert.equal(answers.length, 0, 'a spoken-only bail never gets an answers.jsonl entry');
+
+    const usageEntries = await readJsonlLines<UsageLogEntry>(join(stateRoot, USAGE_LOG_FILE_NAME));
+    assert.equal(usageEntries.length, 1, 'a bail still spends a call and is recorded in usage.jsonl');
+    assert.equal(usageEntries[0]?.outcome, 'done');
+    assert.equal(usageEntries[0]?.bail, true);
+    assert.equal(usageEntries[0]?.target, null);
   });
 });
 

@@ -2,15 +2,15 @@ import { randomUUID } from 'node:crypto';
 import { stat } from 'node:fs/promises';
 import type { TargetWindowIdentity } from '../config/types.ts';
 import { silentLogger, type Logger } from '../logger.ts';
-import type { RecordingLog } from '../logs/recording-log.ts';
-import type { RecordingSegment } from '../logs/types.ts';
+import type { ScreenRecordingLog } from '../logs/screen-recording-log.ts';
+import type { ScreenRecordingSegment } from '../logs/types.ts';
 import { selectSegmentsToPrune } from './retention.ts';
 import { shouldRollSegment } from './segment-policy.ts';
 import { extensionFor, type SegmentWriter } from './segment-writer.ts';
 import type { OpenRecorder, Recorder, SegmentId } from './types.ts';
 
 /**
- * The recording session lifecycle (#45).
+ * The recording session lifecycle (#47).
  *
  * Structurally `capture/session-coordinator.ts`'s sibling: one long-lived thing
  * held open, every real capability injected so the whole state machine runs in
@@ -20,7 +20,7 @@ import type { OpenRecorder, Recorder, SegmentId } from './types.ts';
  * -- there is nothing to record when no stream is open -- plus an explicit
  * on/off the user controls.
  *
- * Recording is off until something turns it on, and `RecordingSettings.enabled`
+ * Recording is off until something turns it on, and `ScreenRecordingSettings.enabled`
  * is what makes that automatic across restarts. That is a deliberate departure
  * from `feat/audio-transcript`'s "never persisted" rule, argued in
  * `config/types.ts`: automatic recording is this ticket's entire premise, and
@@ -28,7 +28,7 @@ import type { OpenRecorder, Recorder, SegmentId } from './types.ts';
  * indicator and a conspicuous live REC state in the client instead.
  */
 
-export type RecordingState =
+export type ScreenRecordingState =
   /** Not recording. The resting state, and where a clean stop lands. */
   | 'off'
   /** `start()` is in flight -- the renderer hasn't confirmed a `MediaRecorder` yet. */
@@ -40,8 +40,8 @@ export type RecordingState =
   /** A terminal failure (disk full, write backlog, renderer error). Recoverable by fixing it and starting again. */
   | 'error';
 
-export interface RecordingSnapshot {
-  readonly state: RecordingState;
+export interface ScreenRecordingSnapshot {
+  readonly state: ScreenRecordingState;
   readonly segmentId: SegmentId | null;
   readonly bytes: number;
   /** ISO 8601 for when the *session* started (not the current segment). */
@@ -50,8 +50,8 @@ export interface RecordingSnapshot {
   readonly reason: string | null;
 }
 
-export interface RecordingCoordinator {
-  snapshot(): RecordingSnapshot;
+export interface ScreenRecordingCoordinator {
+  snapshot(): ScreenRecordingSnapshot;
   /**
    * Subscribes to state changes. Call the returned function to unsubscribe.
    *
@@ -62,9 +62,9 @@ export interface RecordingCoordinator {
    * has nothing to hand a callback at construction time. Subscribing after the
    * fact breaks that cycle without a mutable trampoline.
    */
-  onStateChange(listener: (snapshot: RecordingSnapshot) => void): () => void;
+  onStateChange(listener: (snapshot: ScreenRecordingSnapshot) => void): () => void;
   /** Idempotent while already recording. Resolves once a segment is open, not once bytes arrive. */
-  start(): Promise<RecordingSnapshot>;
+  start(): Promise<ScreenRecordingSnapshot>;
   /** Flushes the open segment and returns to `off`. Idempotent. */
   stop(): Promise<void>;
   /**
@@ -104,9 +104,9 @@ export interface RecordingCoordinator {
   drain(): Promise<void>;
 }
 
-export interface RecordingCoordinatorDeps {
+export interface ScreenRecordingCoordinatorDeps {
   readonly writer: SegmentWriter;
-  readonly recordingLog: RecordingLog;
+  readonly screenRecordingLog: ScreenRecordingLog;
   /** Left unset, recording is `'unavailable'` -- the "safe default that just does less" every optional dep in this repo uses. */
   readonly openRecorder?: OpenRecorder;
   /** Reads the live settings each time they're needed, so a change takes effect without restarting the coordinator. */
@@ -152,14 +152,14 @@ const DEFAULT_TIMESLICE_MS = 1_000;
 /** How often the roll/retention clock runs. Well under the smallest allowed `segmentSeconds`. */
 const TICK_MS = 1_000;
 
-export function createRecordingCoordinator(deps: RecordingCoordinatorDeps): RecordingCoordinator {
+export function createScreenRecordingCoordinator(deps: ScreenRecordingCoordinatorDeps): ScreenRecordingCoordinator {
   const logger = deps.logger ?? silentLogger;
   const now = deps.now ?? (() => new Date());
   const newSegmentId = deps.newSegmentId ?? (() => randomUUID());
   const timesliceMs = deps.timesliceMs ?? DEFAULT_TIMESLICE_MS;
   const fileSize = deps.fileSize ?? (async (path: string) => (await stat(path)).size);
 
-  let state: RecordingState = deps.openRecorder === undefined ? 'unavailable' : 'off';
+  let state: ScreenRecordingState = deps.openRecorder === undefined ? 'unavailable' : 'off';
   let reason: string | null = null;
   let recorder: Recorder | null = null;
   let segmentId: SegmentId | null = null;
@@ -181,7 +181,7 @@ export function createRecordingCoordinator(deps: RecordingCoordinatorDeps): Reco
   let stopping = false;
   /** Serializes start/stop/roll so two of them can never interleave on one recorder. */
   let transition: Promise<void> = Promise.resolve();
-  const listeners = new Set<(snapshot: RecordingSnapshot) => void>();
+  const listeners = new Set<(snapshot: ScreenRecordingSnapshot) => void>();
 
   function publish(): void {
     const current = snapshot();
@@ -196,7 +196,7 @@ export function createRecordingCoordinator(deps: RecordingCoordinatorDeps): Reco
     }
   }
 
-  function snapshot(): RecordingSnapshot {
+  function snapshot(): ScreenRecordingSnapshot {
     return {
       state,
       segmentId,
@@ -206,7 +206,7 @@ export function createRecordingCoordinator(deps: RecordingCoordinatorDeps): Reco
     };
   }
 
-  function setState(next: RecordingState, nextReason: string | null = null): void {
+  function setState(next: ScreenRecordingState, nextReason: string | null = null): void {
     // Suppressed no-op transitions, for `solve/status.ts`'s reason: the caller
     // shouldn't have to diff snapshots just to avoid a duplicate SSE frame.
     if (state === next && reason === nextReason) return;
@@ -321,9 +321,9 @@ export function createRecordingCoordinator(deps: RecordingCoordinatorDeps): Reco
   /** Applies the retention limits. Failures are logged, never fatal -- a full disk is already being handled elsewhere. */
   async function pruneToLimits(): Promise<void> {
     const settings = deps.settings();
-    let index: readonly RecordingSegment[];
+    let index: readonly ScreenRecordingSegment[];
     try {
-      index = await deps.recordingLog.readIndex();
+      index = await deps.screenRecordingLog.readIndex();
     } catch (error) {
       logger.error(`recording: could not read the index to apply retention: ${describeError(error)}`);
       return;
@@ -345,7 +345,7 @@ export function createRecordingCoordinator(deps: RecordingCoordinatorDeps): Reco
     }
   }
 
-  function startRecording(): Promise<RecordingSnapshot> {
+  function startRecording(): Promise<ScreenRecordingSnapshot> {
     return serialize(async () => {
         if (state === 'unavailable') return;
         if (state === 'recording' || state === 'starting') return;
@@ -423,7 +423,7 @@ export function createRecordingCoordinator(deps: RecordingCoordinatorDeps): Reco
   return {
     snapshot,
 
-    onStateChange(listener: (snapshot: RecordingSnapshot) => void): () => void {
+    onStateChange(listener: (snapshot: ScreenRecordingSnapshot) => void): () => void {
       listeners.add(listener);
       return () => {
         listeners.delete(listener);
@@ -464,9 +464,9 @@ export function createRecordingCoordinator(deps: RecordingCoordinatorDeps): Reco
       // appending as we go -- so the honest repair is to measure the file and
       // write the `closed` line that never got written, marked `recovered` so
       // "the process died" stays distinguishable from "the user stopped".
-      let index: readonly RecordingSegment[];
+      let index: readonly ScreenRecordingSegment[];
       try {
-        index = await deps.recordingLog.readIndex();
+        index = await deps.screenRecordingLog.readIndex();
       } catch (error) {
         logger.error(`recording: could not read the index at startup: ${describeError(error)}`);
         return;
@@ -484,7 +484,7 @@ export function createRecordingCoordinator(deps: RecordingCoordinatorDeps): Reco
           await deps.writer.prune(segment.id, segment.mimeType).catch(() => {});
           continue;
         }
-        await deps.recordingLog
+        await deps.screenRecordingLog
           .append({
             type: 'closed',
             id: segment.id,

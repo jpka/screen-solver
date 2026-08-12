@@ -70,11 +70,37 @@ export type SolveEvent =
 export interface SolveOptions {
   /** Aborting ends the iterable quietly — no terminal event, no throw. */
   readonly signal?: AbortSignal;
+  /**
+   * Recent speech to answer alongside the screenshot, already windowed and
+   * rendered by the caller (`audio/window.ts`).
+   *
+   * Optional, and absent on an ordinary solve: the plain Solve button sends a
+   * screenshot and nothing else, exactly as it always has. Only the separate
+   * "Solve with transcript" action fills this in.
+   *
+   * It becomes a *second* user-content block after the image, so the cached
+   * system prefix is untouched and prompt caching still hits. The seam takes
+   * rendered text rather than structured segments on purpose — deciding how
+   * much history is worth sending, and how to label who said what, is a policy
+   * question that belongs to the window, not to the wire.
+   */
+  readonly transcript?: string;
 }
 
-/** The one thing the rest of the app calls to turn a screenshot into an answer. */
+/** The one thing the rest of the app calls to turn a screenshot, recent speech, or both into an answer. */
 export interface Provider {
   /** The model actually in use, for the usage log. */
   readonly model: string;
-  solve(image: SolveImage, options?: SolveOptions): AsyncIterable<SolveEvent>;
+  /**
+   * `image` is `null` for a spoken-only solve: the user asked a question out
+   * loud and there is no screen to read it off. The transcript is then the
+   * whole question rather than a hint about it, which is a distinction the
+   * system prompt makes and this seam only has to carry.
+   *
+   * A call with neither an image nor a transcript has nothing to answer;
+   * callers are expected not to make one (`POST /solve/transcript-only`
+   * refuses with `400 no_transcript` rather than spending a call to find out),
+   * and an implementation may reject it however is cheapest.
+   */
+  solve(image: SolveImage | null, options?: SolveOptions): AsyncIterable<SolveEvent>;
 }

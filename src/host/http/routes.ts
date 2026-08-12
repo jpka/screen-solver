@@ -1,19 +1,37 @@
+import {
+  createRecordingCoordinator,
+  type RecordingCoordinator,
+} from '../audio/recording-coordinator.ts';
+import type { OpenAudioCapture, Transcriber } from '../audio/types.ts';
+import type { TranscriptWindow } from '../audio/window.ts';
 import type { TargetIntentTracker } from '../capture/intent.ts';
 import type { IsTargetMinimized } from '../capture/types.ts';
 import type { CaptureSessionCoordinator } from '../capture/session-coordinator.ts';
 import type { ConfigStore } from '../config/store.ts';
 import type { EnumerateWindows, TargetWindowIdentity } from '../config/types.ts';
 import type { AnswerLog } from '../logs/answer-log.ts';
-import type { RecordingLog } from '../logs/recording-log.ts';
+import type { ScreenRecordingLog } from '../logs/screen-recording-log.ts';
+import type { TranscriptLog } from '../logs/transcript-log.ts';
 import type { Logger } from '../logger.ts';
 import type { Provider } from '../provider/types.ts';
-import type { RecordingCoordinator } from '../recording/coordinator.ts';
-import { extensionFor } from '../recording/segment-writer.ts';
+import type { ScreenRecordingCoordinator } from '../screen-recording/coordinator.ts';
 import { createSegmentFileRoute } from './segment-file.ts';
 import { createEventBroadcaster } from '../solve/broadcaster.ts';
-import { startSolveLoop, type SolveLoop } from '../solve/loop.ts';
+import { startSolveLoop, type SolveLoop, type SolveMode } from '../solve/loop.ts';
 import type { SolveOutcomeEvent } from '../solve/types.ts';
 import { PayloadTooLargeError, readJsonBody, sendJson, type Route } from './router.ts';
+
+/**
+ * How many transcript lines `GET /transcript` serves when the client doesn't
+ * say. Enough to fill a pane and scroll back through a long meeting, without
+ * making a phone parse an entire history that grows one line every few
+ * seconds of speech -- the one way this route has to differ from `GET
+ * /answers`, which grows one line per button press and can afford to be total.
+ */
+export const DEFAULT_TRANSCRIPT_LIMIT = 500;
+
+/** A ceiling on what one request can ask this process to read and serialize. */
+export const MAX_TRANSCRIPT_LIMIT = 5_000;
 
 export interface HostRoutesDeps {
   /**
@@ -39,12 +57,25 @@ export interface HostRoutesDeps {
   readonly onOutcome?: (event: SolveOutcomeEvent) => void | Promise<void>;
   /** #31's `answers.jsonl` reader -- `GET /answers` serves its full backlog. Left unset, `GET /answers` answers `[]` (the same "nothing configured yet" default `enumerateWindows`/`isTargetMinimized` already use). */
   readonly answerLog?: AnswerLog;
-  /** #45's recorder. Left unset, every `/recording*` route answers `503 not_ready`. */
-  readonly recordingCoordinator?: RecordingCoordinator;
-  /** #45's `recordings.jsonl` reader -- backs `GET /recordings` and resolves ids for the playback route. */
-  readonly recordingLog?: RecordingLog;
-  /** `<stateRoot>/recordings`. Required alongside `recordingLog` for the playback route to exist. */
+  /** #47's screen recorder. Left unset, every `/screen-recording*` route answers `503 not_ready`. */
+  readonly screenRecordingCoordinator?: ScreenRecordingCoordinator;
+  /** #47's `recordings.jsonl` reader -- backs `GET /screen-recordings` and resolves ids for the playback route. */
+  readonly screenRecordingLog?: ScreenRecordingLog;
+  /** `<stateRoot>/recordings`. Required alongside `screenRecordingLog` for the playback route to exist. */
   readonly recordingsDir?: string;
+  /**
+   * The transcription seam. `bootstrap.ts` builds a real Deepgram transcriber
+   * when a key is present. Left unset, recording reports `'unavailable'` and
+   * `POST /recording` refuses -- the same "safe default that just does less"
+   * shape as everything above it.
+   */
+  readonly transcriber?: Transcriber;
+  /** Loopback audio capture. Electron supplies the real implementation; left unset, recording is `'unavailable'`. */
+  readonly openAudioCapture?: OpenAudioCapture;
+  /** `transcript.jsonl`. `GET /transcript` serves its tail. Left unset, that route answers `[]` and finals are broadcast but not persisted. */
+  readonly transcriptLog?: TranscriptLog;
+  /** The bounded recent-speech buffer `POST /solve/with-transcript` reads. Left unset, nothing accumulates. */
+  readonly transcriptWindow?: TranscriptWindow;
   readonly logger?: Logger;
 }
 
@@ -60,6 +91,15 @@ export interface HostRoutes {
    * in the window before the server stops listening.
    */
   readonly solveLoop: SolveLoop | null;
+  /**
+   * The recording lifecycle backing `POST /recording`. Always present, unlike
+   * {@link solveLoop}: a coordinator with nothing wired into it is a perfectly
+   * good object that reports `'unavailable'`, which is a more honest answer to
+   * `GET /recording` than a `503` claiming the server isn't ready -- it is
+   * ready, it just has no transcription key. `bootstrap.ts` calls `stop()` and
+   * `drain()` on shutdown.
+   */
+  readonly recordingCoordinator: RecordingCoordinator;
 }
 
 /**
@@ -90,6 +130,7 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
           isTargetMinimized: deps.isTargetMinimized,
           targetIntent: deps.targetIntent,
           onOutcome: deps.onOutcome,
+          transcriptWindow: deps.transcriptWindow,
           logger: deps.logger,
         })
       : null;
@@ -107,14 +148,107 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
     });
   }
 
-  // #45: same shape and same lifetime as the target-change mirror above --
-  // every recorder state change (and the once-a-second byte tick while
-  // recording) becomes a `recording` SSE frame.
-  const { recordingCoordinator } = deps;
-  if (recordingCoordinator !== undefined) {
-    recordingCoordinator.onStateChange((snapshot) => {
-      broadcaster.recording(snapshot);
+  // #47: same shape and same lifetime as the target-change mirror above --
+  // every screen-recorder state change (and the once-a-second byte tick while
+  // recording) becomes a `screen-recording` SSE frame. Note this coordinator is
+  // *injected*, unlike the audio one built just below: it has to exist before
+  // the capture session coordinator does, because that coordinator notifies it
+  // on every stream change, so `bootstrap.ts` owns its construction.
+  const { screenRecordingCoordinator } = deps;
+  if (screenRecordingCoordinator !== undefined) {
+    screenRecordingCoordinator.onStateChange((snapshot) => {
+      broadcaster.screenRecording(snapshot);
     });
+  }
+
+  // Built here rather than taken as a dependency, the same way `solveLoop` is
+  // and for the same reason: it needs the broadcaster, and the broadcaster is
+  // constructed in this function. Its three callbacks are the whole bridge
+  // between the audio subsystem and the wire.
+  const recordingCoordinator = createRecordingCoordinator({
+    transcriber: deps.transcriber,
+    openAudioCapture: deps.openAudioCapture,
+    transcriptLog: deps.transcriptLog,
+    transcriptWindow: deps.transcriptWindow,
+    onTranscript: (entry) => broadcaster.transcript(entry),
+    onInterim: (channel, text) => broadcaster.transcriptInterim(channel, text),
+    onStateChange: (state) => broadcaster.recording(state),
+    logger: deps.logger,
+  });
+
+  // Note the split of responsibility below: `GET /recording` reads its *state*
+  // from the coordinator and its *revision* from the broadcaster.
+  //
+  // That looks like two sources for one fact, but it isn't. `onStateChange`
+  // fires synchronously on every real transition and bumps the revision with
+  // it, so the two can only ever differ on the state the coordinator was
+  // *born* in -- which is `'unavailable'` (no transcription key), a state that
+  // is fixed at construction and can never change while the process runs. The
+  // rejected alternative was to seed the broadcaster with that initial state
+  // instead: it would make the two agree, but at the cost of replaying a
+  // `recording` frame to every client that ever connects, in order to announce
+  // something static that `GET /recording` already tells them on load. The SSE
+  // stream is for things that change.
+  const recordingState = (): ReturnType<RecordingCoordinator['state']> =>
+    recordingCoordinator.state();
+
+  /**
+   * All three solve routes, differing only in what the attempt is made of --
+   * see `SolveMode` in `solve/loop.ts`. Everything else (the guards, the
+   * status codes, the synchronous abort-then-202) is shared by construction
+   * rather than by copy, so the plain route cannot drift as the others grow.
+   *
+   * The two pre-flight refusals below are per-mode because what each mode
+   * needs differs: a screen mode is useless without a target window, and the
+   * spoken-only mode is useless without something having been said. Both are
+   * checked *before* `trigger()`, so a request that is going to be refused
+   * doesn't abort the solve already in flight on its way out.
+   */
+  function solveHandler(mode: SolveMode): Route['handle'] {
+    return ({ res }) => {
+      if (solveLoop === null || configStore === undefined) {
+        sendJson(res, 503, { error: 'not_ready' });
+        return;
+      }
+
+      if (mode === 'transcript-only') {
+        // Deliberately not `no_target_configured`'s twin in spirit: that one
+        // means "configure something and try again", while this means "say
+        // something and try again". Refused rather than sent as an empty
+        // request, since a model handed neither a screen nor speech can only
+        // guess, and the user would still be billed for the guess.
+        //
+        // Rendering the window here and again inside `trigger()` is
+        // deliberate: this render is a *question* ("is there anything to
+        // send?"), and the one in `trigger()` is the answer that actually
+        // travels, taken at the instant of the trigger. Sharing one render
+        // across the two would mean either passing rendered text into the loop
+        // (and losing "the transcript is what was being said when the button
+        // was pressed") or trusting a value read microseconds earlier.
+        if (deps.transcriptWindow?.render() == null) {
+          sendJson(res, 400, { error: 'no_transcript' });
+          return;
+        }
+      } else if (configStore.get().targetWindow === null) {
+        sendJson(res, 400, { error: 'no_target_configured' });
+        return;
+      }
+
+      // Synchronous with the 202 below: whatever solve was in flight is
+      // aborted right here. The pre-flight guards and the provider call for
+      // this new solve run asynchronously, after the response has already
+      // gone out (#29's own body: "This abort is synchronous with the 202").
+      //
+      // The one way this comes back refused is shutdown having already begun
+      // (`SolveLoop.stop()`): the server is still listening for the moment it
+      // takes to close, but nothing is left to run or persist a new attempt,
+      // so say so rather than accepting work that will silently evaporate.
+      if (!solveLoop.trigger({ mode })) {
+        sendJson(res, 503, { error: 'shutting_down' });
+        return;
+      }
+      sendJson(res, 202, { status: 'accepted' });
+    };
   }
 
   const routes: Route[] = [
@@ -128,33 +262,37 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
     {
       method: 'POST',
       path: '/solve',
-      handle: ({ res }) => {
-        if (solveLoop === null || configStore === undefined) {
-          sendJson(res, 503, { error: 'not_ready' });
-          return;
-        }
-
-        const target = configStore.get().targetWindow;
-        if (target === null) {
-          sendJson(res, 400, { error: 'no_target_configured' });
-          return;
-        }
-
-        // Synchronous with the 202 below: whatever solve was in flight is
-        // aborted right here. The pre-flight guards and the provider call for
-        // this new solve run asynchronously, after the response has already
-        // gone out (#29's own body: "This abort is synchronous with the 202").
-        //
-        // The one way this comes back refused is shutdown having already begun
-        // (`SolveLoop.stop()`): the server is still listening for the moment it
-        // takes to close, but nothing is left to run or persist a new attempt,
-        // so say so rather than accepting work that will silently evaporate.
-        if (!solveLoop.trigger()) {
-          sendJson(res, 503, { error: 'shutting_down' });
-          return;
-        }
-        sendJson(res, 202, { status: 'accepted' });
-      },
+      handle: solveHandler('screen'),
+    },
+    {
+      // The transcript-flavoured solve.
+      //
+      // A separate route rather than a body flag on `POST /solve`, deliberately.
+      // That route reads no request body at all today, and its contract is
+      // total: 202 unless not-ready / no-target / shutting-down. Adding a body
+      // would introduce `400 bad_request` and `413 payload_too_large` failure
+      // modes to a route several existing tests assert has none, to express one
+      // bit. `AGENTS.md` frames this flat route list as a place where new
+      // capability is an append, not surgery -- so this is an append, and both
+      // handlers come from the same factory so the two can't drift.
+      method: 'POST',
+      path: '/solve/with-transcript',
+      handle: solveHandler('screen-with-transcript'),
+    },
+    {
+      // The spoken-only solve: recent speech, no screenshot.
+      //
+      // A third route from the same factory rather than a body flag on either
+      // of the two above, for the reason the sibling comment already gives --
+      // and because this one differs from both in what it *requires*, not just
+      // in what it sends. It is the only solve route that answers `202` with
+      // no target window configured at all: nothing is captured, so there is
+      // nothing for a target to be. That also makes it the one solve a user
+      // can run before ever opening the picker, which is exactly the case it
+      // exists for -- a question asked out loud with no exercise on screen.
+      method: 'POST',
+      path: '/solve/transcript-only',
+      handle: solveHandler('transcript-only'),
     },
     {
       method: 'GET',
@@ -259,22 +397,120 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
       },
     },
     {
-      // #45: the recorder's state on first load, before any `recording` SSE
-      // frame has arrived. Exactly the gap `GET /config` fills for the target
-      // -- a client that only learned the state from SSE would render "not
-      // recording" until the next frame, which for this particular feature is
-      // the one wrong thing it could say.
+      // The recording toggle's read side -- what a client needs on first load,
+      // before any `recording` SSE frame has been broadcast. Deliberately not
+      // folded into `GET /config`: that route is the narrow view of *persisted*
+      // `config.json`, and recording state is deliberately never persisted, so
+      // sharing a route would also mean sharing a revision counter between two
+      // things that change independently.
       method: 'GET',
       path: '/recording',
       handle: ({ res }) => {
-        sendJson(res, 200, recordingCoordinator?.snapshot() ?? broadcaster.currentRecording());
+        sendJson(res, 200, {
+          state: recordingState(),
+          sessionId: recordingCoordinator.sessionId(),
+          revision: broadcaster.recordingSnapshot().revision,
+        });
+      },
+    },
+    {
+      // The toggle's write side. `{on: true|false}` only -- unlike
+      // `POST /config/target`, an empty or `null` body has no sensible meaning
+      // here ("toggle to nothing"?), so it is a `400` rather than a default.
+      method: 'POST',
+      path: '/recording',
+      handle: async ({ req, res }) => {
+        let body: unknown;
+        try {
+          body = await readJsonBody(req);
+        } catch (error) {
+          if (error instanceof PayloadTooLargeError) {
+            sendJson(res, 413, { error: 'payload_too_large' });
+          } else {
+            sendJson(res, 400, { error: 'bad_request' });
+          }
+          return;
+        }
+
+        const on = parseRecordingBody(body);
+        if (on === null) {
+          sendJson(res, 400, { error: 'bad_request' });
+          return;
+        }
+
+        if (recordingState() === 'unavailable') {
+          // No transcription key, or no capture opener. Distinct from
+          // `not_ready`: the server is fine, this one capability isn't wired.
+          sendJson(res, 503, { error: 'recording_unavailable' });
+          return;
+        }
+
+        if (on) {
+          await recordingCoordinator.start();
+        } else {
+          await recordingCoordinator.stop();
+        }
+
+        // Every state transition above has already driven `onStateChange` ->
+        // `broadcaster.recording()` synchronously, so this revision is exactly
+        // the one the SSE frame it caused carried -- the same property
+        // `POST /config/target` relies on.
+        sendJson(res, 200, {
+          state: recordingState(),
+          sessionId: recordingCoordinator.sessionId(),
+          revision: broadcaster.recordingSnapshot().revision,
+        });
+      },
+    },
+    {
+      // The transcript backlog, read fresh on every request exactly as
+      // `GET /answers` is. Capped, which `GET /answers` is not -- see
+      // `DEFAULT_TRANSCRIPT_LIMIT`. A query parameter, so `router.ts`'s
+      // "no path parameters" invariant is untouched.
+      method: 'GET',
+      path: '/transcript',
+      handle: async ({ res, url }) => {
+        const limit = parseLimit(url.searchParams.get('limit'));
+        if (limit === null) {
+          sendJson(res, 400, { error: 'bad_request' });
+          return;
+        }
+        // `readTail`, not `readAll().slice()`: this file grows one line every
+        // few seconds of speech, so reading the whole history to serve the
+        // last 500 lines is work proportional to everything ever said, on
+        // every request (review feedback -- the response was bounded but the
+        // read was not).
+        const entries =
+          deps.transcriptLog === undefined ? [] : await deps.transcriptLog.readTail(limit);
+        sendJson(res, 200, entries);
+      },
+    },
+    // #47's screen recorder. Namespaced under `/screen-recording` rather than
+    // sharing `/recording` above: that surface belongs to the audio/transcript
+    // recorder, and the two are genuinely different features that happen to
+    // have both been called "recording" -- different lifecycles, different
+    // persistence, shown in different places in the client.
+    {
+      // The state a client needs on first load, before any `screen-recording`
+      // SSE frame has arrived. Exactly the gap `GET /config` fills for the
+      // target: a client that only learned this from SSE would render "not
+      // recording" until the next frame, which for this feature is the one
+      // wrong thing it could say.
+      method: 'GET',
+      path: '/screen-recording',
+      handle: ({ res }) => {
+        sendJson(
+          res,
+          200,
+          screenRecordingCoordinator?.snapshot() ?? broadcaster.currentScreenRecording(),
+        );
       },
     },
     {
       method: 'POST',
-      path: '/recording/start',
+      path: '/screen-recording/start',
       handle: async ({ res }) => {
-        if (recordingCoordinator === undefined || configStore === undefined) {
+        if (screenRecordingCoordinator === undefined || configStore === undefined) {
           sendJson(res, 503, { error: 'not_ready' });
           return;
         }
@@ -286,45 +522,46 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
           sendJson(res, 409, { error: 'no_capture_session' });
           return;
         }
-        sendJson(res, 200, await recordingCoordinator.start());
+        sendJson(res, 200, await screenRecordingCoordinator.start());
       },
     },
     {
       method: 'POST',
-      path: '/recording/stop',
+      path: '/screen-recording/stop',
       handle: async ({ res }) => {
-        if (recordingCoordinator === undefined) {
+        if (screenRecordingCoordinator === undefined) {
           sendJson(res, 503, { error: 'not_ready' });
           return;
         }
-        await recordingCoordinator.stop();
-        sendJson(res, 200, recordingCoordinator.snapshot());
+        await screenRecordingCoordinator.stop();
+        sendJson(res, 200, screenRecordingCoordinator.snapshot());
       },
     },
     {
       method: 'GET',
-      path: '/recordings',
+      path: '/screen-recordings',
       handle: async ({ res }) => {
         // Read fresh per request, like `GET /answers`: a segment that rolled a
         // moment ago has to show up without any cache to invalidate.
-        const segments = deps.recordingLog === undefined ? [] : await deps.recordingLog.readIndex();
+        const segments =
+          deps.screenRecordingLog === undefined ? [] : await deps.screenRecordingLog.readIndex();
         sendJson(res, 200, segments);
       },
     },
     {
       method: 'GET',
-      path: '/recording/settings',
+      path: '/screen-recording/settings',
       handle: ({ res }) => {
         if (configStore === undefined) {
           sendJson(res, 503, { error: 'not_ready' });
           return;
         }
-        sendJson(res, 200, configStore.get().recording);
+        sendJson(res, 200, configStore.get().screenRecording);
       },
     },
     {
       method: 'POST',
-      path: '/recording/settings',
+      path: '/screen-recording/settings',
       handle: async ({ req, res }) => {
         if (configStore === undefined) {
           sendJson(res, 503, { error: 'not_ready' });
@@ -343,7 +580,7 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
           return;
         }
 
-        const patch = parseRecordingSettingsBody(body);
+        const patch = parseScreenRecordingSettingsBody(body);
         if (patch === INVALID_SETTINGS) {
           sendJson(res, 400, { error: 'bad_request' });
           return;
@@ -352,7 +589,7 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
         // The store clamps and persists; the response is whatever it actually
         // stored, not the patch, so a client that sent an out-of-range value
         // sees the clamped truth rather than believing its own request.
-        sendJson(res, 200, await configStore.setRecordingSettings(patch));
+        sendJson(res, 200, await configStore.setScreenRecordingSettings(patch));
       },
     },
   ];
@@ -360,17 +597,33 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
   // Only registered when both halves exist -- the route cannot serve anything
   // useful with an index but no directory to read from, and a route that always
   // 503s is worse than a 404 from the router's own miss.
-  if (deps.recordingLog !== undefined && deps.recordingsDir !== undefined) {
+  if (deps.screenRecordingLog !== undefined && deps.recordingsDir !== undefined) {
     routes.push(
       createSegmentFileRoute({
-        recordingLog: deps.recordingLog,
+        screenRecordingLog: deps.screenRecordingLog,
         dir: deps.recordingsDir,
         logger: deps.logger,
       }),
     );
   }
 
-  return { routes, solveLoop };
+  return { routes, solveLoop, recordingCoordinator };
+}
+
+/** `true`/`false` from `{on}`, or `null` for anything this route can't act on. */
+function parseRecordingBody(body: unknown): boolean | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const on = (body as Record<string, unknown>).on;
+  return typeof on === 'boolean' ? on : null;
+}
+
+/** The requested page size, or `null` if the client asked for something incoherent. */
+function parseLimit(raw: string | null): number | null {
+  if (raw === null) return DEFAULT_TRANSCRIPT_LIMIT;
+  if (!/^\d+$/.test(raw)) return null;
+  const value = Number(raw);
+  if (value < 1) return null;
+  return Math.min(value, MAX_TRANSCRIPT_LIMIT);
 }
 
 const INVALID_SETTINGS = Symbol('invalid-recording-settings');
@@ -384,7 +637,7 @@ const INVALID_SETTINGS = Symbol('invalid-recording-settings');
  * it would leave the user staring at a control that snapped back with no
  * explanation.
  */
-function parseRecordingSettingsBody(
+function parseScreenRecordingSettingsBody(
   body: unknown,
 ): Partial<{ enabled: boolean; segmentSeconds: number; retentionBytes: number; retentionDays: number }> | typeof INVALID_SETTINGS {
   if (body === null) return {};

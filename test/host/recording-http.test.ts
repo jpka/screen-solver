@@ -1,85 +1,75 @@
 import assert from 'node:assert/strict';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { describe, it, type TestContext } from 'node:test';
-import { loadConfigStore, type ConfigStore } from '../../src/host/config/store.ts';
-import type { TargetWindowIdentity } from '../../src/host/config/types.ts';
-import { createHostRoutes } from '../../src/host/http/routes.ts';
+import type {
+  OpenAudioCapture,
+  Transcriber,
+  TranscriberStream,
+  TranscriptChannel,
+  TranscriptEvent,
+} from '../../src/host/audio/types.ts';
+import { createTranscriptWindow } from '../../src/host/audio/window.ts';
+import { createHostRoutes, MAX_TRANSCRIPT_LIMIT } from '../../src/host/http/routes.ts';
 import { startHttpServer, type ListeningHttpServer } from '../../src/host/http/server.ts';
+import { createTranscriptLog } from '../../src/host/logs/transcript-log.ts';
+import type { TranscriptEntry } from '../../src/host/logs/types.ts';
 import { silentLogger } from '../../src/host/logger.ts';
-import { createRecordingLog, RECORDINGS_DIR_NAME } from '../../src/host/logs/recording-log.ts';
-import type { RecordingSegment } from '../../src/host/logs/types.ts';
-import {
-  createRecordingCoordinator,
-  type RecordingCoordinator,
-} from '../../src/host/recording/coordinator.ts';
-import { createSegmentWriter } from '../../src/host/recording/segment-writer.ts';
-import type { OpenRecorder } from '../../src/host/recording/types.ts';
 import { tempStateRoot } from '../helpers/temp-state-root.ts';
 
 /**
- * #45's HTTP surface: the recorder's control and playback endpoints, plus the
- * `recording` SSE frame.
- *
- * Same approach as `web-client-http.test.ts` -- real HTTP over a real
- * `ConfigStore` and a real recording index on a temp state root. Only the
- * renderer's `MediaRecorder` is faked, since that is the one thing that needs a
- * real composited desktop.
+ * The recording feature's HTTP surface -- `GET`/`POST /recording`,
+ * `GET /transcript`, and the three SSE frames that carry a live transcript to
+ * a connected client. Exercised the way `web-client-http.test.ts` does: a real
+ * server on port 0 over a real `transcript.jsonl` in a temp state root, with
+ * only the audio device and the transcription socket faked.
  */
 
-const TARGET: TargetWindowIdentity = { processName: 'chrome.exe', title: 'Two Sum - LeetCode' };
+interface FakeStream extends TranscriberStream {
+  readonly channel: TranscriptChannel;
+  emit(event: TranscriptEvent): void;
+}
 
 interface Harness {
   readonly server: ListeningHttpServer;
-  readonly configStore: ConfigStore;
-  readonly coordinator: RecordingCoordinator;
   readonly stateRoot: string;
-  readonly recordingsDir: string;
-}
-
-/** A recorder that opens successfully and produces nothing unless asked. */
-function idleRecorder(): OpenRecorder {
-  return async () => ({
-    mimeType: 'video/webm;codecs=vp9',
-    async roll(): Promise<void> {},
-    async close(): Promise<void> {},
-  });
+  /** Drives transcript events as though they had come off a Deepgram socket. */
+  stream(): FakeStream;
+  /** Waits for every queued `transcript.jsonl` write to land. */
+  drain(): Promise<void>;
+  seed(entries: readonly TranscriptEntry[]): Promise<void>;
 }
 
 async function startTestServer(
   t: TestContext,
-  options: { readonly withTarget?: boolean; readonly withCoordinator?: boolean } = {},
+  options: { available?: boolean } = {},
 ): Promise<Harness> {
+  const streams: FakeStream[] = [];
   const stateRoot = await tempStateRoot(t);
-  const recordingsDir = join(stateRoot, RECORDINGS_DIR_NAME);
-  const configStore = await loadConfigStore({
-    stateRoot,
-    enumerateWindows: async () => [TARGET],
-  });
-  if (options.withTarget !== false) await configStore.setTargetWindow(TARGET);
+  const transcriptLog = createTranscriptLog({ stateRoot });
 
-  const recordingLog = createRecordingLog({ stateRoot });
-  let coordinator: RecordingCoordinator;
-  coordinator = createRecordingCoordinator({
-    writer: createSegmentWriter({
-      dir: recordingsDir,
-      recordingLog,
-      onError: (reason) => coordinator.fail(reason),
-    }),
-    recordingLog,
-    openRecorder: idleRecorder(),
-    settings: () => configStore.get().recording,
-    currentTarget: () => configStore.get().targetWindow,
-  });
-  t.after(() => coordinator.stop());
+  const transcriber: Transcriber = {
+    model: 'nova-3',
+    open({ channel, onEvent }) {
+      const stream: FakeStream = {
+        channel,
+        send() {},
+        async close() {},
+        emit: onEvent,
+      };
+      streams.push(stream);
+      return stream;
+    },
+  };
+  const openAudioCapture: OpenAudioCapture = async () => ({ async close() {} });
 
-  const { routes } = createHostRoutes({
-    configStore,
-    recordingCoordinator: options.withCoordinator === false ? undefined : coordinator,
-    recordingLog,
-    recordingsDir,
+  const available = options.available !== false;
+  const { routes, recordingCoordinator } = createHostRoutes({
+    transcriber: available ? transcriber : undefined,
+    openAudioCapture: available ? openAudioCapture : undefined,
+    transcriptLog,
+    transcriptWindow: createTranscriptWindow(),
     logger: silentLogger,
   });
+
   const server = await startHttpServer({
     binding: { host: '127.0.0.1', port: 0 },
     routes,
@@ -87,325 +77,355 @@ async function startTestServer(
   });
   t.after(() => server.close());
 
-  return { server, configStore, coordinator, stateRoot, recordingsDir };
+  return {
+    server,
+    stateRoot,
+    stream() {
+      const found = streams[streams.length - 1];
+      assert.ok(found !== undefined, 'no transcription stream was opened');
+      return found;
+    },
+    drain: () => recordingCoordinator.drain(),
+    async seed(entries) {
+      for (const entry of entries) await transcriptLog.append(entry);
+    },
+  };
 }
 
-describe('recording HTTP surface', () => {
-  describe('POST /recording/start', () => {
-    it('starts recording and answers with the live snapshot', async (t) => {
-      const h = await startTestServer(t);
+interface RecordingBody {
+  readonly state: string;
+  readonly sessionId: string | null;
+  readonly revision: number;
+}
 
-      const response = await fetch(`${h.server.url}/recording/start`, { method: 'POST' });
-      const body = (await response.json()) as { state: string; segmentId: string | null };
+async function recordingBody(response: Response): Promise<RecordingBody> {
+  return (await response.json()) as RecordingBody;
+}
 
-      assert.equal(response.status, 200);
-      assert.equal(body.state, 'recording');
-      assert.notEqual(body.segmentId, null);
-    });
-
-    it('refuses with 409 when no window is being captured', async (t) => {
-      const h = await startTestServer(t, { withTarget: false });
-
-      const response = await fetch(`${h.server.url}/recording/start`, { method: 'POST' });
-
-      assert.equal(response.status, 409);
-      assert.deepEqual(await response.json(), { error: 'no_capture_session' });
-      assert.equal(h.coordinator.snapshot().state, 'off', 'and nothing was started');
-    });
-
-    it('answers 503 when no coordinator is wired', async (t) => {
-      const h = await startTestServer(t, { withCoordinator: false });
-
-      const response = await fetch(`${h.server.url}/recording/start`, { method: 'POST' });
-
-      assert.equal(response.status, 503);
-      assert.deepEqual(await response.json(), { error: 'not_ready' });
-    });
+function setRecording(url: string, on: boolean): Promise<Response> {
+  return fetch(`${url}/recording`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ on }),
   });
+}
 
-  it('GET /recording reports the state a freshly-loaded client needs before any SSE frame', async (t) => {
-    const h = await startTestServer(t);
+function entry(text: string, index: number): TranscriptEntry {
+  return {
+    recordingSessionId: 'seeded',
+    channel: 'them',
+    text,
+    timestamp: new Date(Date.parse('2026-08-11T09:00:00.000Z') + index * 1_000).toISOString(),
+    startSeconds: index,
+    endSeconds: index + 1,
+    model: 'nova-3',
+  };
+}
 
-    const before = (await (await fetch(`${h.server.url}/recording`)).json()) as { state: string };
-    assert.equal(before.state, 'off');
+interface ParsedFrame {
+  readonly type: string;
+  readonly [key: string]: unknown;
+}
 
-    await fetch(`${h.server.url}/recording/start`, { method: 'POST' });
-
-    const after = (await (await fetch(`${h.server.url}/recording`)).json()) as { state: string };
-    assert.equal(after.state, 'recording');
-  });
-
-  it('POST /recording/stop returns to off', async (t) => {
-    const h = await startTestServer(t);
-    await fetch(`${h.server.url}/recording/start`, { method: 'POST' });
-
-    const response = await fetch(`${h.server.url}/recording/stop`, { method: 'POST' });
-
-    assert.equal(response.status, 200);
-    assert.equal(((await response.json()) as { state: string }).state, 'off');
-  });
-
-  describe('GET /recordings', () => {
-    it('is empty before anything has been recorded', async (t) => {
-      const h = await startTestServer(t);
-
-      const response = await fetch(`${h.server.url}/recordings`);
-
-      assert.equal(response.status, 200);
-      assert.deepEqual(await response.json(), []);
-    });
-
-    it('lists a segment as soon as it opens, before it has been closed out', async (t) => {
-      const h = await startTestServer(t);
-      await fetch(`${h.server.url}/recording/start`, { method: 'POST' });
-
-      const segments = (await (await fetch(`${h.server.url}/recordings`)).json()) as RecordingSegment[];
-
-      assert.equal(segments.length, 1);
-      assert.equal(segments[0]?.endedAt, null, 'still being written');
-      assert.deepEqual(segments[0]?.target, TARGET);
-    });
-  });
-
-  describe('GET /recordings/file', () => {
-    /** Puts a real, indexed segment file on disk without going through the recorder. */
-    async function seedSegment(h: Harness, id: string, contents: Buffer): Promise<void> {
-      await mkdir(h.recordingsDir, { recursive: true });
-      await writeFile(join(h.recordingsDir, `${id}.webm`), contents);
-      const log = createRecordingLog({ stateRoot: h.stateRoot });
-      await log.append({
-        type: 'opened',
-        id,
-        startedAt: '2026-08-12T09:00:00.000Z',
-        mimeType: 'video/webm',
-        target: TARGET,
-      });
-      await log.append({
-        type: 'closed',
-        id,
-        endedAt: '2026-08-12T09:05:00.000Z',
-        bytes: contents.byteLength,
-      });
-    }
-
-    it('serves the whole file, advertising range support', async (t) => {
-      const h = await startTestServer(t);
-      await seedSegment(h, 'abc', Buffer.from('0123456789'));
-
-      const response = await fetch(`${h.server.url}/recordings/file?id=abc`);
-
-      assert.equal(response.status, 200);
-      assert.equal(response.headers.get('accept-ranges'), 'bytes');
-      assert.equal(response.headers.get('content-type'), 'video/webm');
-      assert.equal(response.headers.get('content-length'), '10');
-      assert.equal(await response.text(), '0123456789');
-    });
-
-    it('answers a range request with 206 and the requested slice, so <video> can seek', async (t) => {
-      const h = await startTestServer(t);
-      await seedSegment(h, 'abc', Buffer.from('0123456789'));
-
-      const response = await fetch(`${h.server.url}/recordings/file?id=abc`, {
-        headers: { range: 'bytes=2-5' },
-      });
-
-      assert.equal(response.status, 206);
-      assert.equal(response.headers.get('content-range'), 'bytes 2-5/10');
-      assert.equal(response.headers.get('content-length'), '4');
-      assert.equal(await response.text(), '2345');
-    });
-
-    it('answers 416 for a range entirely past the end', async (t) => {
-      const h = await startTestServer(t);
-      await seedSegment(h, 'abc', Buffer.from('0123456789'));
-
-      const response = await fetch(`${h.server.url}/recordings/file?id=abc`, {
-        headers: { range: 'bytes=99-200' },
-      });
-
-      assert.equal(response.status, 416);
-      assert.equal(response.headers.get('content-range'), 'bytes */10');
-    });
-
-    it('404s an id that is not in the index', async (t) => {
-      const h = await startTestServer(t);
-
-      const response = await fetch(`${h.server.url}/recordings/file?id=nope`);
-
-      assert.equal(response.status, 404);
-    });
-
-    it('404s an indexed segment whose file has vanished from disk', async (t) => {
-      const h = await startTestServer(t);
-      const log = createRecordingLog({ stateRoot: h.stateRoot });
-      await log.append({
-        type: 'opened',
-        id: 'ghost',
-        startedAt: '2026-08-12T09:00:00.000Z',
-        mimeType: 'video/webm',
-        target: null,
-      });
-
-      const response = await fetch(`${h.server.url}/recordings/file?id=ghost`);
-
-      assert.equal(response.status, 404);
-    });
-
-    it('refuses a traversal attempt rather than reading outside the recordings directory', async (t) => {
-      const h = await startTestServer(t);
-      // Planted in the index deliberately: resolving ids through the index is
-      // the primary defence, so this test defeats that defence on purpose to
-      // prove the containment check behind it also holds.
-      const log = createRecordingLog({ stateRoot: h.stateRoot });
-      await log.append({
-        type: 'opened',
-        id: '../../config',
-        startedAt: '2026-08-12T09:00:00.000Z',
-        mimeType: 'video/webm',
-        target: null,
-      });
-
-      const response = await fetch(
-        `${h.server.url}/recordings/file?id=${encodeURIComponent('../../config')}`,
-      );
-
-      assert.equal(response.status, 400);
-    });
-
-    it('400s a request with no id at all', async (t) => {
-      const h = await startTestServer(t);
-
-      assert.equal((await fetch(`${h.server.url}/recordings/file`)).status, 400);
-    });
-  });
-
-  describe('recording settings', () => {
-    it('round-trips a partial patch, leaving the untouched fields alone', async (t) => {
-      const h = await startTestServer(t);
-
-      const response = await fetch(`${h.server.url}/recording/settings`, {
-        method: 'POST',
-        body: JSON.stringify({ enabled: true }),
-      });
-      const body = (await response.json()) as { enabled: boolean; segmentSeconds: number };
-
-      assert.equal(response.status, 200);
-      assert.equal(body.enabled, true);
-      assert.equal(body.segmentSeconds, 300, 'the default survived a patch that never mentioned it');
-      assert.equal(h.configStore.get().recording.enabled, true, 'and it reached the store');
-    });
-
-    it('answers with the clamped value rather than echoing an out-of-range request', async (t) => {
-      const h = await startTestServer(t);
-
-      const response = await fetch(`${h.server.url}/recording/settings`, {
-        method: 'POST',
-        body: JSON.stringify({ segmentSeconds: 0 }),
-      });
-
-      assert.equal(((await response.json()) as { segmentSeconds: number }).segmentSeconds, 5);
-    });
-
-    it('rejects a field of the wrong type with 400, rather than silently dropping it', async (t) => {
-      const h = await startTestServer(t);
-
-      const response = await fetch(`${h.server.url}/recording/settings`, {
-        method: 'POST',
-        body: JSON.stringify({ enabled: 'yes please' }),
-      });
-
-      assert.equal(response.status, 400);
-      assert.equal(h.configStore.get().recording.enabled, false, 'and nothing changed');
-    });
-
-    it('persists across a reload of the store, which is what makes automatic recording automatic', async (t) => {
-      const h = await startTestServer(t);
-      await fetch(`${h.server.url}/recording/settings`, {
-        method: 'POST',
-        body: JSON.stringify({ enabled: true, retentionDays: 3 }),
-      });
-
-      const reloaded = await loadConfigStore({ stateRoot: h.stateRoot });
-
-      assert.equal(reloaded.get().recording.enabled, true);
-      assert.equal(reloaded.get().recording.retentionDays, 3);
-    });
-  });
-
-  describe('the recording SSE frame', () => {
-    it('broadcasts a state change to a connected client', async (t) => {
-      const h = await startTestServer(t);
-      const events = await fetch(`${h.server.url}/events`);
-      const frames = frameReader(events);
-
-      await fetch(`${h.server.url}/recording/start`, { method: 'POST' });
-
-      // `starting` then `recording`; the first real frame is enough to prove
-      // the wiring, and waiting for a specific later one would race the tick.
-      const frame = await frames.next();
-      assert.equal(frame?.type, 'recording');
-      assert.ok(
-        frame?.state === 'starting' || frame?.state === 'recording',
-        `unexpected first state: ${String(frame?.state)}`,
-      );
-    });
-
-    it('replays the current state to a client that connects mid-recording', async (t) => {
-      const h = await startTestServer(t);
-      await fetch(`${h.server.url}/recording/start`, { method: 'POST' });
-
-      const events = await fetch(`${h.server.url}/events`);
-      const frames = frameReader(events);
-      const frame = await frames.next();
-
-      // The catch-up. Without it a phone opened during a recording would show
-      // "not recording" until the next change -- the one thing this feature
-      // must never say.
-      assert.equal(frame?.type, 'recording');
-      assert.equal(frame?.state, 'recording');
-    });
-
-    it('sends no catch-up frame when nothing is recording', async (t) => {
-      const h = await startTestServer(t);
-
-      const events = await fetch(`${h.server.url}/events`);
-      const frames = frameReader(events);
-
-      assert.equal(await frames.nextWithin(250), null);
-    });
-  });
-});
-
-/** Reads `event:`/`data:` SSE frames off a live response body. */
+/** Same fixed drain-buffered-first shape as `web-client-http.test.ts`'s own copy. */
 function frameReader(response: Response) {
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
-  let buffered = '';
+  let buffer = '';
 
-  async function pump(): Promise<Record<string, unknown> | null> {
-    for (;;) {
-      const boundary = buffered.indexOf('\n\n');
-      if (boundary !== -1) {
-        const raw = buffered.slice(0, boundary);
-        buffered = buffered.slice(boundary + 2);
-        const dataLine = raw.split('\n').find((line) => line.startsWith('data: '));
-        if (dataLine === undefined) continue; // the `:ok` preamble
-        return JSON.parse(dataLine.slice('data: '.length)) as Record<string, unknown>;
+  function drainBuffered(events: ParsedFrame[], count: number): void {
+    let idx: number;
+    while (events.length < count && (idx = buffer.indexOf('\n\n')) !== -1) {
+      const chunk = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      const dataLine = chunk.split('\n').find((line) => line.startsWith('data: '));
+      if (dataLine !== undefined) {
+        events.push(JSON.parse(dataLine.slice('data: '.length)) as ParsedFrame);
       }
-      const { value, done } = await reader.read();
-      if (done) return null;
-      buffered += decoder.decode(value, { stream: true });
     }
   }
 
   return {
-    next: pump,
-    /** `null` if no frame arrives within `ms` -- for asserting that nothing is sent. */
-    async nextWithin(ms: number): Promise<Record<string, unknown> | null> {
+    async take(count: number): Promise<ParsedFrame[]> {
+      const events: ParsedFrame[] = [];
+      drainBuffered(events, count);
+      while (events.length < count) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        drainBuffered(events, count);
+      }
+      return events;
+    },
+    async raceTimeout(ms: number): Promise<'timeout' | ParsedFrame> {
       return Promise.race([
-        pump(),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+        this.take(1).then((frames) => frames[0] ?? ('timeout' as const)),
+        new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), ms)),
       ]);
+    },
+    async cancel(): Promise<void> {
+      await reader.cancel().catch(() => {});
     },
   };
 }
+
+async function connectEvents(url: string): Promise<ReturnType<typeof frameReader>> {
+  return frameReader(await fetch(`${url}/events`));
+}
+
+describe('GET /recording', () => {
+  it('reports off with no session before anything has been toggled', async (t) => {
+    const h = await startTestServer(t);
+    const response = await fetch(`${h.server.url}/recording`);
+
+    assert.equal(response.status, 200);
+    const body = await recordingBody(response);
+    assert.equal(body.state, 'off');
+    assert.equal(body.sessionId, null);
+    assert.equal(typeof body.revision, 'number');
+  });
+
+  it('reports unavailable, not a 503, when no transcription key was wired', async (t) => {
+    // The server is perfectly ready; this one capability just isn't configured,
+    // and saying so is more useful to a client than claiming not_ready.
+    const h = await startTestServer(t, { available: false });
+    const response = await fetch(`${h.server.url}/recording`);
+
+    assert.equal(response.status, 200);
+    assert.equal((await recordingBody(response)).state, 'unavailable');
+  });
+});
+
+describe('POST /recording', () => {
+  it('starts recording and hands back a session id', async (t) => {
+    const h = await startTestServer(t);
+    const body = await recordingBody(await setRecording(h.server.url, true));
+
+    assert.equal(body.state, 'starting');
+    assert.equal(typeof body.sessionId, 'string');
+  });
+
+  it('stops recording and clears the session id', async (t) => {
+    const h = await startTestServer(t);
+    await setRecording(h.server.url, true);
+    const body = await recordingBody(await setRecording(h.server.url, false));
+
+    assert.equal(body.state, 'off');
+    assert.equal(body.sessionId, null);
+  });
+
+  it('the revision strictly increases across transitions', async (t) => {
+    const h = await startTestServer(t);
+    const first = await recordingBody(await setRecording(h.server.url, true));
+    const second = await recordingBody(await setRecording(h.server.url, false));
+    const third = await recordingBody(await setRecording(h.server.url, true));
+
+    assert.ok(second.revision > first.revision);
+    assert.ok(third.revision > second.revision);
+  });
+
+  it('answers with exactly the revision the SSE frame it caused carried', async (t) => {
+    const h = await startTestServer(t);
+    const events = await connectEvents(h.server.url);
+
+    const response = await recordingBody(await setRecording(h.server.url, true));
+    const frames = await events.take(1);
+
+    assert.equal(frames[0]?.type, 'recording');
+    assert.equal(frames[0]?.state, response.state);
+    assert.equal(frames[0]?.revision, response.revision);
+    await events.cancel();
+  });
+
+  it('rejects a body that does not say on or off', async (t) => {
+    const h = await startTestServer(t);
+    for (const body of ['{}', 'null', '{"on":"yes"}', 'not json']) {
+      const response = await fetch(`${h.server.url}/recording`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      });
+      assert.equal(response.status, 400, `body ${body} should be rejected`);
+    }
+  });
+
+  it('rejects an empty body, unlike POST /config/target where clearing has a meaning', async (t) => {
+    const h = await startTestServer(t);
+    const response = await fetch(`${h.server.url}/recording`, { method: 'POST' });
+    assert.equal(response.status, 400);
+  });
+
+  it('rejects an oversized body with 413', async (t) => {
+    const h = await startTestServer(t);
+    const response = await fetch(`${h.server.url}/recording`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ on: true, padding: 'x'.repeat(70 * 1024) }),
+    });
+    assert.equal(response.status, 413);
+  });
+
+  it('refuses with recording_unavailable when nothing is wired', async (t) => {
+    const h = await startTestServer(t, { available: false });
+    const response = await setRecording(h.server.url, true);
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: 'recording_unavailable' });
+  });
+});
+
+describe('transcript SSE frames', () => {
+  it('broadcasts a final as a transcript frame carrying the persisted entry', async (t) => {
+    const h = await startTestServer(t);
+    await setRecording(h.server.url, true);
+    const events = await connectEvents(h.server.url);
+
+    h.stream().emit({ type: 'open' });
+    h.stream().emit({ type: 'final', text: 'two sum', startSeconds: 1, endSeconds: 2 });
+
+    // Three frames: the mid-session `recording` replay on connect, the
+    // starting -> on transition, then the transcript itself.
+    const frames = await events.take(3);
+    const transcript = frames.find((f) => f.type === 'transcript');
+    assert.ok(transcript !== undefined);
+    assert.equal((transcript.entry as TranscriptEntry).text, 'two sum');
+    assert.equal((transcript.entry as TranscriptEntry).channel, 'them');
+    await events.cancel();
+  });
+
+  it('broadcasts an interim as its own frame, replacing rather than appending', async (t) => {
+    const h = await startTestServer(t);
+    await setRecording(h.server.url, true);
+    const events = await connectEvents(h.server.url);
+
+    h.stream().emit({ type: 'open' });
+    h.stream().emit({ type: 'interim', text: 'two s' });
+    h.stream().emit({ type: 'interim', text: 'two sum' });
+
+    // recording replay, starting -> on, then both interims.
+    const frames = await events.take(4);
+    const interims = frames.filter((f) => f.type === 'transcript-interim');
+    assert.deepEqual(interims.map((f) => f.text), ['two s', 'two sum']);
+    await events.cancel();
+  });
+
+  it('replays a live recording state to a client that connects mid-session', async (t) => {
+    const h = await startTestServer(t);
+    await setRecording(h.server.url, true);
+
+    // A phone unlocking mid-meeting must not show an Off toggle over a
+    // running session.
+    const events = await connectEvents(h.server.url);
+    const frames = await events.take(1);
+    assert.equal(frames[0]?.type, 'recording');
+    assert.equal(frames[0]?.state, 'starting');
+    await events.cancel();
+  });
+
+  it('replays the pending interim line so a mid-sentence join is not staring at a blank pane', async (t) => {
+    const h = await startTestServer(t);
+    await setRecording(h.server.url, true);
+    h.stream().emit({ type: 'open' });
+    h.stream().emit({ type: 'interim', text: 'halfway through a sen' });
+
+    const events = await connectEvents(h.server.url);
+    const frames = await events.take(2);
+    const interim = frames.find((f) => f.type === 'transcript-interim');
+    assert.equal(interim?.text, 'halfway through a sen');
+    await events.cancel();
+  });
+
+  it('does NOT replay finalized transcript lines -- GET /transcript already covers those', async (t) => {
+    const h = await startTestServer(t);
+    await setRecording(h.server.url, true);
+    h.stream().emit({ type: 'open' });
+    h.stream().emit({ type: 'final', text: 'already said', startSeconds: 0, endSeconds: 1 });
+    await h.drain();
+
+    const events = await connectEvents(h.server.url);
+    const frames = await events.take(1);
+    assert.equal(frames.find((f) => f.type === 'transcript'), undefined);
+    await events.cancel();
+  });
+
+  it('does not replay a recording state of off', async (t) => {
+    const h = await startTestServer(t);
+    const events = await connectEvents(h.server.url);
+    assert.equal(await events.raceTimeout(120), 'timeout');
+    await events.cancel();
+  });
+
+  it('fans out identically to two simultaneous clients', async (t) => {
+    const h = await startTestServer(t);
+    await setRecording(h.server.url, true);
+    const a = await connectEvents(h.server.url);
+    const b = await connectEvents(h.server.url);
+
+    h.stream().emit({ type: 'open' });
+    h.stream().emit({ type: 'final', text: 'shared', startSeconds: 0, endSeconds: 1 });
+
+    const [fromA, fromB] = await Promise.all([a.take(3), b.take(3)]);
+    assert.deepEqual(
+      fromA.filter((f) => f.type === 'transcript'),
+      fromB.filter((f) => f.type === 'transcript'),
+    );
+    await a.cancel();
+    await b.cancel();
+  });
+});
+
+describe('GET /transcript', () => {
+  it('answers [] when nothing has ever been transcribed', async (t) => {
+    const h = await startTestServer(t);
+    const response = await fetch(`${h.server.url}/transcript`);
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), []);
+  });
+
+  it('serves what a live session actually wrote', async (t) => {
+    const h = await startTestServer(t);
+    await setRecording(h.server.url, true);
+    h.stream().emit({ type: 'open' });
+    h.stream().emit({ type: 'final', text: 'persisted line', startSeconds: 0, endSeconds: 1 });
+    await h.drain();
+
+    const entries = (await (await fetch(`${h.server.url}/transcript`)).json()) as TranscriptEntry[];
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0]?.text, 'persisted line');
+  });
+
+  it('reads fresh on every request rather than caching', async (t) => {
+    const h = await startTestServer(t);
+    await h.seed([entry('one', 0)]);
+    assert.equal(((await (await fetch(`${h.server.url}/transcript`)).json()) as unknown[]).length, 1);
+
+    await h.seed([entry('two', 1)]);
+    assert.equal(((await (await fetch(`${h.server.url}/transcript`)).json()) as unknown[]).length, 2);
+  });
+
+  it('returns the NEWEST entries when capped, not the oldest', async (t) => {
+    const h = await startTestServer(t);
+    await h.seed(Array.from({ length: 10 }, (_, i) => entry(`line ${i}`, i)));
+
+    const entries = (await (
+      await fetch(`${h.server.url}/transcript?limit=3`)
+    ).json()) as TranscriptEntry[];
+    assert.deepEqual(entries.map((e) => e.text), ['line 7', 'line 8', 'line 9']);
+  });
+
+  it('clamps an absurd limit rather than reading unbounded', async (t) => {
+    const h = await startTestServer(t);
+    await h.seed([entry('one', 0)]);
+    const response = await fetch(`${h.server.url}/transcript?limit=${MAX_TRANSCRIPT_LIMIT * 10}`);
+    assert.equal(response.status, 200);
+  });
+
+  it('rejects an incoherent limit', async (t) => {
+    const h = await startTestServer(t);
+    for (const limit of ['0', '-5', 'abc', '1.5', '']) {
+      const response = await fetch(`${h.server.url}/transcript?limit=${limit}`);
+      assert.equal(response.status, 400, `limit=${limit} should be rejected`);
+    }
+  });
+});

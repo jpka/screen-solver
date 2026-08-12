@@ -1,65 +1,195 @@
-// Screen Solver web client (#33) -- the functional core: connect to the live
-// stream, show history, trigger a solve, pick a target window. Deliberately
-// dependency-free (no bundler, no framework) per this repo's static/
-// convention -- see AGENTS.md's "Product code: toolchain and layout".
+// Screen Solver web client (#33/#34) -- connect to the live stream, show
+// history, trigger a solve, pick a target window, and lay all of that out
+// for a phone: two layouts picked by orientation, swapping live with no
+// reload and no lost state, plus fullscreen. Deliberately dependency-free
+// (no bundler, no framework) per this repo's static/ convention -- see
+// AGENTS.md's "Product code: toolchain and layout".
 //
-// Talks to the wire contract built by #28/#29/#31/#32/#33:
-//   GET  /config          -> { targetWindow, revision }    (#33)
-//   GET  /windows          -> WindowInfo[]                 (#33)
-//   POST /config/target    -> { targetWindow, revision }   (#33)
-//   GET  /answers          -> AnswerLogEntry[]              (#31)
-//   POST /solve             -> 202/400/503                   (#29)
-//   GET  /events (SSE)      -> start/delta/done/error/sync/status/config{,revision}/recording
+// Talks to the wire contract built by #28/#29/#31/#32/#33/#35/#47:
+//   GET  /config              -> { targetWindow, revision }    (#33)
+//   GET  /windows              -> WindowInfo[]                 (#33)
+//   POST /config/target        -> { targetWindow, revision }   (#33)
+//   GET  /answers              -> AnswerLogEntry[]              (#31)
+//   POST /solve                 -> 202/400/503                   (#29)
+//   GET  /recording             -> { state, sessionId, revision } (#35)
+//   POST /recording  {on}       -> 200/400/413/503                (#35)
+//   GET  /transcript?limit=N    -> TranscriptEntry[]               (#35)
+//   POST /solve/with-transcript -> 202/400/503, same shape as /solve (#35)
+//   POST /solve/transcript-only -> 202/400/503, speech only, no target needed
+//   GET  /events (SSE)  -> start/delta/done/error/sync/status/config{,revision}
+//                          /recording/transcript/transcript-interim (#35)
+//                          /screen-recording (#47)
 //
-// Continuous screen recording (server contract as of this writing):
-//   POST /recording/start   -> 200 {state,segmentId,startedAt,bytes} / 409 no_capture_session / 503
-//   POST /recording/stop    -> 200 {state:'off'}
-//   GET  /recordings        -> {id,startedAt,endedAt,bytes,durationMs,mimeType,target}[], newest first
-//   GET  /recordings/file?id=<id> -> segment bytes, Range-capable (used directly as a <video> src)
-//   GET  /recording/settings  -> {enabled,segmentSeconds,retentionBytes,retentionDays}
-//   POST /recording/settings  -> same shape, accepts any subset of the four fields
+// Continuous screen recording (#47) -- note the `/screen-recording` prefix
+// throughout: `/recording` above is the *audio transcript* toggle (#35), a
+// genuinely different feature that happens to share the English word.
+//   GET  /screen-recording        -> {state,segmentId,bytes,startedAt,reason}
+//   POST /screen-recording/start  -> 200 same shape / 409 no_capture_session / 503
+//   POST /screen-recording/stop   -> 200 {state:'off'}
+//   GET  /screen-recordings       -> {id,startedAt,endedAt,bytes,durationMs,mimeType,target}[], newest first
+//   GET  /screen-recordings/file?id=<id> -> segment bytes, Range-capable (used directly as a <video> src)
+//   GET  /screen-recording/settings  -> {enabled,segmentSeconds,retentionBytes,retentionDays}
+//   POST /screen-recording/settings  -> same shape, accepts any subset of the four fields
 
 (() => {
   'use strict';
 
-  // Mirrors `src/host/logs/title.ts`'s `BAIL_TITLE` -- the client has no
-  // server-side module to import, so this is kept in lockstep by hand. Only
+  // Mirrors `src/host/logs/title.ts`'s two bail markers -- the client has no
+  // server-side module to import, so these are kept in lockstep by hand. Only
   // used to decide *display* emphasis; the server remains the sole authority
   // on what actually gets persisted.
+  //
+  // Two markers, not one: a screenshot-carrying solve bails with "no exercise
+  // on screen", while a speech-only solve (which was shown no screen at all)
+  // bails with "no question in the recent speech". They mean the same thing
+  // here -- this answer answered nothing -- so `isBailTitle` collapses them
+  // the way the server's own `isBailTitle()` does, and the badge below names
+  // whichever one actually came back.
   const BAIL_TITLE = 'No exercise on screen';
+  const NO_QUESTION_TITLE = 'No question in the recent speech';
+
+  function isBailTitle(title) {
+    return title === BAIL_TITLE || title === NO_QUESTION_TITLE;
+  }
+
+  /** What the bail badge says, per marker -- "no exercise" would be a lie about a request that had no screen. */
+  function bailBadgeText(title) {
+    return title === NO_QUESTION_TITLE ? ' no question' : ' no exercise';
+  }
+
+  const IDLE_TEXT = 'Click "Solve now" to analyze the target window.';
+
+  // Verified on a real device against prototype/21-web-client (#21/#34's
+  // prior art): every phone clears this in landscape (iPhone SE, the
+  // narrowest in practice, is 568px), so the floor exists purely to stop a
+  // narrow *desktop* window that happens to be taller-than-wide-adjacent
+  // from getting a rail it has no room for.
+  const LANDSCAPE_MIN_WIDTH = 480;
+
+  const CONNECTION_LABELS = {
+    connecting: 'Connecting…',
+    connected: 'Live',
+    reconnecting: 'Reconnecting…',
+    disconnected: 'Disconnected',
+  };
 
   const solveButton = document.getElementById('solve-button');
   const statusPill = document.getElementById('status-pill');
+  const connectionIndicator = document.getElementById('connection-indicator');
+  const fullscreenButton = document.getElementById('fullscreen-button');
   const picker = document.getElementById('picker');
   const pickerError = document.getElementById('picker-error');
   const windowList = document.getElementById('window-list');
   const refreshWindowsButton = document.getElementById('refresh-windows');
-  const answerPane = document.getElementById('answer-pane');
+  const targetBar = document.getElementById('target-bar');
   const targetLabel = document.getElementById('target-label');
   const solveError = document.getElementById('solve-error');
-  const answerText = document.getElementById('answer-text');
-  const historyList = document.getElementById('history-list');
-
-  const recButton = document.getElementById('rec-button');
-  const recStateLabel = document.getElementById('rec-state-label');
+  const entriesRoot = document.getElementById('entries-root');
+  // #35 additions: record toggle, the second solve button, and the transcript
+  // pane (finals plus the two pinned per-channel interim rows). The pane is
+  // static markup rather than something render() draws -- see index.html.
+  const recordToggleButton = document.getElementById('record-toggle');
+  const solveTranscriptButton = document.getElementById('solve-transcript-button');
+  // This ticket's third solve button -- speech only, no screenshot, no
+  // target. See its enabled-ness comment (`hasHeardSpeech`/`markSpeechHeard`)
+  // below for why it is wired independently of `applyConfig`.
+  const solveVoiceButton = document.getElementById('solve-voice-button');
+  const transcriptPane = document.getElementById('transcript-pane');
   const recordingError = document.getElementById('recording-error');
-  const recordingIndicator = document.getElementById('recording-indicator');
-  const recElapsed = document.getElementById('rec-elapsed');
-  const recBytes = document.getElementById('rec-bytes');
-  const recordingsList = document.getElementById('recordings-list');
-  const recordingsError = document.getElementById('recordings-error');
-  const recordingPlayer = document.getElementById('recording-player');
-  const recordingSettingsForm = document.getElementById('recording-settings-form');
-  const recordingSettingsError = document.getElementById('recording-settings-error');
-  const recordingSettingsStatus = document.getElementById('rec-settings-status');
-  const recSettingEnabled = document.getElementById('rec-setting-enabled');
-  const recSettingSegmentSeconds = document.getElementById('rec-setting-segment-seconds');
-  const recSettingRetentionBytes = document.getElementById('rec-setting-retention-bytes');
-  const recSettingRetentionDays = document.getElementById('rec-setting-retention-days');
+  const transcriptList = document.getElementById('transcript-list');
+  const transcriptInterimThem = document.getElementById('transcript-interim-them');
+  const transcriptInterimMe = document.getElementById('transcript-interim-me');
+
+  const recButton = document.getElementById('screen-rec-button');
+  const recStateLabel = document.getElementById('screen-rec-state-label');
+  const screenRecordingError = document.getElementById('screen-recording-error');
+  const recordingIndicator = document.getElementById('screen-recording-indicator');
+  const recElapsed = document.getElementById('screen-rec-elapsed');
+  const recBytes = document.getElementById('screen-rec-bytes');
+  const recordingsList = document.getElementById('screen-recordings-list');
+  const recordingsError = document.getElementById('screen-recordings-error');
+  const recordingPlayer = document.getElementById('screen-recording-player');
+  const recordingSettingsForm = document.getElementById('screen-recording-settings-form');
+  const recordingSettingsError = document.getElementById('screen-recording-settings-error');
+  const recordingSettingsStatus = document.getElementById('screen-rec-settings-status');
+  const recSettingEnabled = document.getElementById('screen-rec-setting-enabled');
+  const recSettingSegmentSeconds = document.getElementById('screen-rec-setting-segment-seconds');
+  const recSettingRetentionBytes = document.getElementById('screen-rec-setting-retention-bytes');
+  const recSettingRetentionDays = document.getElementById('screen-rec-setting-retention-days');
 
   /** @type {{processName: string, title: string} | null} */
   let currentTarget = null;
-  let liveText = '';
+
+  /**
+   * Whether `#solve-voice-button` should be enabled -- a heuristic, and
+   * deliberately so. The button needs *some* recent speech, not a target
+   * (`applyConfig` never touches it), but "recent" is a server-side
+   * bounded-window concept (the 5-minute transcript buffer `POST
+   * /solve/transcript-only`'s own `400 no_transcript` guards) that this
+   * client cannot evaluate itself. So this only ever tracks "has this client
+   * seen at least one finalized transcript line at some point" -- from the
+   * `GET /transcript` snapshot `loadTranscript()` loads, or a live
+   * `transcript` SSE frame -- and once true, stays true; it never flips back
+   * off as time passes, even though the server-side window it was inferring
+   * from may since have emptied. That's fine: the button merely offers the
+   * attempt, and the server's `400 no_transcript` (mapped to a human
+   * sentence in the click handler below) is the authoritative refusal when
+   * this guess turns out to be stale.
+   */
+  let hasHeardSpeech = false;
+
+  function markSpeechHeard() {
+    if (hasHeardSpeech) return;
+    hasHeardSpeech = true;
+    solveVoiceButton.disabled = false;
+  }
+
+  // Set for the duration of a speech-only solve *this client* initiated, so
+  // the next `start`/`done` SSE frame stamps `liveEntry.target = null`
+  // instead of `currentTarget` -- a speech-only answer genuinely has no
+  // target (the server records `target: null` for it), and stamping
+  // whatever window this client happens to be watching would mislabel the
+  // entry's meta line with a window the answer had nothing to do with.
+  //
+  // This is best-effort and purely local: the wire carries no marker of
+  // *which* button started a solve, so a speech-only solve triggered from
+  // another device (or another tab) is indistinguishable here from a normal
+  // one and will still get stamped with `currentTarget`, wrongly. The
+  // authoritative record is whatever the next `GET /answers` reports, where
+  // `target` is genuinely `null` for a speech-only entry regardless of what
+  // this flag guessed in the meantime.
+  let voiceSolveInFlight = false;
+
+  // ---------------------------------------------------------------------
+  // Entry model.
+  //
+  // `liveEntry` is this browser session's current-or-just-finished attempt
+  // (null until the first `start`/`sync` this session sees one); it is
+  // always referenced by the sentinel id `'live'`, never a stable id of its
+  // own, precisely so `openEntryId === 'live'` keeps tracking "whatever's
+  // live" across a `start` that replaces it -- see `demoteLiveEntry` below.
+  //
+  // `historyEntries` is the persisted log: the `GET /answers` snapshot plus
+  // anything `demoteLiveEntry` has folded in since, newest first, each
+  // frozen with a stable `_uid` (the UI selection identity) the moment it's
+  // created -- see the doc comment on `nextEntryUid` below for why that's a
+  // separate field from `_id`, the content-fingerprint identity used only
+  // for dedup.
+  //
+  // There is deliberately no separate "pane mode" per layout (live vs.
+  // history) the way the rejected D-only prototype had -- both layouts
+  // read the *same* `openEntryId`, which is why a rotation needs no explicit
+  // normalization step to avoid the "forced-variant trap" writeup's
+  // state-model mismatch (a live entry rendered with history's chrome):
+  // there is only ever one open entry, full stop, and both layouts agree on
+  // what it means.
+  let liveEntry = null;
+  let historyEntries = [];
+  /** @type {'live' | string} */
+  let openEntryId = 'live';
+
+  /** @type {'off' | 'starting' | 'on' | 'reconnecting' | 'unavailable' | 'error'} */
+  let currentRecordingState = 'off';
 
   // The `recording` SSE frame is only replayed to a newly-connecting client
   // when the server-side state is not `'off'` (see the contract comment up
@@ -68,9 +198,9 @@
   // `undefined` (not `null`) specifically so the very first frame -- even
   // one reporting `segmentId: null` -- is still treated as "different from
   // what we had" by {@link refreshRecordingsIfNeeded}'s `!==` check below.
-  let recordingState = { state: 'off', segmentId: undefined, bytes: 0, startedAt: null, reason: null };
-  let recordingRequestPending = false;
-  let recordingTimerId = null;
+  let screenRecordingState = { state: 'off', segmentId: undefined, bytes: 0, startedAt: null, reason: null };
+  let screenRecordingRequestPending = false;
+  let screenRecordingTimerId = null;
   let currentVideoEl = null;
   let currentVideoLi = null;
 
@@ -95,22 +225,62 @@
   // real revision (`broadcaster.ts` starts counting at `1`), so the very
   // first thing to arrive -- through either path -- is always applied.
   let latestConfigRevision = -1;
-  // History has no single "current value" to compare a revision against, so
-  // it uses a queue instead: a `done` completion that lands before
-  // `GET /answers` resolves is held here and replayed *after* the snapshot
-  // renders (instead of being added straight to a DOM the snapshot is about
-  // to clear), then filtered against what the snapshot already contains --
-  // the recorder's JSONL write can complete before this client's own
-  // `GET /answers` does, so the same answer can legitimately show up in
-  // both the snapshot and the queue.
+  // History (in the #34 model, "folding a finished live entry in") has no
+  // single "current value" to compare a revision against, so it uses a
+  // queue instead: a fold that happens before `GET /answers` resolves is
+  // held here and replayed *after* the snapshot renders, then filtered
+  // against what the snapshot already contains -- the recorder's JSONL
+  // write can complete before this client's own `GET /answers` does, so the
+  // same answer can legitimately show up in both the snapshot and the queue.
   let historySnapshotLoaded = false;
-  const queuedLiveHistoryEntries = [];
+  const queuedDemotedEntries = [];
 
-  /** Applies `targetWindow` only if `revision` is at least as new as the last one actually applied, updating the latch either way it's compared against next time. Shared by all three sources of a target (`GET /config`, `POST /config/target`, the `config` SSE frame) so they can't disagree about ordering. */
-  function applyConfigIfNewer(targetWindow, revision) {
-    if (revision < latestConfigRevision) return;
-    latestConfigRevision = revision;
-    applyConfig(targetWindow);
+  // Socket state (of the SSE connection itself) vs. `statusPill`'s
+  // escalation ladder (#32, unrelated -- that one tracks provider-call
+  // health, not the transport). Only meaningful while `openEntryId` is
+  // `'live'`; see `renderConnectionIndicator`.
+  let connectionState = 'connecting';
+  // Transient "syncing…" tag for a `sync` catch-up window (#31's mid-flight
+  // join/reconnect). Cleared the moment a real `delta` resumes, or on
+  // anything that ends the window outright (`done`/`error`/a fresh `start`).
+  let syncing = false;
+
+  /** @type {'portrait' | 'landscape'} */
+  let currentOrientation = computeOrientation();
+
+  /**
+   * Source of truth for orientation is a direct dimension comparison, not a
+   * media query -- verified against prototype/21-web-client (#21/#34): a
+   * compound `matchMedia` query is one more thing that can silently fail to
+   * match, where `innerWidth`/`innerHeight` cannot. `matchMedia` is kept
+   * below only as one of several *triggers* that ask this function to
+   * re-run, never as the answer itself.
+   */
+  function computeOrientation() {
+    const landscape = window.innerWidth > window.innerHeight && window.innerWidth >= LANDSCAPE_MIN_WIDTH;
+    return landscape ? 'landscape' : 'portrait';
+  }
+
+  // Same ordering problem as `latestConfigRevision` above, for recording
+  // state instead of the target window: it arrives from two independent,
+  // unordered sources (the `recording` SSE frame, and this client's own
+  // `GET /recording` / `POST /recording` responses), and arrival order says
+  // nothing about which is more current. This is a *separate* counter from
+  // `latestConfigRevision` -- the server tracks target-config and
+  // recording-state revisions independently, so the two are never compared
+  // against each other, only against their own kind.
+  let latestRecordingRevision = -1;
+  // Same queue-then-dedupe shape as `queuedDemotedEntries` above, for the
+  // transcript backfill instead of the answer history -- see `loadTranscript`
+  // for the replay/de-dupe half of this.
+  let transcriptSnapshotLoaded = false;
+  const queuedLiveTranscriptEntries = [];
+
+  /** Applies a recording `state` only if `revision` is at least as new as the last one actually applied -- the exact same shape as {@link applyConfigIfNewer} above, for the identical problem against `latestRecordingRevision` instead. Shared by all three sources of recording state (`GET /recording`, `POST /recording`, the `recording` SSE frame). */
+  function applyRecordingIfNewer(state, revision) {
+    if (revision < latestRecordingRevision) return;
+    latestRecordingRevision = revision;
+    applyRecording(state);
   }
 
   function parseAnswerTitle(text) {
@@ -123,24 +293,29 @@
     return `${target.title} — ${target.processName}`;
   }
 
-  /** The single place that flips between the picker and the answer pane. Reached only through {@link applyConfigIfNewer}, which all three sources of a target (an initial `GET /config`, a successful `POST /config/target`, a live `config` SSE frame) are funneled through, so this never has to arbitrate ordering itself. */
+  /** The single place that flips between the picker and the entry views. Reached only through {@link applyConfigIfNewer}, which all three sources of a target (an initial `GET /config`, a successful `POST /config/target`, a live `config` SSE frame) are funneled through, so this never has to arbitrate ordering itself. */
   function applyConfig(targetWindow) {
     currentTarget = targetWindow;
     solveButton.disabled = targetWindow === null;
+    // Solving with transcript needs a target too -- it takes the same 400
+    // no_target_configured the plain solve gets without one.
+    solveTranscriptButton.disabled = targetWindow === null;
+    // `#solve-voice-button` is deliberately left untouched here -- it needs
+    // speech, not a target (see `hasHeardSpeech`'s doc comment), so having no
+    // target configured at all must not disable it the way it disables the
+    // other two.
+    if (targetWindow === null) loadWindows();
+    // The REC control is disabled with no target configured (#47) -- reuses
+    // this existing state rather than re-fetching anything of its own.
+    updateScreenRecordingUI();
+    render();
+  }
 
-    if (targetWindow === null) {
-      picker.hidden = false;
-      answerPane.hidden = true;
-      loadWindows();
-    } else {
-      picker.hidden = true;
-      answerPane.hidden = false;
-      targetLabel.textContent = `Watching: ${formatTarget(targetWindow)}`;
-    }
-
-    // The REC control is disabled with no target configured -- reuses this
-    // existing state rather than the client re-fetching anything of its own.
-    updateRecordingUI();
+  /** Applies `targetWindow` only if `revision` is at least as new as the last one actually applied, updating the latch either way it's compared against next time. Shared by all three sources of a target (`GET /config`, `POST /config/target`, the `config` SSE frame) so they can't disagree about ordering. */
+  function applyConfigIfNewer(targetWindow, revision) {
+    if (revision < latestConfigRevision) return;
+    latestConfigRevision = revision;
+    applyConfig(targetWindow);
   }
 
   async function loadConfig() {
@@ -152,6 +327,82 @@
     } catch {
       // Left on the initial "no target" default (picker shown, empty list);
       // `loadWindows()`'s own error path reports the underlying failure.
+    }
+  }
+
+  // Label for each of the six states `GET /recording` / `POST /recording` /
+  // the `recording` SSE frame can report. `unavailable` means no
+  // transcription key is configured server-side -- pressing the button can
+  // never make it succeed, so it's the one state {@link applyRecording}
+  // also disables the button for, rather than just relabeling it like the
+  // other non-`off` states.
+  const RECORDING_BUTTON_LABEL = {
+    off: 'Start recording',
+    starting: 'Starting…',
+    on: 'Stop recording',
+    reconnecting: 'Reconnecting…',
+    unavailable: 'Recording unavailable',
+    error: 'Recording error — retry',
+  };
+
+  /** The single place that updates the record toggle's label, `data-state` (styling hook for off/starting/on/reconnecting/unavailable/error), and enabled-ness. Reached only through {@link applyRecordingIfNewer}, mirroring how {@link applyConfig} is reached only through `applyConfigIfNewer`. */
+  function applyRecording(state) {
+    currentRecordingState = state;
+    recordToggleButton.dataset.state = state;
+    recordToggleButton.textContent = RECORDING_BUTTON_LABEL[state] || state;
+    recordToggleButton.disabled = state === 'unavailable';
+
+    // Nothing is being transcribed any more, so a pending interim line is now
+    // a guess at a sentence that will never be finished -- it would otherwise
+    // sit pinned at the bottom of the pane indefinitely, still styled as "in
+    // progress", after recording stopped mid-word. The server makes the same
+    // move on its side (`broadcaster.ts` clears its interim map on `off`, so
+    // it is never replayed to a future client); this is the half that fixes
+    // the client already looking at it. `starting`/`on`/`reconnecting` are
+    // deliberately excluded -- those are all still-recording states, and a
+    // reconnect in particular should leave the last line visible rather than
+    // blanking the pane during a blip.
+    if (state === 'off' || state === 'unavailable' || state === 'error') clearInterimLines();
+
+    updateTranscriptPaneVisibility();
+  }
+
+  /**
+   * Shows the transcript pane only when it has something to say.
+   *
+   * Screen space is the scarce resource in #34's layouts -- a phone in
+   * portrait gives the whole viewport to one continuous log -- so an empty
+   * "Transcript" heading permanently occupying a chunk of it, on a machine
+   * that may have no transcription key at all, is a bad trade. It appears
+   * once recording starts or once there is backfill to show, and stays put
+   * afterwards so that stopping doesn't yank away lines you are still reading.
+   */
+  function updateTranscriptPaneVisibility() {
+    const recordingActive =
+      currentRecordingState === 'starting' ||
+      currentRecordingState === 'on' ||
+      currentRecordingState === 'reconnecting';
+    const hasLines = transcriptList.querySelector('.transcript-line:not(.transcript-interim)') !== null;
+    if (recordingActive || hasLines) transcriptPane.hidden = false;
+  }
+
+  function clearInterimLines() {
+    for (const el of [transcriptInterimThem, transcriptInterimMe]) {
+      el.hidden = true;
+      el.querySelector('.transcript-text').textContent = '';
+    }
+  }
+
+  async function loadRecording() {
+    try {
+      const res = await fetch('/recording');
+      if (!res.ok) return;
+      const body = await res.json();
+      applyRecordingIfNewer(body.state, body.revision);
+    } catch {
+      // Left on the initial "off" default, same best-effort handling as
+      // `loadConfig` -- the toggle stays clickable and its own click
+      // handler's error path reports a real problem if there is one.
     }
   }
 
@@ -219,6 +470,75 @@
 
   refreshWindowsButton.addEventListener('click', loadWindows);
 
+  recordToggleButton.addEventListener('click', async () => {
+    recordingError.hidden = true;
+    // Anything other than actively on/starting/reconnecting reads as "off"
+    // for the purpose of deciding which way to flip -- `unavailable` never
+    // reaches here since {@link applyRecording} disables the button for it,
+    // and `error` should read as "off" (clicking it means "try again").
+    const turnOn = !(
+      currentRecordingState === 'on' ||
+      currentRecordingState === 'starting' ||
+      currentRecordingState === 'reconnecting'
+    );
+    recordToggleButton.disabled = true;
+    try {
+      const res = await fetch('/recording', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ on: turnOn }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `unexpected status ${res.status}`);
+      }
+      const body = await res.json();
+      applyRecordingIfNewer(body.state, body.revision);
+    } catch (err) {
+      recordingError.hidden = false;
+      recordingError.textContent = `Could not ${turnOn ? 'start' : 'stop'} recording: ${err.message}`;
+      // Undo the disabled-while-in-flight state set above. `currentRecordingState`
+      // wasn't touched by this catch (only a successful response reaches
+      // `applyRecordingIfNewer`), so re-deriving from it here is safe -- a
+      // fetch failure can't have turned it into `unavailable` out from under us.
+      recordToggleButton.disabled = currentRecordingState === 'unavailable';
+    }
+  });
+
+  // Mutual exclusion between the two solve buttons, wired as a *second*,
+  // independent listener on each rather than by editing either handler's
+  // body -- `#solve-button`'s handler in particular must stay byte-for-byte
+  // unchanged, since it is the regression guard for "the plain button's
+  // behavior is unchanged" (see the file-level comment / PR description).
+  // The server only ever runs one solve at a time regardless of which
+  // endpoint started it, so the other button has nothing useful to do until
+  // this one's stream ends -- re-enabling happens in the shared `done`/
+  // `error` SSE listeners below, for the same reason.
+  solveButton.addEventListener('click', () => {
+    solveTranscriptButton.disabled = true;
+  });
+  solveTranscriptButton.addEventListener('click', () => {
+    solveButton.disabled = true;
+  });
+
+  // This ticket's third button folds into the same mesh via *more*
+  // independent listeners, rather than editing the two above -- same
+  // byte-for-byte-handler reasoning as the click handlers themselves (adding
+  // a second `click` listener to an element is additive; `addEventListener`
+  // happily runs both). `solveVoiceButton` disabling itself is handled by
+  // its own click handler below, matching how `solveButton`/
+  // `solveTranscriptButton` each disable *themselves* in their own handlers.
+  solveButton.addEventListener('click', () => {
+    solveVoiceButton.disabled = true;
+  });
+  solveTranscriptButton.addEventListener('click', () => {
+    solveVoiceButton.disabled = true;
+  });
+  solveVoiceButton.addEventListener('click', () => {
+    solveButton.disabled = true;
+    solveTranscriptButton.disabled = true;
+  });
+
   solveButton.addEventListener('click', async () => {
     solveError.hidden = true;
     solveButton.disabled = true;
@@ -239,40 +559,61 @@
     }
   });
 
-  function renderAnswer(text, state) {
-    answerText.textContent = text;
-    answerText.dataset.state = state;
-  }
-
-  function addHistoryEntry(entry) {
-    const li = document.createElement('li');
-    if (entry.interrupted) li.dataset.interrupted = 'true';
-
-    const title = document.createElement('div');
-    title.className = 'history-title';
-    title.textContent = entry.title || '(untitled)';
-
-    if (entry.title === BAIL_TITLE) {
-      title.appendChild(badge('bail-badge', ' no exercise'));
+  // Duplicated from the `#solve-button` handler above rather than factored
+  // out, per the same byte-for-byte constraint: sharing a helper would mean
+  // editing that handler to call it, and that handler is the regression guard
+  // for "the plain button's behavior is unchanged". The only real differences
+  // are the endpoint and which button owns the disabled state.
+  solveTranscriptButton.addEventListener('click', async () => {
+    solveError.hidden = true;
+    solveTranscriptButton.disabled = true;
+    try {
+      const res = await fetch('/solve/with-transcript', { method: 'POST' });
+      if (res.status !== 202) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `unexpected status ${res.status}`);
+      }
+      // Same "left disabled until done/error" reasoning as the plain button.
+    } catch (err) {
+      solveError.hidden = false;
+      solveError.textContent = `Could not start a solve: ${err.message}`;
+      solveTranscriptButton.disabled = currentTarget === null;
     }
-    if (entry.interrupted) {
-      title.appendChild(badge('interrupted-badge', ' interrupted'));
+  });
+
+  // Same shape again: modelled on `#solve-button`'s handler (hide
+  // `solveError`, disable itself, POST, throw on anything but 202, surface
+  // the failure), duplicated rather than shared for the same byte-for-byte
+  // reasoning. Two real differences beyond the endpoint and which button
+  // owns the disabled state: (1) `no_transcript` -- the one refusal unique to
+  // this route, since there is no target to be missing -- gets mapped to a
+  // human sentence instead of showing the raw error code; (2) it sets
+  // `voiceSolveInFlight` so the `start`/`done` SSE listeners know to stamp
+  // this attempt's `target` as `null` (see that flag's own doc comment).
+  solveVoiceButton.addEventListener('click', async () => {
+    solveError.hidden = true;
+    solveVoiceButton.disabled = true;
+    voiceSolveInFlight = true;
+    try {
+      const res = await fetch('/solve/transcript-only', { method: 'POST' });
+      if (res.status !== 202) {
+        const body = await res.json().catch(() => ({}));
+        if (body.error === 'no_transcript') {
+          throw new Error('Nothing has been said recently. Start recording and ask your question out loud.');
+        }
+        throw new Error(body.error || `unexpected status ${res.status}`);
+      }
+      // Same "left disabled until done/error" reasoning as the other two.
+    } catch (err) {
+      solveError.hidden = false;
+      solveError.textContent = `Could not start a solve: ${err.message}`;
+      solveVoiceButton.disabled = !hasHeardSpeech;
+      // The attempt never actually reached the server (or was rejected
+      // outright), so there is no in-flight speech-only solve for a later
+      // `start`/`done` to stamp `target: null` for.
+      voiceSolveInFlight = false;
     }
-
-    const meta = document.createElement('div');
-    meta.className = 'history-meta';
-    const when = new Date(entry.timestamp);
-    const usageText =
-      entry.usage && (entry.usage.inputTokens || entry.usage.outputTokens)
-        ? `${entry.usage.inputTokens} in / ${entry.usage.outputTokens} out`
-        : '';
-    meta.textContent = [when.toLocaleString(), entry.model, formatTarget(entry.target), usageText]
-      .filter(Boolean)
-      .join(' · ');
-
-    li.append(title, meta);
-    historyList.insertBefore(li, historyList.firstChild);
-  }
+  });
 
   function badge(className, text) {
     const span = document.createElement('span');
@@ -289,20 +630,21 @@
   }
 
   /**
-   * A completion's identity for de-duplicating a queued live entry against
-   * the `GET /answers` snapshot (see {@link loadHistory}). The server
-   * assigns no client-visible ID to a solve, so this is necessarily a
-   * heuristic -- but `text` alone is too weak (review feedback: solving the
-   * same exercise twice in a row can legitimately produce byte-identical
-   * output, which would make a real second answer look like a duplicate of
-   * the first and get silently dropped). Folding in the target identity and
-   * the *exact* token-usage tuple narrows this to "two independent calls
-   * produced the same text *and* the same target *and* the same four usage
-   * numbers" -- a provider call's real accounting varies with things the
-   * client has no control over (retries, exact image bytes, prompt-cache
-   * hits), so two genuinely different solves landing on identical usage as
-   * well as identical text is not a realistic collision, even though it
-   * remains possible in principle without a real ID from the server.
+   * A completion's identity for de-duplicating a folded-in live entry
+   * against the `GET /answers` snapshot (see {@link loadHistory}). The
+   * server assigns no client-visible ID to a solve, so this is necessarily a
+   * heuristic -- but `text` alone is too weak (review feedback on #33:
+   * solving the same exercise twice in a row can legitimately produce
+   * byte-identical output, which would make a real second answer look like a
+   * duplicate of the first and get silently dropped). Folding in the target
+   * identity and the *exact* token-usage tuple narrows this to "two
+   * independent calls produced the same text *and* the same target *and*
+   * the same four usage numbers" -- a provider call's real accounting
+   * varies with things the client has no control over (retries, exact image
+   * bytes, prompt-cache hits), so two genuinely different solves landing on
+   * identical usage as well as identical text is not a realistic collision,
+   * even though it remains possible in principle without a real ID from the
+   * server.
    */
   function completionIdentity(entry) {
     const usage = entry.usage ?? {};
@@ -317,40 +659,206 @@
     ]);
   }
 
+  // A history entry carries two different identities, deliberately kept
+  // apart (Greptile review on this PR): `_id` (`completionIdentity`) is a
+  // *content* fingerprint, used only to answer "does the snapshot already
+  // contain this" during the merge below -- it's fine, even correct, for
+  // two independent entries to collide on it, since that's exactly what
+  // marks a queued fold as already-persisted. `_uid` is a per-entry
+  // identity for the UI (`openEntryId`, both layouts' click-to-open), and
+  // has to be unique per entry even when the content is byte-identical --
+  // `completionIdentity`'s own doc comment already calls out that solving
+  // the same exercise twice in a row can legitimately produce identical
+  // text *and* usage. Reusing the content fingerprint as the UI id (an
+  // earlier version of this file did) collapses two such entries onto one
+  // selectable card and strands the other, unreachable.
+  let nextEntryUid = 1;
+
+  /**
+   * Folds a finished `liveEntry` into `historyEntries` and clears the live
+   * slot, called right before a new `start` claims it. Only a cleanly
+   * finished attempt (`state === 'done'`) has a server-persisted counterpart
+   * to fold in -- a bail or an `error` is never written to `answers.jsonl`
+   * (`logs/recorder.ts`), and an attempt still `'streaming'` when a new
+   * `start` interrupts it never got a `done` at all, so there is nothing a
+   * reload would ever show for either. Both are simply dropped, matching
+   * what the server itself would (not) persist.
+   */
+  function demoteLiveEntry() {
+    if (!liveEntry) return;
+    if (liveEntry.state === 'done') {
+      const finished = { ...liveEntry, _id: completionIdentity(liveEntry), _uid: nextEntryUid++ };
+      if (historySnapshotLoaded) historyEntries.unshift(finished);
+      else queuedDemotedEntries.push(finished);
+    }
+    liveEntry = null;
+    // `openEntryId` is left untouched: if it was `'live'`, it now naturally
+    // refers to whatever `start` sets up next (the whole point of the
+    // sentinel); if it was pointing at some other history entry, that
+    // entry's `_uid` is unaffected by this fold.
+  }
+
   async function loadHistory() {
-    let entries = [];
+    let snapshot = [];
     try {
       const res = await fetch('/answers');
-      if (res.ok) entries = await res.json();
+      if (res.ok) snapshot = await res.json();
     } catch {
-      // Best-effort: a failed load just leaves the snapshot half empty
-      // rather than blocking the rest of the page -- the code below still
-      // runs regardless, so any queued live completion is not lost either
-      // way, just replayed on top of an empty-ish snapshot.
+      // Best-effort: a failed load just leaves history empty rather than
+      // blocking the rest of the page -- the code below still runs
+      // regardless, so anything queued by `demoteLiveEntry` is not lost
+      // either way, just replayed on top of an empty-ish snapshot.
     }
 
-    historyList.innerHTML = '';
-    // Oldest first is appended first, so it ends up at the bottom -- the
-    // newest logged entry lands on top, matching where `addHistoryEntry`
-    // (called live, on a fresh `done`) always inserts.
-    for (const entry of entries) addHistoryEntry(entry);
+    // Snapshot arrives oldest-first; `historyEntries` is newest-first.
+    historyEntries = snapshot
+      .slice()
+      .reverse()
+      .map((entry) => ({ ...entry, _id: completionIdentity(entry), _uid: nextEntryUid++ }));
 
     // Whether the fetch succeeded or not, the snapshot phase is over -- any
-    // `done` completion that arrived while it was in flight was queued
-    // rather than rendered (it would have been wiped by `innerHTML = ''`
-    // above). Replay it now, on top of what the snapshot just rendered --
+    // fold that happened while it was in flight was queued rather than
+    // spliced in directly (it would have been wiped by the assignment
+    // above). Replay it now, on top of what the snapshot just produced --
     // except when the recorder's JSONL write already landed before this
     // fetch ran, in which case the snapshot above already contains it and
-    // replaying would duplicate the row. See `completionIdentity` for what
-    // "already contains it" is judged by, and why.
+    // replaying would duplicate the row. Matched on `_id` (the content
+    // fingerprint), not `_uid` -- see the identity doc comment above.
+    //
+    // A *count* per fingerprint, not a `Set` (review, round 2): two
+    // genuinely distinct completed attempts can share a fingerprint (the
+    // same "solving the same exercise twice in a row" case `_id`'s own doc
+    // comment already flags), and can both be queued while only one of them
+    // has actually landed in the snapshot yet (the recorder's writes don't
+    // all complete before this fetch resolves). A `Set.has()` membership
+    // check can't tell "already accounted for by the snapshot" from
+    // "another queued entry with the same fingerprint already claimed
+    // that", so it dropped *both* -- silently losing a real completed
+    // attempt. Decrementing a count as each queued entry claims one
+    // snapshot occurrence makes only as many queued entries "already
+    // there" as the snapshot actually contains that many times.
     historySnapshotLoaded = true;
-    const alreadyPersisted = new Set(entries.map(completionIdentity));
-    for (const queued of queuedLiveHistoryEntries) {
-      if (!alreadyPersisted.has(completionIdentity(queued))) addHistoryEntry(queued);
+    const remainingInSnapshot = new Map();
+    for (const entry of historyEntries) {
+      remainingInSnapshot.set(entry._id, (remainingInSnapshot.get(entry._id) ?? 0) + 1);
     }
-    queuedLiveHistoryEntries.length = 0;
+    for (const queued of queuedDemotedEntries) {
+      const remaining = remainingInSnapshot.get(queued._id) ?? 0;
+      if (remaining > 0) remainingInSnapshot.set(queued._id, remaining - 1);
+      else historyEntries.unshift(queued);
+    }
+    queuedDemotedEntries.length = 0;
 
-    if (historyList.children.length === 0) historyList.appendChild(emptyHint('No answers yet.'));
+    render();
+  }
+
+  /**
+   * A transcript entry's identity for de-duplicating a queued live entry
+   * against the `GET /transcript` snapshot (see {@link loadTranscript}) --
+   * the same race {@link completionIdentity} guards against for history,
+   * but without needing a heuristic: `recordingSessionId` + `channel` +
+   * `startSeconds` really is a unique key the server assigns (one recording
+   * session cannot produce two segments on the same channel starting at the
+   * same offset), so there's no ambiguity to fold extra fields in against.
+   */
+  function transcriptEntryIdentity(entry) {
+    return JSON.stringify([entry.recordingSessionId, entry.channel, entry.startSeconds]);
+  }
+
+  function interimElementFor(channel) {
+    return channel === 'me' ? transcriptInterimMe : transcriptInterimThem;
+  }
+
+  /** Whether `el` is scrolled close enough to its own bottom that appending more content should pull it along. 24px of slop absorbs sub-pixel scroll rounding without mistaking "the user scrolled up on purpose to read back" for "at the bottom". */
+  function isNearTranscriptBottom() {
+    return transcriptList.scrollHeight - transcriptList.scrollTop - transcriptList.clientHeight < 24;
+  }
+
+  /**
+   * Appends one finalized transcript line. Newest-at-bottom with
+   * auto-scroll -- deliberately the opposite of the newest-first ordering
+   * `historyEntries` uses -- because a transcript is read top-down like a
+   * conversation log, not scanned newest-first like a history of discrete
+   * answers. Auto-scroll only fires when the pane was already near its
+   * bottom (checked *before* appending), so scrolling back to read earlier
+   * lines isn't yanked back down by the next line arriving.
+   */
+  function addTranscriptEntry(entry, { supersedesInterim = true } = {}) {
+    // Every finalized line -- backfilled from `GET /transcript` or a live
+    // `transcript` SSE frame, replayed-from-queue or not -- passes through
+    // here, so this is the one place `hasHeardSpeech` needs to be set from.
+    // See its doc comment for why this is "has ever heard speech", not "has
+    // speech within the server's window right now".
+    markSpeechHeard();
+
+    const wasNearBottom = isNearTranscriptBottom();
+
+    const line = document.createElement('div');
+    line.className = 'transcript-line';
+    line.dataset.channel = entry.channel;
+
+    const channelLabel = document.createElement('span');
+    channelLabel.className = 'transcript-channel';
+    channelLabel.textContent = entry.channel === 'me' ? 'Me:' : 'Them:';
+
+    const text = document.createElement('span');
+    text.className = 'transcript-text';
+    text.textContent = entry.text;
+
+    line.append(channelLabel, text);
+    // Inserted just above the two pinned interim rows -- see the comment on
+    // those elements in index.html for why that keeps "newest final at the
+    // bottom" true without ever having to move the interim rows themselves.
+    transcriptList.insertBefore(line, transcriptInterimThem);
+    // Backfill can arrive with recording already stopped (a previous
+    // session's lines), which is still a reason to show the pane.
+    updateTranscriptPaneVisibility();
+
+    // This channel's pending interim line, if any, describes text this
+    // final has now superseded -- clear it so the words don't show twice
+    // (once settled here, once still marked "in progress" below it).
+    //
+    // Skipped for backfill (`supersedesInterim: false`). `GET /transcript`
+    // and the SSE connect race each other: the stream's connect-time interim
+    // replay routinely lands *before* the slower fetch resolves, and those
+    // backfilled finals are old -- often from an entirely previous recording
+    // session -- so letting them clear the row would blank a live, currently-
+    // being-spoken line that has nothing to do with them.
+    if (supersedesInterim) {
+      const interimEl = interimElementFor(entry.channel);
+      interimEl.hidden = true;
+      interimEl.querySelector('.transcript-text').textContent = '';
+    }
+
+    if (wasNearBottom) transcriptList.scrollTop = transcriptList.scrollHeight;
+  }
+
+  async function loadTranscript() {
+    let entries = [];
+    try {
+      const res = await fetch('/transcript?limit=500');
+      if (res.ok) entries = await res.json();
+    } catch {
+      // Best-effort, same as `loadHistory` -- a failed load just leaves the
+      // pane short some backfill rather than blocking the rest of the page.
+    }
+
+    // Oldest-first within the slice is exactly the append order this pane
+    // wants (newest-at-bottom) -- unlike `loadHistory`'s newest-first list,
+    // nothing here needs reversing or inserting at the front.
+    for (const entry of entries) addTranscriptEntry(entry, { supersedesInterim: false });
+
+    // Same replay-then-dedupe as `loadHistory`: a `transcript` frame that
+    // arrived while this fetch was in flight was queued instead of
+    // rendered, and gets replayed now against what the snapshot already
+    // contains -- see `transcriptEntryIdentity` for the (real, not
+    // heuristic) key that comparison uses.
+    transcriptSnapshotLoaded = true;
+    const alreadyPersisted = new Set(entries.map(transcriptEntryIdentity));
+    for (const queued of queuedLiveTranscriptEntries) {
+      if (!alreadyPersisted.has(transcriptEntryIdentity(queued))) addTranscriptEntry(queued);
+    }
+    queuedLiveTranscriptEntries.length = 0;
   }
 
   /** KB/MB/GB, one decimal place -- matches the byte counter ticking up live on the recording indicator and the size shown per row in the recordings list. */
@@ -378,28 +886,28 @@
     return hours > 0 ? `${hours}:${mm}:${ss}` : `${minutes}:${ss}`;
   }
 
-  function recordingIndicatorTick() {
-    recElapsed.textContent = recordingState.startedAt
-      ? formatElapsedMs(Date.now() - new Date(recordingState.startedAt).getTime())
+  function screenRecordingIndicatorTick() {
+    recElapsed.textContent = screenRecordingState.startedAt
+      ? formatElapsedMs(Date.now() - new Date(screenRecordingState.startedAt).getTime())
       : '';
-    recBytes.textContent = formatBytes(recordingState.bytes);
+    recBytes.textContent = formatBytes(screenRecordingState.bytes);
   }
 
-  function startRecordingTimer() {
-    if (recordingTimerId !== null) return;
-    recordingTimerId = setInterval(recordingIndicatorTick, 1000);
+  function startScreenRecordingTimer() {
+    if (screenRecordingTimerId !== null) return;
+    screenRecordingTimerId = setInterval(screenRecordingIndicatorTick, 1000);
   }
 
-  function stopRecordingTimer() {
-    if (recordingTimerId === null) return;
-    clearInterval(recordingTimerId);
-    recordingTimerId = null;
+  function stopScreenRecordingTimer() {
+    if (screenRecordingTimerId === null) return;
+    clearInterval(screenRecordingTimerId);
+    screenRecordingTimerId = null;
   }
 
-  /** The single place that renders the REC button/label/indicator from {@link recordingState} plus {@link currentTarget} -- called on every `recording` SSE frame, on every config change (the target the button depends on can change out from under it), and around the button's own click handler while its request is in flight. Never flips state on click itself; only ever reflects what the last frame or fetch actually reported. */
-  function updateRecordingUI() {
-    const { state, reason } = recordingState;
-    recordingError.hidden = true;
+  /** The single place that renders the REC button/label/indicator from {@link screenRecordingState} plus {@link currentTarget} -- called on every `recording` SSE frame, on every config change (the target the button depends on can change out from under it), and around the button's own click handler while its request is in flight. Never flips state on click itself; only ever reflects what the last frame or fetch actually reported. */
+  function updateScreenRecordingUI() {
+    const { state, reason } = screenRecordingState;
+    screenRecordingError.hidden = true;
 
     if (state === 'unavailable') {
       recButton.disabled = true;
@@ -411,7 +919,7 @@
       recButton.disabled = true;
       recButton.textContent = 'Record';
       recStateLabel.textContent = 'Pick a target window before recording.';
-    } else if (recordingRequestPending) {
+    } else if (screenRecordingRequestPending) {
       recButton.disabled = true;
       recButton.textContent = state === 'off' || state === 'error' ? 'Starting…' : 'Stopping…';
       recStateLabel.textContent = '';
@@ -427,8 +935,8 @@
       recButton.disabled = false;
       recButton.textContent = 'Retry recording';
       recStateLabel.textContent = '';
-      recordingError.hidden = false;
-      recordingError.textContent = reason ? `Recording error: ${reason}` : 'Recording error.';
+      screenRecordingError.hidden = false;
+      screenRecordingError.textContent = reason ? `Recording error: ${reason}` : 'Recording error.';
     } else {
       // 'off'
       recButton.disabled = false;
@@ -438,19 +946,19 @@
 
     recordingIndicator.hidden = state !== 'recording';
     if (state === 'recording') {
-      recordingIndicatorTick();
-      startRecordingTimer();
+      screenRecordingIndicatorTick();
+      startScreenRecordingTimer();
     } else {
-      stopRecordingTimer();
+      stopScreenRecordingTimer();
     }
   }
 
   recButton.addEventListener('click', async () => {
-    const action = recordingState.state === 'off' || recordingState.state === 'error' ? 'start' : 'stop';
-    recordingRequestPending = true;
-    updateRecordingUI();
+    const action = screenRecordingState.state === 'off' || screenRecordingState.state === 'error' ? 'start' : 'stop';
+    screenRecordingRequestPending = true;
+    updateScreenRecordingUI();
     try {
-      const res = await fetch(`/recording/${action}`, { method: 'POST' });
+      const res = await fetch(`/screen-recording/${action}`, { method: 'POST' });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         const message =
@@ -469,15 +977,15 @@
       // click, so this response is consulted for its error shape alone and
       // the actual state transition is left to the frame that follows.
     } catch (err) {
-      recordingError.hidden = false;
-      recordingError.textContent = `Could not ${action} recording: ${err.message}`;
+      screenRecordingError.hidden = false;
+      screenRecordingError.textContent = `Could not ${action} recording: ${err.message}`;
     } finally {
-      recordingRequestPending = false;
-      updateRecordingUI();
+      screenRecordingRequestPending = false;
+      updateScreenRecordingUI();
     }
   });
 
-  function renderRecordingItem(entry) {
+  function renderScreenRecordingItem(entry) {
     const li = document.createElement('li');
     li.dataset.recordingId = entry.id;
 
@@ -494,14 +1002,14 @@
     const playButton = document.createElement('button');
     playButton.type = 'button';
     playButton.textContent = 'Play';
-    playButton.addEventListener('click', () => openRecording(entry, li));
+    playButton.addEventListener('click', () => openScreenRecording(entry, li));
 
     li.append(title, meta, playButton);
     return li;
   }
 
   /** Only one `<video>` open at a time -- tears down whatever was previously playing (pause + drop `src` + `load()`, the standard way to stop a buffering `<video>` from continuing to fetch) before mounting the next one, so switching rows never leaves more than one element buffering. */
-  function openRecording(entry, li) {
+  function openScreenRecording(entry, li) {
     if (currentVideoEl) {
       currentVideoEl.pause();
       currentVideoEl.removeAttribute('src');
@@ -513,7 +1021,7 @@
     const video = document.createElement('video');
     video.controls = true;
     video.preload = 'metadata';
-    video.src = `/recordings/file?id=${encodeURIComponent(entry.id)}`;
+    video.src = `/screen-recordings/file?id=${encodeURIComponent(entry.id)}`;
     recordingPlayer.appendChild(video);
     recordingPlayer.hidden = false;
 
@@ -522,10 +1030,10 @@
     li.dataset.active = 'true';
   }
 
-  async function loadRecordings() {
+  async function loadScreenRecordings() {
     recordingsError.hidden = true;
     try {
-      const res = await fetch('/recordings');
+      const res = await fetch('/screen-recordings');
       if (!res.ok) throw new Error(`GET /recordings -> ${res.status}`);
       const entries = await res.json();
 
@@ -540,14 +1048,14 @@
         return;
       }
       // Already newest-first per the contract -- appended in that order.
-      for (const entry of entries) recordingsList.appendChild(renderRecordingItem(entry));
+      for (const entry of entries) recordingsList.appendChild(renderScreenRecordingItem(entry));
     } catch (err) {
       recordingsError.hidden = false;
       recordingsError.textContent = `Could not load recordings: ${err.message}`;
     }
   }
 
-  function applyRecordingSettings(settings) {
+  function applyScreenRecordingSettings(settings) {
     recSettingEnabled.checked = Boolean(settings.enabled);
     recSettingSegmentSeconds.value = settings.segmentSeconds;
     recSettingRetentionBytes.value = settings.retentionBytes;
@@ -561,9 +1069,9 @@
   // recording shows "not recording" for as long as that handshake takes, which
   // is the one thing this UI must never say. Mirrors what `loadConfig()`
   // already does for the target.
-  async function loadRecordingState() {
+  async function loadScreenRecordingState() {
     try {
-      const res = await fetch('/recording');
+      const res = await fetch('/screen-recording');
       if (!res.ok) return;
       const snapshot = await res.json();
       // Never allowed to overwrite a live SSE frame that beat it here: the two
@@ -571,21 +1079,21 @@
       // `GET /config`'s `revision` counter exists to solve. There is no
       // revision on this one, so the weaker but sufficient rule is "only fill
       // in a state nothing has reported yet".
-      if (recordingState.state !== 'off') return;
-      recordingState = snapshot;
-      updateRecordingUI();
-      if (snapshot.state !== 'off') loadRecordings();
+      if (screenRecordingState.state !== 'off') return;
+      screenRecordingState = snapshot;
+      updateScreenRecordingUI();
+      if (snapshot.state !== 'off') loadScreenRecordings();
     } catch {
       // A failure here costs nothing -- the SSE replay covers the same ground.
     }
   }
 
-  async function loadRecordingSettings() {
+  async function loadScreenRecordingSettings() {
     recordingSettingsError.hidden = true;
     try {
-      const res = await fetch('/recording/settings');
-      if (!res.ok) throw new Error(`GET /recording/settings -> ${res.status}`);
-      applyRecordingSettings(await res.json());
+      const res = await fetch('/screen-recording/settings');
+      if (!res.ok) throw new Error(`GET /screen-recording/settings -> ${res.status}`);
+      applyScreenRecordingSettings(await res.json());
     } catch (err) {
       recordingSettingsError.hidden = false;
       recordingSettingsError.textContent = `Could not load recording settings: ${err.message}`;
@@ -597,7 +1105,7 @@
     recordingSettingsError.hidden = true;
     recordingSettingsStatus.hidden = true;
     try {
-      const res = await fetch('/recording/settings', {
+      const res = await fetch('/screen-recording/settings', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -611,7 +1119,7 @@
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || `unexpected status ${res.status}`);
       }
-      applyRecordingSettings(await res.json());
+      applyScreenRecordingSettings(await res.json());
       recordingSettingsStatus.hidden = false;
     } catch (err) {
       recordingSettingsError.hidden = false;
@@ -629,56 +1137,335 @@
     statusPill.textContent = level === 'sticky' ? `Needs attention (${kind})` : `Recovering (${kind})`;
   }
 
+  // -----------------------------------------------------------------------
+  // Fullscreen (#34). Feature-detected per platform, per prototype/
+  // 21-web-client's confirmed finding: functional on Android Chrome via the
+  // standard Fullscreen API (with the `webkit`-prefixed fallback some
+  // browsers still need); iPhone Safari has never exposed the Fullscreen API
+  // for arbitrary elements, so there the button renders visibly disabled
+  // (native `disabled`, plus an explanatory `title`) instead of failing
+  // silently on click. (The prototype's noted alternative for that case --
+  // "Add to Home Screen" + a `display: standalone` manifest -- is a
+  // different mechanism entirely and out of scope here.)
+  const fullscreenTarget = document.documentElement;
+
+  function fullscreenSupported() {
+    return !!(fullscreenTarget.requestFullscreen || fullscreenTarget.webkitRequestFullscreen);
+  }
+
+  function isFullscreenActive() {
+    return !!(document.fullscreenElement || document.webkitFullscreenElement);
+  }
+
+  function toggleFullscreen() {
+    if (!fullscreenSupported()) return;
+    if (isFullscreenActive()) {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    } else {
+      (fullscreenTarget.requestFullscreen || fullscreenTarget.webkitRequestFullscreen).call(fullscreenTarget);
+    }
+  }
+
+  function renderFullscreenButton() {
+    const supported = fullscreenSupported();
+    fullscreenButton.disabled = !supported;
+    fullscreenButton.textContent = isFullscreenActive() ? '⤢' : '⛶';
+    fullscreenButton.title = supported
+      ? isFullscreenActive()
+        ? 'Exit fullscreen'
+        : 'Fullscreen'
+      : 'Fullscreen not supported by this browser (e.g. iPhone Safari has no Fullscreen API for arbitrary elements)';
+  }
+
+  fullscreenButton.addEventListener('click', toggleFullscreen);
+  document.addEventListener('fullscreenchange', renderFullscreenButton);
+  document.addEventListener('webkitfullscreenchange', renderFullscreenButton);
+
+  // -----------------------------------------------------------------------
+  // Connection indicator (#34). Two independent signals collapsed onto one:
+  // the SSE socket's own state while the open entry is the live one, wholly
+  // replaced by "viewing history" while it isn't -- a history view has no
+  // use for "the socket underneath is fine", per prototype/21-web-client's
+  // finding that showing both is just noise.
+  function renderConnectionIndicator() {
+    const isLiveOpen = openEntryId === 'live';
+    connectionIndicator.dataset.state = isLiveOpen ? connectionState : 'history';
+    if (!isLiveOpen) {
+      connectionIndicator.textContent = 'Viewing history';
+      return;
+    }
+    const label = CONNECTION_LABELS[connectionState] ?? connectionState;
+    connectionIndicator.textContent = syncing ? `${label} · syncing…` : label;
+  }
+
+  // -----------------------------------------------------------------------
+  // Rendering. Full rebuild of whichever layout is current, driven by the
+  // orientation/entry/connection state above -- no framework, so this is a
+  // plain "throw away the DOM under the mount point and rebuild" pass, kept
+  // cheap by the small size of what's rendered. Scroll position inside the
+  // split-rail layout's two independently-scrolling regions is preserved
+  // across a rebuild explicitly (see `captureScrollPositions`); the
+  // continuous log has no inner scroll region -- it's the page itself that
+  // scrolls -- so there's nothing to preserve there.
+
+  function displayList() {
+    const live = liveEntry
+      ? { ...liveEntry, id: 'live', isLive: true }
+      : { id: 'live', isLive: true, title: null, text: IDLE_TEXT, state: 'idle' };
+    const history = historyEntries.map((entry) => ({ ...entry, id: entry._uid, isLive: false }));
+    return [live, ...history];
+  }
+
+  function captureScrollPositions() {
+    const positions = {};
+    entriesRoot.querySelectorAll('[data-scroll-key]').forEach((el) => {
+      positions[el.dataset.scrollKey] = el.scrollTop;
+    });
+    return positions;
+  }
+
+  function restoreScrollPositions(positions) {
+    entriesRoot.querySelectorAll('[data-scroll-key]').forEach((el) => {
+      if (el.dataset.scrollKey in positions) el.scrollTop = positions[el.dataset.scrollKey];
+    });
+  }
+
+  function buildCardHeader(entry) {
+    const header = document.createElement('div');
+    header.className = 'entry-card-header';
+
+    const title = document.createElement('div');
+    title.className = 'entry-title';
+    title.textContent = entry.title || (entry.isLive ? 'Current answer' : '(untitled)');
+    if (entry.isLive && entry.state === 'bail') {
+      title.appendChild(badge('bail-badge', bailBadgeText(entry.title)));
+    }
+    if (!entry.isLive && isBailTitle(entry.title)) {
+      title.appendChild(badge('bail-badge', bailBadgeText(entry.title)));
+    }
+    if (entry.interrupted) title.appendChild(badge('interrupted-badge', ' interrupted'));
+    header.appendChild(title);
+
+    if (!entry.isLive || entry.state === 'done' || entry.state === 'bail' || entry.state === 'error') {
+      const meta = document.createElement('div');
+      meta.className = 'entry-meta';
+      const when = entry.timestamp ? new Date(entry.timestamp) : null;
+      const usageText =
+        entry.usage && (entry.usage.inputTokens || entry.usage.outputTokens)
+          ? `${entry.usage.inputTokens} in / ${entry.usage.outputTokens} out`
+          : '';
+      // A speech-only entry's `target` is genuinely `null` (see
+      // `voiceSolveInFlight`'s doc comment), so `formatTarget` returns ''
+      // for it -- `.filter(Boolean)` drops that empty segment before the
+      // join, rather than leaving a dangling ` · ` where the window label
+      // would otherwise have gone.
+      meta.textContent = [when ? when.toLocaleString() : '', entry.model, formatTarget(entry.target), usageText]
+        .filter(Boolean)
+        .join(' · ');
+      if (meta.textContent) header.appendChild(meta);
+    }
+
+    return header;
+  }
+
+  function buildCardBody(entry) {
+    const pre = document.createElement('pre');
+    pre.className = 'entry-card-text';
+    pre.dataset.state = entry.state;
+    pre.textContent = entry.text;
+    return pre;
+  }
+
+  function attachOpenHandler(el, id) {
+    el.tabIndex = 0;
+    el.setAttribute('role', 'button');
+    el.addEventListener('click', () => {
+      openEntryId = id;
+      render();
+    });
+    el.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openEntryId = id;
+        render();
+      }
+    });
+  }
+
+  /** Portrait: a continuous log, one feed. Physical order never changes with
+   * which entry is open (the live slot is always first) -- only which entry
+   * renders expanded-and-outlined vs. collapsed-to-a-line does. */
+  function renderPortrait() {
+    entriesRoot.dataset.layout = 'portrait';
+    entriesRoot.innerHTML = '';
+
+    const feed = document.createElement('ul');
+    feed.className = 'entry-feed';
+
+    for (const entry of displayList()) {
+      const isOpen = entry.id === openEntryId;
+      const li = document.createElement('li');
+      li.className = 'entry-card' + (isOpen ? ' entry-card--open' : ' entry-card--collapsed');
+      if (entry.isLive) li.classList.add('entry-card--live');
+      if (entry.interrupted) li.dataset.interrupted = 'true';
+      li.appendChild(buildCardHeader(entry));
+      if (isOpen) li.appendChild(buildCardBody(entry));
+      else attachOpenHandler(li, entry.id);
+      feed.appendChild(li);
+    }
+
+    entriesRoot.appendChild(feed);
+  }
+
+  /** Landscape: a narrow rail (every entry, collapsed to a row, live pinned
+   * at top) alongside a single detail pane holding whichever entry is open. */
+  function renderLandscape() {
+    entriesRoot.dataset.layout = 'landscape';
+    entriesRoot.innerHTML = '';
+
+    const list = displayList();
+    const open = list.find((entry) => entry.id === openEntryId) ?? list[0];
+
+    const rail = document.createElement('nav');
+    rail.className = 'entry-rail';
+    rail.dataset.scrollKey = 'rail';
+
+    const railList = document.createElement('ul');
+    railList.className = 'entry-rail-list';
+    for (const entry of list) {
+      const isOpen = entry.id === open.id;
+      const item = document.createElement('li');
+      item.className = 'entry-rail-item' + (isOpen ? ' entry-rail-item--open' : '');
+      if (entry.isLive) item.classList.add('entry-rail-item--live');
+      const label = document.createElement('div');
+      label.className = 'entry-rail-title';
+      label.textContent = entry.title || (entry.isLive ? 'Current answer' : '(untitled)');
+      item.appendChild(label);
+      attachOpenHandler(item, entry.id);
+      railList.appendChild(item);
+    }
+    rail.appendChild(railList);
+
+    const detail = document.createElement('div');
+    detail.className = 'entry-detail';
+    detail.dataset.scrollKey = 'detail';
+    detail.appendChild(buildCardHeader(open));
+    detail.appendChild(buildCardBody(open));
+
+    entriesRoot.append(rail, detail);
+  }
+
+  function render() {
+    renderConnectionIndicator();
+    renderFullscreenButton();
+
+    const hasTarget = currentTarget !== null;
+    picker.hidden = hasTarget;
+    targetBar.hidden = !hasTarget;
+    entriesRoot.hidden = !hasTarget;
+    if (!hasTarget) return;
+
+    targetLabel.textContent = `Watching: ${formatTarget(currentTarget)}`;
+
+    const scrollPositions = captureScrollPositions();
+    if (currentOrientation === 'landscape') renderLandscape();
+    else renderPortrait();
+    restoreScrollPositions(scrollPositions);
+  }
+
+  // -----------------------------------------------------------------------
+  // Orientation. Several cheap triggers ask `computeOrientation()` to
+  // re-check, because a missed one means the layout silently stops matching
+  // the device -- verified necessary against prototype/21-web-client:
+  // `orientationchange` in particular fires on Android before the resize
+  // settles, so it re-checks again a frame later and once more after a short
+  // delay rather than trusting the event's own timing.
+  function handleOrientationSignal() {
+    const next = computeOrientation();
+    if (next === currentOrientation) return;
+    currentOrientation = next;
+    render();
+  }
+
+  window.matchMedia('(orientation: landscape)').addEventListener('change', handleOrientationSignal);
+  window.addEventListener('resize', handleOrientationSignal);
+  window.addEventListener('orientationchange', () => {
+    handleOrientationSignal();
+    requestAnimationFrame(handleOrientationSignal);
+    setTimeout(handleOrientationSignal, 250);
+  });
+
+  /**
+   * What to stamp a fresh/finishing `liveEntry.target` with. Normally
+   * `currentTarget` (the window this client is watching), except while
+   * `voiceSolveInFlight` -- see that flag's own doc comment on why a
+   * speech-only solve this client itself started needs `null` here instead,
+   * and why that is only ever a best-effort local guess.
+   */
+  function liveEntryTargetStamp() {
+    return voiceSolveInFlight ? null : currentTarget;
+  }
+
+  // -----------------------------------------------------------------------
+  // SSE wire.
   function connectEvents() {
     const source = new EventSource('/events');
 
+    source.addEventListener('open', () => {
+      connectionState = 'connected';
+      render();
+    });
+
     source.addEventListener('start', () => {
-      liveText = '';
-      renderAnswer('(waiting for the first token…)', 'streaming');
+      demoteLiveEntry();
+      liveEntry = { text: '', state: 'streaming', title: null, target: liveEntryTargetStamp(), usage: null, timestamp: null };
+      syncing = false;
+      render();
     });
 
     source.addEventListener('delta', (event) => {
       const data = JSON.parse(event.data);
-      liveText += data.text;
-      renderAnswer(liveText, 'streaming');
+      if (!liveEntry) liveEntry = { text: '', state: 'streaming', title: null, target: liveEntryTargetStamp(), usage: null, timestamp: null };
+      liveEntry.text += data.text;
+      syncing = false;
+      render();
     });
 
     // Mid-flight join / reconnect catch-up (#31): the accumulated text so
-    // far, in place of waiting silently for the next `start`.
+    // far, in place of waiting silently for the next `start`, with a
+    // transient "syncing…" tag (#34) until a real `delta` resumes.
     source.addEventListener('sync', (event) => {
       const data = JSON.parse(event.data);
-      liveText = data.text;
-      renderAnswer(liveText || '(waiting for the first token…)', 'streaming');
+      if (!liveEntry) liveEntry = { text: '', state: 'streaming', title: null, target: liveEntryTargetStamp(), usage: null, timestamp: null };
+      liveEntry.text = data.text;
+      liveEntry.state = 'streaming';
+      syncing = true;
+      render();
     });
 
     source.addEventListener('done', (event) => {
       const data = JSON.parse(event.data);
-      const title = parseAnswerTitle(liveText);
-      const isBail = title === BAIL_TITLE;
-      renderAnswer(liveText, isBail ? 'bail' : 'done');
+      if (!liveEntry) liveEntry = { text: '', state: 'streaming', title: null, target: liveEntryTargetStamp(), usage: null, timestamp: null };
+      const title = parseAnswerTitle(liveEntry.text);
+      liveEntry.title = title;
+      liveEntry.state = isBailTitle(title) ? 'bail' : 'done';
+      liveEntry.usage = data.usage;
+      liveEntry.timestamp = new Date().toISOString();
+      liveEntry.target = liveEntryTargetStamp();
+      liveEntry.model = '';
+      syncing = false;
+      // The solve this client itself initiated (if any) has now ended --
+      // see `voiceSolveInFlight`'s doc comment for why this has to be
+      // cleared here rather than left set for the next attempt.
+      voiceSolveInFlight = false;
       solveButton.disabled = currentTarget === null;
-
-      // A bail is never written to answers.jsonl (`logs/recorder.ts`) --
-      // mirrored here rather than live-adding a history entry the server
-      // itself would never have persisted. `currentTarget` is guaranteed
-      // non-null here: `start` (and so `done`) can only follow a `POST
-      // /solve` that itself required a configured target.
-      if (!isBail && currentTarget !== null) {
-        const entry = {
-          title,
-          text: liveText,
-          timestamp: new Date().toISOString(),
-          model: '',
-          usage: data.usage,
-          target: currentTarget,
-        };
-        // If the initial `GET /answers` snapshot hasn't rendered yet,
-        // adding straight to the DOM here would just be wiped out by its
-        // `innerHTML = ''` once it resolves -- queue it and `loadHistory()`
-        // replays the queue right after rendering the snapshot instead.
-        if (historySnapshotLoaded) addHistoryEntry(entry);
-        else queuedLiveHistoryEntries.push(entry);
-      }
+      // Re-enables all three buttons regardless of which endpoint started
+      // this solve -- see the mutual-exclusion comment above their click
+      // listeners. `#solve-voice-button`'s enabled-ness depends on whether
+      // this client has ever heard speech, not on `currentTarget`.
+      solveTranscriptButton.disabled = currentTarget === null;
+      solveVoiceButton.disabled = !hasHeardSpeech;
+      render();
     });
 
     // EventSource dispatches both the server's named `event: error` frames
@@ -687,11 +1474,28 @@
     // not, which is how the two are told apart below.
     source.addEventListener('error', (event) => {
       solveButton.disabled = currentTarget === null;
-      if (!event.data) return;
+      solveTranscriptButton.disabled = currentTarget === null;
+      solveVoiceButton.disabled = !hasHeardSpeech;
+      // Same "the solve this client initiated has ended" clearing as `done`
+      // above -- run unconditionally here too (rather than only inside the
+      // wire-frame branch below) to match the existing re-enable lines just
+      // above, which already treat a native connection error the same as a
+      // wire `error` frame for the purpose of un-disabling the buttons.
+      voiceSolveInFlight = false;
+      if (!event.data) {
+        // Native failure -- EventSource retries on its own; `readyState`
+        // says whether that retry is still coming (CONNECTING) or the
+        // browser has given up for good (CLOSED).
+        connectionState = source.readyState === EventSource.CLOSED ? 'disconnected' : 'reconnecting';
+        render();
+        return;
+      }
       const data = JSON.parse(event.data);
       solveError.hidden = false;
       solveError.textContent = `Solve failed (${data.kind}). The partial answer above is what streamed before it failed.`;
-      answerText.dataset.state = 'error';
+      if (liveEntry) liveEntry.state = 'error';
+      syncing = false;
+      render();
     });
 
     source.addEventListener('status', (event) => {
@@ -708,29 +1512,71 @@
       applyConfigIfNewer(data.target, data.revision);
     });
 
-    // Replayed immediately on connect whenever the server-side state isn't
-    // `'off'` (see the contract comment up top), so this can fire before
-    // anything else does -- `updateRecordingUI` doesn't care which frame is
-    // "first", only what the latest one says. A changed `segmentId` (a
-    // fresh start, or a roll to the next segment while still `'recording'`)
-    // or a transition to `'off'` (a stop, which finalizes the segment that
-    // was writing) both mean the `/recordings` list is now stale, so those
-    // are the only two cases that trigger a re-fetch -- a same-segment
-    // `bytes` tick every few seconds while recording does not.
+    // Recording state changing under this client (another tab toggling it,
+    // or this client's own `POST /recording` echoed back) -- routed through
+    // the same `applyRecordingIfNewer` the toggle's own POST response uses.
+    // Also what delivers connect-time catch-up: per the wire contract, a
+    // fresh `/events` connection replays this frame whenever state isn't
+    // `off`, so a client that opens mid-recording finds out promptly rather
+    // than staying on the `off` default until the next real change.
     source.addEventListener('recording', (event) => {
       const data = JSON.parse(event.data);
-      const shouldRefreshRecordings = data.state === 'off' || data.segmentId !== recordingState.segmentId;
-      recordingState = data;
-      updateRecordingUI();
-      if (shouldRefreshRecordings) loadRecordings();
+      applyRecordingIfNewer(data.state, data.revision);
+    });
+
+    // A finalized transcript segment. See `loadTranscript` for why the
+    // snapshot-vs-live race is handled with a queue instead of a revision
+    // latch (transcript has no single "current value" to compare a
+    // revision against, same as demoted entries and `queuedDemotedEntries`).
+    source.addEventListener('transcript', (event) => {
+      const data = JSON.parse(event.data);
+      if (transcriptSnapshotLoaded) addTranscriptEntry(data.entry);
+      else queuedLiveTranscriptEntries.push(data.entry);
+    });
+
+    // Replaces the pending line for one channel wholesale -- no diffing, no
+    // append. Also what delivers connect-time catch-up for a line already
+    // in progress when this client opens the stream (the wire contract
+    // replays the pending interim line per channel on connect, the same way
+    // it replays the `recording` frame above).
+    source.addEventListener('transcript-interim', (event) => {
+      const data = JSON.parse(event.data);
+      const wasNearBottom = isNearTranscriptBottom();
+      const interimEl = interimElementFor(data.channel);
+      interimEl.hidden = false;
+      interimEl.querySelector('.transcript-text').textContent = data.text;
+      if (wasNearBottom) transcriptList.scrollTop = transcriptList.scrollHeight;
+    });
+
+    // The *video* recorder (#47) -- a separate frame from `recording` above,
+    // which is the audio transcript toggle. Replayed immediately on connect
+    // whenever the server-side state isn't `'off'` (see the contract comment
+    // up top), so this can fire before anything else does;
+    // `updateScreenRecordingUI` doesn't care which frame is "first", only what
+    // the latest one says. A changed `segmentId` (a fresh start, or a roll to
+    // the next segment while still `'recording'`) or a transition to `'off'`
+    // (a stop, which finalizes the segment that was writing) both mean the
+    // `/screen-recordings` list is now stale, so those are the only two cases
+    // that trigger a re-fetch -- a same-segment `bytes` tick every second
+    // while recording does not.
+    source.addEventListener('screen-recording', (event) => {
+      const data = JSON.parse(event.data);
+      const shouldRefresh =
+        data.state === 'off' || data.segmentId !== screenRecordingState.segmentId;
+      screenRecordingState = data;
+      updateScreenRecordingUI();
+      if (shouldRefresh) loadScreenRecordings();
     });
   }
 
   loadConfig();
   loadHistory();
-  loadRecordings();
-  loadRecordingSettings();
-  loadRecordingState();
-  updateRecordingUI();
+  loadRecording();
+  loadTranscript();
+  loadScreenRecordings();
+  loadScreenRecordingSettings();
+  loadScreenRecordingState();
+  updateScreenRecordingUI();
   connectEvents();
+  render();
 })();

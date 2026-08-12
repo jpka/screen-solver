@@ -36,7 +36,7 @@ export interface ProviderSelection {
 }
 
 /**
- * Continuous recording's persisted settings (#45).
+ * Continuous recording's persisted settings (#47).
  *
  * Persisted, unlike the capture-adjacent toggle on `feat/audio-transcript`
  * (which is deliberately off on every launch and never written down). The
@@ -53,7 +53,7 @@ export interface ProviderSelection {
  * because `retention.ts`/`segment-policy.ts` take them as plain arguments
  * anyway — reading them from config costs nothing over hard-coding them.
  */
-export interface RecordingSettings {
+export interface ScreenRecordingSettings {
   /** Whether recording follows the capture session automatically. */
   readonly enabled: boolean;
   /** Roll to a fresh segment after this many seconds of wall clock. */
@@ -64,7 +64,7 @@ export interface RecordingSettings {
   readonly retentionDays: number;
 }
 
-export const DEFAULT_RECORDING_SETTINGS: RecordingSettings = Object.freeze({
+export const DEFAULT_SCREEN_RECORDING_SETTINGS: ScreenRecordingSettings = Object.freeze({
   enabled: false,
   segmentSeconds: 300,
   retentionBytes: 2 * 1024 * 1024 * 1024,
@@ -74,7 +74,7 @@ export const DEFAULT_RECORDING_SETTINGS: RecordingSettings = Object.freeze({
 export interface ScreenSolverConfig {
   readonly targetWindow: TargetWindowIdentity | null;
   readonly provider: ProviderSelection | null;
-  readonly recording: RecordingSettings;
+  readonly screenRecording: ScreenRecordingSettings;
 }
 
 /**
@@ -101,7 +101,7 @@ export type ConfigChangeEvent = {
 };
 
 /**
- * Emitted whenever {@link RecordingSettings} change (#45).
+ * Emitted whenever {@link ScreenRecordingSettings} change (#47).
  *
  * Deliberately a *separate* subscription from {@link ConfigChangeEvent} rather
  * than a second variant of it. Every existing `onChange` subscriber —
@@ -113,7 +113,7 @@ export type ConfigChangeEvent = {
  * forgetting the guard would silently reopen the capture session (and flicker
  * the OS capture border) every time a checkbox moved.
  */
-export type RecordingSettingsChangeEvent = {
-  readonly type: 'recording-settings';
-  readonly settings: RecordingSettings;
+export type ScreenRecordingSettingsChangeEvent = {
+  readonly type: 'screen-recording-settings';
+  readonly settings: ScreenRecordingSettings;
 };

@@ -1,6 +1,6 @@
 /**
  * The IPC channel names `recording.ts` (runs in main) uses to talk to the
- * hidden renderer's `MediaRecorder` (#45).
+ * hidden renderer's `MediaRecorder` (#47).
  *
  * Same hand-duplication rule as `capture-ipc-channels.ts`:
  * `static/renderer/preload.js` and `static/renderer/capture.js` copy these
@@ -14,17 +14,17 @@
  * on close and `capture-session.ts` doesn't (its listeners are per-request and
  * self-removing).
  */
-export const RECORDING_CHANNELS = {
+export const SCREEN_RECORDING_CHANNELS = {
   /** main -> renderer: begin recording the open capture stream into `segmentId`. */
-  start: 'screen-solver:recording:start',
+  start: 'screen-solver:screen-recording:start',
   /** main -> renderer: finish the current segment and begin the supplied one. */
-  roll: 'screen-solver:recording:roll',
+  roll: 'screen-solver:screen-recording:roll',
   /** main -> renderer: flush the final chunk and tear the recorder down. */
-  stop: 'screen-solver:recording:stop',
+  stop: 'screen-solver:screen-recording:stop',
   /** renderer -> main: one `dataavailable` payload, tagged with its segment. */
-  chunk: 'screen-solver:recording:chunk',
-  /** renderer -> main: lifecycle and failure reports (see {@link RecordingStatusMessage}). */
-  status: 'screen-solver:recording:status',
+  chunk: 'screen-solver:screen-recording:chunk',
+  /** renderer -> main: lifecycle and failure reports (see {@link ScreenRecordingStatusMessage}). */
+  status: 'screen-solver:screen-recording:status',
 } as const;
 
 /**
@@ -37,7 +37,7 @@ export const RECORDING_CHANNELS = {
  * by the timeslice — at one chunk per second of a downscaled window capture
  * this is tens to low hundreds of KB per message, not a whole recording.
  */
-export interface RecordingChunkMessage {
+export interface ScreenRecordingChunkMessage {
   readonly segmentId: string;
   readonly bytesBase64: string;
   /** `true` for the flush produced by stopping this segment's `MediaRecorder`. */
@@ -54,7 +54,7 @@ export interface RecordingChunkMessage {
  * `failed` is the only channel a mid-session failure has — by then there is no
  * outstanding call left to reject.
  */
-export type RecordingStatusMessage =
+export type ScreenRecordingStatusMessage =
   | { readonly state: 'started'; readonly mimeType: string }
   | { readonly state: 'rolled'; readonly segmentId: string }
   | { readonly state: 'stopped' }

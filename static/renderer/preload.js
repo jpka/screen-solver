@@ -13,12 +13,19 @@
 // ipcRenderer need.
 //
 // `contextBridge.exposeInMainWorld` is what makes this safe under
-// `contextIsolation: true`: it copies these functions into capture.js's main
-// world without giving capture.js's own script any access to `ipcRenderer`,
-// `require`, or anything else this file can see. Three inbound events (open,
-// close, request-frame) and one outbound reply (frame-result), all
-// capture-shaped, nothing else -- capture.js gets exactly this surface and
-// nothing more.
+// `contextIsolation: true`: it copies these functions into the page's main
+// world without giving the page's own scripts any access to `ipcRenderer`,
+// `require`, or anything else this file can see.
+//
+// Three surfaces, exposed separately rather than merged into one object:
+// `window.captureHost` (#30) is three inbound events (open, close,
+// request-frame) and one outbound reply (frame-result), all capture-shaped;
+// `window.screenRecordingHost` (#47) is the video recorder's five;
+// `window.audioHost` is the transcript pipeline's own four. They stay apart
+// because the modules behind them do -- capture-ipc-channels.ts,
+// screen-recording-ipc-channels.ts and audio-ipc-channels.ts are separate for
+// reasons each spells out -- and because capture.js and audio.js should each
+// see only what they use.
 'use strict';
 
 const { contextBridge, ipcRenderer } = require('electron');
@@ -35,16 +42,16 @@ const CAPTURE_CHANNELS = {
   frameResult: 'screen-solver:capture:frame-result',
 };
 
-// Mirrors src/main/recording-ipc-channels.ts (#45), for the same
+// Mirrors src/main/screen-recording-ipc-channels.ts (#47), for the same
 // can't-import-across-static reason as CAPTURE_CHANNELS above. Keep these
-// five strings in sync with recording-ipc-channels.ts by hand if either
+// five strings in sync with screen-recording-ipc-channels.ts by hand if either
 // changes.
-const RECORDING_CHANNELS = {
-  start: 'screen-solver:recording:start',
-  roll: 'screen-solver:recording:roll',
-  stop: 'screen-solver:recording:stop',
-  chunk: 'screen-solver:recording:chunk',
-  status: 'screen-solver:recording:status',
+const SCREEN_RECORDING_CHANNELS = {
+  start: 'screen-solver:screen-recording:start',
+  roll: 'screen-solver:screen-recording:roll',
+  stop: 'screen-solver:screen-recording:stop',
+  chunk: 'screen-solver:screen-recording:chunk',
+  status: 'screen-solver:screen-recording:status',
 };
 
 contextBridge.exposeInMainWorld('captureHost', {
@@ -81,34 +88,82 @@ contextBridge.exposeInMainWorld('captureHost', {
 
 // A second exposeInMainWorld object, not more members bolted onto
 // captureHost, because this is a genuinely separate subscription with its
-// own lifecycle (#45's recording.ts note: "these are a subscription, not a
-// per-request round trip" -- see recording-ipc-channels.ts) rather than
+// own lifecycle (#47's screen-recording.ts note: "these are a subscription, not a
+// per-request round trip" -- see screen-recording-ipc-channels.ts) rather than
 // another capture-shaped request/reply pair. Keeping the two surfaces
 // separate also means capture.js's recording code can be read on its own
 // without cross-referencing captureHost's request/reply shapes.
-contextBridge.exposeInMainWorld('recordingHost', {
+contextBridge.exposeInMainWorld('screenRecordingHost', {
   /** Fires when main wants recording started against segmentId, at timesliceMs. */
   onStart(handler) {
-    ipcRenderer.on(RECORDING_CHANNELS.start, (_event, segmentId, timesliceMs) => handler(segmentId, timesliceMs));
+    ipcRenderer.on(SCREEN_RECORDING_CHANNELS.start, (_event, segmentId, timesliceMs) => handler(segmentId, timesliceMs));
   },
 
   /** Fires when main wants the current segment finished and nextSegmentId begun. */
   onRoll(handler) {
-    ipcRenderer.on(RECORDING_CHANNELS.roll, (_event, nextSegmentId) => handler(nextSegmentId));
+    ipcRenderer.on(SCREEN_RECORDING_CHANNELS.roll, (_event, nextSegmentId) => handler(nextSegmentId));
   },
 
   /** Fires when main wants the open segment flushed and the recorder torn down. */
   onStop(handler) {
-    ipcRenderer.on(RECORDING_CHANNELS.stop, () => handler());
+    ipcRenderer.on(SCREEN_RECORDING_CHANNELS.stop, () => handler());
   },
 
   /** Sends one dataavailable payload (base64 bytes, tagged with its segment) to main. */
   sendChunk(message) {
-    ipcRenderer.send(RECORDING_CHANNELS.chunk, message);
+    ipcRenderer.send(SCREEN_RECORDING_CHANNELS.chunk, message);
   },
 
   /** Sends a lifecycle or failure report (started/rolled/stopped/failed) to main. */
   sendStatus(message) {
-    ipcRenderer.send(RECORDING_CHANNELS.status, message);
+    ipcRenderer.send(SCREEN_RECORDING_CHANNELS.status, message);
+  },
+});
+
+// Mirrors src/main/audio-ipc-channels.ts, duplicated by hand for the same
+// reason CAPTURE_CHANNELS above is: nothing under static/ can require a
+// module from src/, compiled or otherwise. Keep these four strings in sync
+// with audio-ipc-channels.ts by hand if either changes.
+const AUDIO_CHANNELS = {
+  start: 'screen-solver:audio:start',
+  stop: 'screen-solver:audio:stop',
+  chunk: 'screen-solver:audio:chunk',
+  status: 'screen-solver:audio:status',
+};
+
+contextBridge.exposeInMainWorld('audioHost', {
+  /** Fires when main wants loopback capture running. */
+  onStart(handler) {
+    ipcRenderer.on(AUDIO_CHANNELS.start, () => handler());
+  },
+
+  /** Fires when main wants whatever capture is running torn down. */
+  onStop(handler) {
+    ipcRenderer.on(AUDIO_CHANNELS.stop, () => handler());
+  },
+
+  /**
+   * Sends one ~100 ms block of 16 kHz signed-16 little-endian PCM to main.
+   *
+   * `pcm` is a plain `ArrayBuffer`, not a `Uint8Array` view and not base64 --
+   * see src/main/audio-ipc-channels.ts for why this stream makes the opposite
+   * call from capture.js's frames. Note that the buffer is *copied* twice on
+   * the way out (once by contextBridge into this world, once by ipcRenderer's
+   * own structured clone); the transfer list audio.js's worklet uses only
+   * saves the copy from the audio thread. Two 3.2 KB memcpys ten times a
+   * second is not worth a `postMessage` port to avoid.
+   */
+  sendChunk(channel, pcm) {
+    ipcRenderer.send(AUDIO_CHANNELS.chunk, channel, pcm);
+  },
+
+  /**
+   * Reports whether a `start` actually produced a running graph: 'started',
+   * or 'failed' with a reason. Main turns a failure into a rejected
+   * `openAudioCapture`, which is what lets the recording coordinator say
+   * 'error' instead of sitting in 'starting' forever.
+   */
+  reportStatus(state, reason) {
+    ipcRenderer.send(AUDIO_CHANNELS.status, { state, reason });
   },
 });

@@ -1,7 +1,7 @@
-import type { RecordingSegment } from '../logs/types.ts';
+import type { ScreenRecordingSegment } from '../logs/types.ts';
 
 /**
- * Which segments to delete (#45). Pure -- takes a folded index and the limits,
+ * Which segments to delete (#47). Pure -- takes a folded index and the limits,
  * returns ids. Nothing here touches the disk.
  *
  * This is genuinely new ground for this repo: nothing prunes anything today.
@@ -22,7 +22,7 @@ import type { RecordingSegment } from '../logs/types.ts';
 
 export interface RetentionInput {
   /** The folded index, in any order -- this function sorts what it needs. */
-  readonly segments: readonly RecordingSegment[];
+  readonly segments: readonly ScreenRecordingSegment[];
   readonly retentionBytes: number;
   readonly retentionDays: number;
   /** Now, injected so the age rule is testable without waiting. */

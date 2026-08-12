@@ -2,12 +2,12 @@ import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { silentLogger, type Logger } from '../logger.ts';
-import type { RecordingLog } from '../logs/recording-log.ts';
-import { segmentPath } from '../recording/segment-writer.ts';
+import type { ScreenRecordingLog } from '../logs/screen-recording-log.ts';
+import { segmentPath } from '../screen-recording/segment-writer.ts';
 import { sendJson, type Route } from './router.ts';
 
 /**
- * `GET /recordings/file?id=…` — serves one recorded segment (#45).
+ * `GET /screen-recordings/file?id=…` — serves one recorded segment (#47).
  *
  * **Why a query string and not `/recordings/:id`.** `router.ts` matches
  * pathnames exactly and says so in a comment: "the v1 HTTP surface has no path
@@ -25,7 +25,7 @@ import { sendJson, type Route } from './router.ts';
  */
 
 export interface SegmentFileRouteDeps {
-  readonly recordingLog: RecordingLog;
+  readonly screenRecordingLog: ScreenRecordingLog;
   /** `<stateRoot>/recordings`. */
   readonly dir: string;
   readonly logger?: Logger;
@@ -36,7 +36,7 @@ export function createSegmentFileRoute(deps: SegmentFileRouteDeps): Route {
 
   return {
     method: 'GET',
-    path: '/recordings/file',
+    path: '/screen-recordings/file',
     handle: async ({ res, url, req }) => {
       const id = url.searchParams.get('id');
       if (id === null || id === '') {
@@ -50,7 +50,7 @@ export function createSegmentFileRoute(deps: SegmentFileRouteDeps): Route {
       // it is exactly the shape a traversal takes (`?id=../../../../config`).
       // Looking it up means only ids this process itself minted can resolve at
       // all, and the containment check below is the belt to that suspenders.
-      const index = await deps.recordingLog.readIndex();
+      const index = await deps.screenRecordingLog.readIndex();
       const segment = index.find((candidate) => candidate.id === id);
       if (segment === undefined) {
         sendJson(res, 404, { error: 'not_found' });

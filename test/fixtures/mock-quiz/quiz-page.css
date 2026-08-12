@@ -1,0 +1,369 @@
+/*
+ * The mock quiz rig's styling: a plausible kata site, plus a bar of rig
+ * controls that reads as site furniture rather than as part of the exercise.
+ *
+ * Light theme only, and deliberately so -- this page is a photographic
+ * subject, not a UI someone lives in. A dark variant would only add a second
+ * thing to check every screenshot against.
+ */
+
+:root {
+  --ink: #1c2024;
+  --ink-muted: #5b6570;
+  --rule: #dfe3e8;
+  --page: #ffffff;
+  --canvas: #f4f6f8;
+  --editor-ink: #e6edf3;
+  --editor-bg: #1f2429;
+  --accent: #2f6f4f;
+  --warning-bg: #fff4d6;
+  --warning-rule: #e0b64a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--ink);
+  font: 16px/1.55 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The rig bar                                                                 */
+/* -------------------------------------------------------------------------- */
+
+.rig {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #22262b;
+  color: #cdd5de;
+  font-size: 13px;
+  padding: 6px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Presenter mode: every pixel of rig chrome gone, for a screenshot that is
+   nothing but the site. The keyboard shortcuts still drive the quiz. */
+body.presenting .rig,
+body.presenting .crib {
+  display: none;
+}
+
+.rig-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.rig-row-secondary {
+  font-size: 12px;
+  color: #93a0ad;
+}
+
+.rig-brand {
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #8fb5a0;
+}
+
+.rig-position {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.rig-kind {
+  border: 1px solid #4a525b;
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.rig-kind[data-kind='screen'] {
+  border-color: #4c7fb5;
+  color: #9dc4ec;
+}
+
+.rig-kind[data-kind='voice'] {
+  border-color: #b57f4c;
+  color: #edc49d;
+}
+
+.rig-kind[data-kind='voice-about-screen'] {
+  border-color: #7fb54c;
+  color: #c4ec9d;
+}
+
+.rig-press {
+  color: #cdd5de;
+}
+
+.rig-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+.rig button {
+  font: inherit;
+  background: #2f353c;
+  color: #e2e8ee;
+  border: 1px solid #444c55;
+  border-radius: 4px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.rig button:hover:not(:disabled) {
+  background: #3a424a;
+}
+
+.rig button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.rig-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rig-field select,
+.rig-field input {
+  font: inherit;
+  max-width: 260px;
+}
+
+.rig-status {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The page under test                                                         */
+/* -------------------------------------------------------------------------- */
+
+.stage {
+  padding: 20px;
+}
+
+.page {
+  max-width: 1180px;
+  margin: 0 auto;
+  background: var(--page);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 0 0 24px;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 6%);
+}
+
+.site-bar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 10px 24px;
+  border-bottom: 1px solid var(--rule);
+  background: #fafbfc;
+  border-radius: 6px 6px 0 0;
+}
+
+.site-brand {
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.site-nav {
+  display: flex;
+  gap: 18px;
+  color: var(--ink-muted);
+  font-size: 14px;
+}
+
+.exercise-title {
+  margin: 22px 24px 4px;
+  font-size: 30px;
+  line-height: 1.2;
+}
+
+.columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 28px;
+  padding: 12px 24px 0;
+}
+
+@media (max-width: 900px) {
+  .columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.statement h2,
+.editor-column h2 {
+  font-size: 15px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-muted);
+  margin: 22px 0 8px;
+}
+
+.statement p {
+  margin: 0 0 12px;
+}
+
+.example,
+.editor,
+.sample-tests {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 14px;
+  white-space: pre-wrap;
+  margin: 0 0 10px;
+}
+
+.example {
+  background: var(--canvas);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 10px 12px;
+}
+
+.constraints {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--ink);
+}
+
+.editor-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #2b3138;
+  color: #c9d3dd;
+  border-radius: 4px 4px 0 0;
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+/* The site's own "Run tests" button -- pure furniture, drawn rather than
+   labelled so the screenshot has the same visual weight a real one would. */
+.editor-tab-run::after {
+  content: 'Run tests';
+  background: var(--accent);
+  color: #ffffff;
+  border-radius: 3px;
+  padding: 3px 10px;
+}
+
+.editor {
+  background: var(--editor-bg);
+  color: var(--editor-ink);
+  border-radius: 0 0 4px 4px;
+  padding: 14px 16px;
+  min-height: 180px;
+}
+
+.sample-tests {
+  background: var(--canvas);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 12px 14px;
+}
+
+/* A page with nothing to solve on it. */
+.page-no-exercise .exercise-title {
+  margin-bottom: 8px;
+}
+
+.page-description {
+  margin: 0 24px 18px;
+  color: var(--ink-muted);
+}
+
+.catalogue {
+  margin: 0 24px;
+  padding: 0;
+  list-style: none;
+  max-width: 560px;
+}
+
+.catalogue li {
+  border-top: 1px solid var(--rule);
+  padding: 12px 4px;
+}
+
+.load-error {
+  max-width: 640px;
+  margin: 40px auto;
+  padding: 16px 18px;
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-rule);
+  border-radius: 6px;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The crib sheet                                                              */
+/* -------------------------------------------------------------------------- */
+
+.crib {
+  margin: 0 20px 24px;
+  border: 1px dashed #b9c0c8;
+  border-radius: 6px;
+  background: #fbfcfd;
+  padding: 8px 14px;
+  font-size: 14px;
+}
+
+.crib > summary {
+  cursor: pointer;
+  color: var(--ink-muted);
+}
+
+.crib[open] > summary {
+  color: #8a5a00;
+  font-weight: 600;
+}
+
+.crib-warning {
+  margin: 10px 0;
+  padding: 8px 12px;
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-rule);
+  border-radius: 4px;
+}
+
+.crib h2 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-muted);
+  margin: 16px 0 6px;
+}
+
+.crib-script li,
+.crib-checklist li {
+  margin-bottom: 4px;
+}
+
+.crib-checklist {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.crib-notes {
+  color: var(--ink-muted);
+}
+
+.crib-answer pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  white-space: pre-wrap;
+  background: var(--canvas);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 12px 14px;
+}

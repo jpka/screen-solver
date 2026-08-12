@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { shouldRollSegment } from '../../src/host/recording/segment-policy.ts';
-import { selectSegmentsToPrune } from '../../src/host/recording/retention.ts';
-import type { RecordingSegment } from '../../src/host/logs/types.ts';
+import { shouldRollSegment } from '../../src/host/screen-recording/segment-policy.ts';
+import { selectSegmentsToPrune } from '../../src/host/screen-recording/retention.ts';
+import type { ScreenRecordingSegment } from '../../src/host/logs/types.ts';
 
 describe('shouldRollSegment', () => {
   it('rolls when elapsed reaches segmentSeconds * 1000 exactly', () => {
@@ -45,8 +45,8 @@ describe('shouldRollSegment', () => {
   });
 });
 
-/** Builds a minimal RecordingSegment, overridable per test. */
-function segment(overrides: Partial<RecordingSegment> & { readonly id: string }): RecordingSegment {
+/** Builds a minimal ScreenRecordingSegment, overridable per test. */
+function segment(overrides: Partial<ScreenRecordingSegment> & { readonly id: string }): ScreenRecordingSegment {
   return {
     startedAt: '2026-01-01T00:00:00.000Z',
     endedAt: '2026-01-01T00:05:00.000Z',

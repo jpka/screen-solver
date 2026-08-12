@@ -9,7 +9,7 @@ import {
 } from '../../src/host/config/store.ts';
 import { StartupError } from '../../src/host/errors.ts';
 import {
-  DEFAULT_RECORDING_SETTINGS,
+  DEFAULT_SCREEN_RECORDING_SETTINGS,
   type ConfigChangeEvent,
   type WindowInfo,
 } from '../../src/host/config/types.ts';
@@ -24,7 +24,7 @@ describe('loadConfigStore', () => {
 
     const store = await loadConfigStore({ stateRoot });
 
-    // #45 added the `recording` block to the config shape, so "a fresh
+    // #47 added the `recording` block to the config shape, so "a fresh
     // config.json" is now three fields rather than two. Asserted in full
     // rather than field-by-field, deliberately: this test's job is to pin the
     // whole on-disk shape, and a later ticket adding a fourth field should
@@ -32,14 +32,14 @@ describe('loadConfigStore', () => {
     assert.deepEqual(store.get(), {
       targetWindow: null,
       provider: null,
-      recording: DEFAULT_RECORDING_SETTINGS,
+      screenRecording: DEFAULT_SCREEN_RECORDING_SETTINGS,
     });
 
     const onDisk = JSON.parse(await readFile(join(stateRoot, CONFIG_FILE_NAME), 'utf8'));
     assert.deepEqual(onDisk, {
       targetWindow: null,
       provider: null,
-      recording: DEFAULT_RECORDING_SETTINGS,
+      screenRecording: DEFAULT_SCREEN_RECORDING_SETTINGS,
     });
   });
 
@@ -51,11 +51,11 @@ describe('loadConfigStore', () => {
 
     const store = await loadConfigStore({ stateRoot, enumerateWindows: async () => [KATA_TAB] });
 
-    // The saved file predates #45 and has no `recording` block -- exactly what
+    // The saved file predates #47 and has no `recording` block -- exactly what
     // every config.json written by an earlier version looks like. It loads with
     // defaults filled in rather than refusing to start, and the file itself is
     // still not rewritten (this test's "no-op" claim).
-    assert.deepEqual(store.get(), { ...saved, recording: DEFAULT_RECORDING_SETTINGS });
+    assert.deepEqual(store.get(), { ...saved, screenRecording: DEFAULT_SCREEN_RECORDING_SETTINGS });
     assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')), saved);
   });
 

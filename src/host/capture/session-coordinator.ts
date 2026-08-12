@@ -12,7 +12,7 @@ import type { CapturedFrame, CaptureSession, OpenCaptureSession, TargetWindowIde
  * difference between a clean last segment and one truncated mid-chunk -- but
  * only briefly: a wedged renderer must not be able to freeze target switching,
  * and a truncated segment is still a playable segment (see
- * `recording/segment-writer.ts`), so the cost of giving up here is small.
+ * `screen-recording/segment-writer.ts`), so the cost of giving up here is small.
  */
 const SESSION_LISTENER_TIMEOUT_MS = 3_000;
 
@@ -26,9 +26,9 @@ export interface CaptureSessionCoordinatorOptions {
   /**
    * Notified whenever the live capture stream changes: `null` immediately
    * *before* a session is closed, and the new target immediately *after* one is
-   * opened (#45).
+   * opened (#47).
    *
-   * The before/after asymmetry is the whole point. #45's recorder sits on top
+   * The before/after asymmetry is the whole point. #47's recorder sits on top
    * of this coordinator's stream, and if it only learned about a target change
    * after the tracks were already stopped, its final chunk would be flushed
    * against a dead stream — a truncated last segment on every window switch.
@@ -38,7 +38,7 @@ export interface CaptureSessionCoordinatorOptions {
    * guaranteed without waiting for it.
    *
    * Left unset, nothing is notified and this coordinator behaves exactly as it
-   * did before #45 — the same "safe default that just does less" shape as every
+   * did before #47 — the same "safe default that just does less" shape as every
    * other optional dependency in `src/host`.
    */
   readonly onSessionChange?: (target: TargetWindowIdentity | null) => void | Promise<void>;

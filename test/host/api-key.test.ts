@@ -1,10 +1,16 @@
 import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
 import { describe, it } from 'node:test';
-import { API_KEY_ENV_VAR, takeApiKey } from '../../src/host/api-key.ts';
+import {
+  API_KEY_ENV_VAR,
+  DEEPGRAM_API_KEY_ENV_VAR,
+  takeApiKey,
+  takeDeepgramApiKey,
+} from '../../src/host/api-key.ts';
 import { StartupError } from '../../src/host/errors.ts';
 
 const KEY = 'sk-ant-test-000111222';
+const DEEPGRAM_KEY = 'dg-test-333444555';
 
 describe('takeApiKey', () => {
   it('returns the key and removes it from the environment', () => {
@@ -56,6 +62,57 @@ describe('takeApiKey', () => {
 
     for (const rendering of renderings) {
       assert.equal(rendering.includes(KEY), false, `leaked the key: ${rendering}`);
+      assert.match(rendering, /redacted/);
+    }
+  });
+});
+
+describe('takeDeepgramApiKey', () => {
+  it('returns the key and removes it from the environment', () => {
+    const env: NodeJS.ProcessEnv = { [DEEPGRAM_API_KEY_ENV_VAR]: DEEPGRAM_KEY, PATH: '/usr/bin' };
+
+    const secret = takeDeepgramApiKey(env);
+
+    assert.equal(secret?.reveal(), DEEPGRAM_KEY);
+    assert.equal(DEEPGRAM_API_KEY_ENV_VAR in env, false);
+    assert.equal(env['PATH'], '/usr/bin', 'unrelated variables are left alone');
+  });
+
+  it('trims surrounding whitespace', () => {
+    const env: NodeJS.ProcessEnv = { [DEEPGRAM_API_KEY_ENV_VAR]: `  ${DEEPGRAM_KEY}\n` };
+    assert.equal(takeDeepgramApiKey(env)?.reveal(), DEEPGRAM_KEY);
+  });
+
+  it('returns null rather than throwing when missing -- recording is optional, unlike solving', () => {
+    assert.equal(takeDeepgramApiKey({}), null);
+  });
+
+  it('treats a blank key as missing', () => {
+    assert.equal(takeDeepgramApiKey({ [DEEPGRAM_API_KEY_ENV_VAR]: '   ' }), null);
+  });
+
+  it('clears the variable on EVERY path, including the missing one', () => {
+    // The renderer snapshots `process.env` at creation, so a key left behind
+    // on the failure path is just as leaked as one left behind on success.
+    const blank: NodeJS.ProcessEnv = { [DEEPGRAM_API_KEY_ENV_VAR]: '' };
+    takeDeepgramApiKey(blank);
+    assert.equal(DEEPGRAM_API_KEY_ENV_VAR in blank, false);
+
+    const whitespace: NodeJS.ProcessEnv = { [DEEPGRAM_API_KEY_ENV_VAR]: '  ' };
+    takeDeepgramApiKey(whitespace);
+    assert.equal(DEEPGRAM_API_KEY_ENV_VAR in whitespace, false);
+  });
+
+  it('does not leak the key through stringification, JSON, or inspect', () => {
+    const secret = takeDeepgramApiKey({ [DEEPGRAM_API_KEY_ENV_VAR]: DEEPGRAM_KEY });
+    assert.ok(secret !== null);
+
+    for (const rendering of [
+      String(secret),
+      JSON.stringify({ apiKey: secret }),
+      inspect({ apiKey: secret }, { depth: 5 }),
+    ]) {
+      assert.equal(rendering.includes(DEEPGRAM_KEY), false, `leaked the key: ${rendering}`);
       assert.match(rendering, /redacted/);
     }
   });

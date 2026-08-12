@@ -2,7 +2,7 @@
  * Resolves `true` once `work` settles, or `false` if `timeoutMs` elapses first.
  *
  * Extracted from `bootstrap.ts` (#31), where shutdown's drain has always needed
- * it, once #45 gave it a second caller: `capture/session-coordinator.ts` awaits
+ * it, once #47 gave it a second caller: `capture/session-coordinator.ts` awaits
  * the recorder's flush before tearing a stream down, and that await needs the
  * same bound for the same reason shutdown's does -- the thing being waited on
  * is cooperative, and a wedged renderer must not be able to stall a target

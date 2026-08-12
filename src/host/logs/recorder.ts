@@ -51,18 +51,22 @@ export interface SolveLogRecorderDeps {
  * | outcome                              | `usage.jsonl` | `answers.jsonl`          |
  * |---------------------------------------|---------------|---------------------------|
  * | `done`, normal answer                 | yes           | yes                       |
- * | `done`, bail (`# No exercise on screen`) | yes        | no                        |
+ * | `done`, bail (either marker)          | yes           | no                        |
  * | `interrupted`                         | yes           | yes, `interrupted: true`  |
  * | `error`                               | yes           | no                        |
  *
- * A bail is detected exactly the way the model itself signals it: the
- * parsed title is the literal string `title.ts` calls `BAIL_TITLE` -- there
- * is no separate classifier, matching the spec's framing of the heading as
- * "the entire v1 'is there a problem here' detector". Bail detection only
- * ever applies to a `done` outcome (the spec's own definition: "a bail is a
- * `done` outcome whose title is exactly...") -- an `interrupted` outcome is
- * always recorded to `answers.jsonl`, even in the (degenerate, shouldn't
- * happen in practice) case its partial text happens to match the bail title.
+ * A bail is detected exactly the way the model itself signals it: the parsed
+ * title is one of the two literal strings `title.ts` exports -- `BAIL_TITLE`
+ * (`# No exercise on screen`, for a request that carried a screenshot) or
+ * `NO_QUESTION_TITLE` (`# No question in the recent speech`, for a spoken-only
+ * one that was shown no screen). There is no separate classifier, matching the
+ * spec's framing of the heading as "the entire v1 'is there a problem here'
+ * detector", and this module needs no branch per marker: both mean the same
+ * thing to the logs, which is why `isBailTitle()` collapses them. Bail
+ * detection only ever applies to a `done` outcome (the spec's own definition:
+ * "a bail is a `done` outcome whose title is exactly...") -- an `interrupted`
+ * outcome is always recorded to `answers.jsonl`, even in the (degenerate,
+ * shouldn't happen in practice) case its partial text happens to match one.
  *
  * Each write is independently try/caught and logged rather than thrown, so a
  * failure persisting one log (e.g. a full disk) doesn't prevent the other
@@ -107,6 +111,8 @@ export function createSolveLogRecorder(deps: SolveLogRecorderDeps): SolveLogReco
     const usage = outcome.type === 'done' ? outcome.usage : UNKNOWN_USAGE;
     const bail = outcome.type === 'done' && isBailTitle(title);
 
+    const withTranscript = event.withTranscript === true ? { withTranscript: true as const } : {};
+
     const usageEntry: UsageLogEntry = {
       timestamp,
       model,
@@ -115,6 +121,7 @@ export function createSolveLogRecorder(deps: SolveLogRecorderDeps): SolveLogReco
       usage,
       ...(bail ? { bail: true as const } : {}),
       ...(outcome.type === 'error' ? { errorKind: outcome.kind } : {}),
+      ...withTranscript,
     };
     try {
       await deps.usageLog.append(usageEntry);
@@ -133,6 +140,7 @@ export function createSolveLogRecorder(deps: SolveLogRecorderDeps): SolveLogReco
       usage,
       target,
       ...(outcome.type === 'interrupted' ? { interrupted: true as const } : {}),
+      ...withTranscript,
     };
     try {
       await deps.answerLog.append(answerEntry);

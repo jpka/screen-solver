@@ -1,7 +1,10 @@
 import type { ServerResponse } from 'node:http';
+import type { RecordingState } from '../audio/recording-coordinator.ts';
+import type { TranscriptChannel } from '../audio/types.ts';
 import type { TargetWindowIdentity } from '../config/types.ts';
+import type { TranscriptEntry } from '../logs/types.ts';
 import type { ProviderErrorKind, Usage } from '../provider/types.ts';
-import type { RecordingSnapshot } from '../recording/coordinator.ts';
+import type { ScreenRecordingSnapshot } from '../screen-recording/coordinator.ts';
 import type { StatusSnapshot } from './status.ts';
 
 /**
@@ -39,16 +42,45 @@ import type { StatusSnapshot } from './status.ts';
  * gives the client real ordering to compare against instead of guessing from
  * arrival order.
  *
- * `recording{state,segmentId,bytes,startedAt,reason}` (#45) is the recorder's
- * live state. It rides this same channel for the reason `status` already does
- * -- the spec ruled out a second push endpoint -- and is replayed on
- * `subscribe()` whenever the state isn't `off`, the same catch-up `sync` and
- * `status` use. It is broadcast both on real state changes *and* once per
- * second while recording, because `bytes` is a live counter: a client that only
- * learned the byte total at a segment boundary would show a frozen number for
- * minutes at a time. That makes it the one deliberately chatty event here, and
- * it stays cheap because it is a single small frame to a handful of local
- * clients.
+ * `transcript{entry}`, `transcript-interim{channel,text}` and
+ * `recording{state,revision}` are the audio feature's wire home, and they ride
+ * this same broadcast for exactly the reason `status` does -- the transcript
+ * pane is another view of the one shared, unfiltered, unauthenticated stream,
+ * not a second channel with its own connection lifecycle.
+ *
+ * The split between the two transcript events is the interim/final split
+ * Deepgram itself draws. A `final` is immutable and is what
+ * `transcript.jsonl` records, so `transcript` frames only ever append. An
+ * interim is revised wholesale by the next one, so `transcript-interim`
+ * *replaces* the pending line for its channel rather than adding to it --
+ * which is why it carries `channel` as its own field instead of a whole
+ * entry: there is nothing durable to describe yet.
+ *
+ * `recording` reuses the `config` revision idea for the identical reason: a
+ * client learns the recording state from two unordered sources (this frame and
+ * its own `GET /recording`), and arrival order says nothing about which is
+ * more current. Its own counter, not `config`'s -- recording state is
+ * deliberately not part of the persisted config, and one counter serving two
+ * unrelated things would make both of them lie.
+ *
+ * `screen-recording{state,segmentId,bytes,startedAt,reason}` (#47) is the
+ * *video* recorder's live state -- a deliberately different event from the
+ * `recording` frame above, which belongs to the audio/transcript feature.
+ * Both were built as "the recorder", independently, and the collision is
+ * resolved by naming rather than by merging them: they have different
+ * lifecycles (one follows the capture session, the other a manual toggle),
+ * different persistence (`screenRecording` settings survive a restart,
+ * transcript recording deliberately does not), and a client shows them in
+ * different places.
+ *
+ * It carries no `revision` counter, unlike `config` and `recording`. Those
+ * need one because their state can be learned from two unordered sources and
+ * arrival order says nothing about which is fresher. This frame is also
+ * readable via `GET /screen-recording`, but it is republished on a timer while
+ * recording (`bytes` is a live counter that would otherwise sit frozen between
+ * segment boundaries), so a stale snapshot self-corrects within a second
+ * rather than persisting. The client's own load-time read gives way to any
+ * frame it has already seen instead -- see `loadScreenRecordingState()`.
  */
 export type SseEvent =
   | { readonly type: 'start' }
@@ -58,7 +90,10 @@ export type SseEvent =
   | { readonly type: 'sync'; readonly text: string }
   | { readonly type: 'status'; readonly level: StatusSnapshot['level']; readonly kind: StatusSnapshot['kind'] }
   | { readonly type: 'config'; readonly target: TargetWindowIdentity | null; readonly revision: number }
-  | ({ readonly type: 'recording' } & RecordingSnapshot);
+  | { readonly type: 'transcript'; readonly entry: TranscriptEntry }
+  | { readonly type: 'transcript-interim'; readonly channel: TranscriptChannel; readonly text: string }
+  | { readonly type: 'recording'; readonly state: RecordingState; readonly revision: number }
+  | ({ readonly type: 'screen-recording' } & ScreenRecordingSnapshot);
 
 /**
  * One shared broadcast to every connected `GET /events` client -- no
@@ -125,19 +160,39 @@ export interface EventBroadcaster {
    */
   currentConfigRevision(): number;
   /**
-   * Broadcasts the recorder's current state (#45) -- `bootstrap.ts` wires this
-   * to `RecordingCoordinator`'s `onStateChange`. Unlike `status`, no
-   * change-filtering happens here: the coordinator deliberately republishes on
-   * a timer so the client's byte counter advances, and deciding what is worth
-   * sending is its job, not this broadcaster's.
+   * Broadcasts one finalized transcript segment -- the same entry
+   * `transcript.jsonl` just received. Append-only on the client: a final is
+   * never revised.
    */
-  recording(snapshot: RecordingSnapshot): void;
-  /** The recorder's last published state -- `subscribe()` replays it when it isn't `off`, and `GET /recording` serves it. */
-  currentRecording(): RecordingSnapshot;
+  transcript(entry: TranscriptEntry): void;
+  /**
+   * Broadcasts the current in-progress line for one channel, replacing
+   * whatever that channel's pending line was. Never persisted, and never
+   * fed to the model -- interim text is unstable by definition.
+   */
+  transcriptInterim(channel: TranscriptChannel, text: string): void;
+  /** The pending interim line per channel -- `subscribe()` replays these so a client that connects mid-sentence isn't staring at a blank pane. */
+  currentInterim(): ReadonlyMap<TranscriptChannel, string>;
+  /** Records the recording lifecycle's new state, assigns the next revision, and broadcasts it. */
+  recording(state: RecordingState): void;
+  recordingSnapshot(): { readonly state: RecordingState; readonly revision: number };
+  /**
+   * Broadcasts the *screen* recorder's current state (#47) -- `routes.ts` wires
+   * this to `ScreenRecordingCoordinator`'s `onStateChange`. Distinct from
+   * {@link recording} above, which is the audio/transcript recorder; see the
+   * `screen-recording` note on {@link SseEvent} for why the two stayed separate.
+   *
+   * Unlike `status`, no change-filtering happens here: the coordinator
+   * deliberately republishes on a timer so the client's byte counter advances,
+   * and deciding what is worth sending is its job, not this broadcaster's.
+   */
+  screenRecording(snapshot: ScreenRecordingSnapshot): void;
+  /** The screen recorder's last published state -- `subscribe()` replays it when it isn't `off`, and `GET /screen-recording` serves it. */
+  currentScreenRecording(): ScreenRecordingSnapshot;
 }
 
-/** What a client is told before any recorder has ever reported in. */
-const IDLE_RECORDING: RecordingSnapshot = Object.freeze({
+/** What a client is told before any screen recorder has ever reported in. */
+const IDLE_SCREEN_RECORDING: ScreenRecordingSnapshot = Object.freeze({
   state: 'off',
   segmentId: null,
   bytes: 0,
@@ -151,7 +206,10 @@ export function createEventBroadcaster(): EventBroadcaster {
   let inFlight = false;
   let status: StatusSnapshot = { level: 'silent', kind: null };
   let configRevision = 0;
-  let recording: RecordingSnapshot = IDLE_RECORDING;
+  let recordingState: RecordingState = 'off';
+  let recordingRevision = 0;
+  const interim = new Map<TranscriptChannel, string>();
+  let screenRecording: ScreenRecordingSnapshot = IDLE_SCREEN_RECORDING;
 
   function broadcast(event: SseEvent): void {
     const frame = frameFor(event);
@@ -206,18 +264,45 @@ export function createEventBroadcaster(): EventBroadcaster {
         }
       }
 
-      if (recording.state !== 'off') {
-        // Same one-client catch-up as `sync` and `status`. A client opening
-        // mid-recording has to learn that immediately -- a REC indicator that
-        // only appeared after the next state change would leave a phone showing
-        // "not recording" while the desktop was, in fact, recording, which is
-        // the one thing this feature must never do.
+      if (recordingState !== 'off') {
+        // The same "catch this one client up" idea as `sync` and `status`: a
+        // phone that unlocks mid-meeting must learn that recording is already
+        // live, rather than showing an Off toggle over a running session and
+        // inviting the user to "start" what is already started. `off` is the
+        // default and carries nothing to catch up on, exactly as `silent` does
+        // for the status pill.
         try {
-          res.write(frameFor({ type: 'recording', ...recording }));
+          res.write(frameFor({ type: 'recording', state: recordingState, revision: recordingRevision }));
         } catch {
           clients.delete(res);
         }
       }
+
+      if (screenRecording.state !== 'off') {
+        // The same one-client catch-up, for the video recorder. A phone opened
+        // mid-recording that displayed "not recording" while the desktop was in
+        // fact recording is the one thing this feature must never do.
+        try {
+          res.write(frameFor({ type: 'screen-recording', ...screenRecording }));
+        } catch {
+          clients.delete(res);
+        }
+      }
+
+      for (const [channel, text] of interim) {
+        // Without this a client connecting mid-sentence sees nothing at all
+        // until the speaker finishes the sentence they are already saying.
+        try {
+          res.write(frameFor({ type: 'transcript-interim', channel, text }));
+        } catch {
+          clients.delete(res);
+        }
+      }
+
+      // Finalized transcript lines are deliberately *not* replayed: `GET
+      // /transcript` already answers "what was said", and replaying an
+      // unbounded backlog down the event stream would duplicate it. The same
+      // argument `config` makes about `GET /config`.
 
       return () => {
         clients.delete(res);
@@ -261,12 +346,39 @@ export function createEventBroadcaster(): EventBroadcaster {
 
     currentConfigRevision: () => configRevision,
 
-    recording(snapshot) {
-      recording = snapshot;
-      broadcast({ type: 'recording', ...snapshot });
+    transcript(entry) {
+      // A final ends whatever interim line was pending for that channel: the
+      // sentence it was guessing at is now settled and has moved to the list.
+      interim.delete(entry.channel);
+      broadcast({ type: 'transcript', entry });
     },
 
-    currentRecording: () => recording,
+    transcriptInterim(channel, text) {
+      interim.set(channel, text);
+      broadcast({ type: 'transcript-interim', channel, text });
+    },
+
+    currentInterim: () => interim,
+
+    recording(state) {
+      recordingState = state;
+      recordingRevision += 1;
+      if (state === 'off') {
+        // Nothing is being transcribed any more, so a pending guess must not
+        // be replayed to the next client as though it still were.
+        interim.clear();
+      }
+      broadcast({ type: 'recording', state, revision: recordingRevision });
+    },
+
+    recordingSnapshot: () => ({ state: recordingState, revision: recordingRevision }),
+
+    screenRecording(snapshot) {
+      screenRecording = snapshot;
+      broadcast({ type: 'screen-recording', ...snapshot });
+    },
+
+    currentScreenRecording: () => screenRecording,
   };
 }
 

@@ -1,13 +1,13 @@
 import { join } from 'node:path';
 import { openJsonlFile, type JsonlFile } from './jsonl.ts';
-import type { RecordingLogEntry, RecordingSegment } from './types.ts';
+import type { ScreenRecordingLogEntry, ScreenRecordingSegment } from './types.ts';
 
-export const RECORDING_LOG_FILE_NAME = 'recordings.jsonl';
+export const SCREEN_RECORDING_LOG_FILE_NAME = 'recordings.jsonl';
 
 /** Where segment files live, alongside `recordings.jsonl` under the state root. */
 export const RECORDINGS_DIR_NAME = 'recordings';
 
-export interface RecordingLog extends JsonlFile<RecordingLogEntry> {
+export interface ScreenRecordingLog extends JsonlFile<ScreenRecordingLogEntry> {
   /**
    * Every segment that still exists on disk, folded from the raw event log and
    * ordered **newest first** -- the order `GET /recordings` serves and the
@@ -17,19 +17,19 @@ export interface RecordingLog extends JsonlFile<RecordingLogEntry> {
    * a segment that the writer appended a moment ago without any cache
    * invalidation between them.
    */
-  readIndex(): Promise<readonly RecordingSegment[]>;
+  readIndex(): Promise<readonly ScreenRecordingSegment[]>;
 }
 
-export interface RecordingLogOptions {
+export interface ScreenRecordingLogOptions {
   readonly stateRoot: string;
   readonly appendFile?: (path: string, contents: string) => Promise<void>;
   readonly readFile?: (path: string) => Promise<string>;
 }
 
 /** `recordings.jsonl` under the state root -- the fourth instance of `jsonl.ts`'s shape, plus a fold. */
-export function createRecordingLog(options: RecordingLogOptions): RecordingLog {
-  const file = openJsonlFile<RecordingLogEntry>({
-    path: join(options.stateRoot, RECORDING_LOG_FILE_NAME),
+export function createScreenRecordingLog(options: ScreenRecordingLogOptions): ScreenRecordingLog {
+  const file = openJsonlFile<ScreenRecordingLogEntry>({
+    path: join(options.stateRoot, SCREEN_RECORDING_LOG_FILE_NAME),
     appendFile: options.appendFile,
     readFile: options.readFile,
   });
@@ -37,8 +37,17 @@ export function createRecordingLog(options: RecordingLogOptions): RecordingLog {
   return {
     append: file.append,
     readAll: file.readAll,
-    async readIndex(): Promise<readonly RecordingSegment[]> {
-      return foldRecordingLog(await file.readAll());
+    readTail: file.readTail,
+    async readIndex(): Promise<readonly ScreenRecordingSegment[]> {
+      // Deliberately `readAll`, not `readTail`, despite this file having the
+      // same append-only shape `transcript.jsonl` needed a bounded read for.
+      // The fold has to see a segment's `opened` line to make sense of its
+      // `closed` or `pruned` one, and a tail window can cut between the two --
+      // which would silently drop the oldest retained recordings from the list.
+      // This log also grows ~3 lines per segment (one every few minutes at the
+      // default) rather than one every few seconds of speech, so reading it
+      // whole stays cheap in a way `transcript.jsonl` doesn't.
+      return foldScreenRecordingLog(await file.readAll());
     },
   };
 }
@@ -57,8 +66,8 @@ export function createRecordingLog(options: RecordingLogOptions): RecordingLog {
  * because one line refers to a segment whose `opened` line predates something
  * is a worse failure than skipping that line.
  */
-export function foldRecordingLog(entries: readonly RecordingLogEntry[]): readonly RecordingSegment[] {
-  const byId = new Map<string, RecordingSegment>();
+export function foldScreenRecordingLog(entries: readonly ScreenRecordingLogEntry[]): readonly ScreenRecordingSegment[] {
+  const byId = new Map<string, ScreenRecordingSegment>();
   const pruned = new Set<string>();
 
   for (const entry of entries) {

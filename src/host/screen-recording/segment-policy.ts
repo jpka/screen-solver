@@ -1,5 +1,5 @@
 /**
- * When to roll to a fresh segment (#45). Pure -- no clock, no disk, no state.
+ * When to roll to a fresh segment (#47). Pure -- no clock, no disk, no state.
  *
  * Rolling is what keeps a continuous recording usable at all. One unbounded
  * file would be unplayable until the recording stopped, impossible to prune
@@ -31,7 +31,7 @@ export interface SegmentRollInput {
   readonly elapsedMs: number;
   /** Bytes handed to the writer for the current segment so far. */
   readonly bytes: number;
-  /** `RecordingSettings.segmentSeconds`, already clamped by the config store. */
+  /** `ScreenRecordingSettings.segmentSeconds`, already clamped by the config store. */
   readonly segmentSeconds: number;
   /** Overridable for tests; production uses {@link MAX_SEGMENT_BYTES}. */
   readonly maxSegmentBytes?: number;

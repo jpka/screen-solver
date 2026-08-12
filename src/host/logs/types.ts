@@ -1,3 +1,4 @@
+import type { TranscriptChannel } from '../audio/types.ts';
 import type { TargetWindowIdentity } from '../config/types.ts';
 import type { ProviderErrorKind, Usage } from '../provider/types.ts';
 
@@ -27,14 +28,26 @@ export interface AnswerLogEntry {
    * interrupted call actually cost), not a design choice.
    */
   readonly usage: Usage;
-  /** The window this answer was solved against. */
-  readonly target: TargetWindowIdentity;
+  /**
+   * The window this answer was solved against, or `null` when the question
+   * was answered from speech alone (`POST /solve/transcript-only`) and no
+   * screenshot was ever taken -- see `SolveOutcomeEvent.target` for why this
+   * is a null rather than an omission.
+   */
+  readonly target: TargetWindowIdentity | null;
   /** Present and `true` only when the outcome was `interrupted`. */
   readonly interrupted?: true;
+  /**
+   * Present and `true` only when recent speech was actually sent to the
+   * model with this attempt -- not exclusive to an attempt that also carried
+   * a screenshot. See `SolveOutcomeEvent.withTranscript` for the full
+   * three-combination matrix against {@link target}.
+   */
+  readonly withTranscript?: true;
 }
 
 /**
- * One `recordings.jsonl` line (#45).
+ * One `recordings.jsonl` line (#47).
  *
  * Unlike `answers.jsonl`/`usage.jsonl`, where one line *is* one record, this
  * file is an append-only **event log** folded on read (`recording-log.ts`'s
@@ -61,7 +74,7 @@ export interface AnswerLogEntry {
  * thousand lines a year -- immaterial next to the video, and cheap to compact
  * later behind the same `readIndex` fold.
  */
-export type RecordingLogEntry =
+export type ScreenRecordingLogEntry =
   | {
       readonly type: 'opened';
       readonly id: string;
@@ -93,7 +106,7 @@ export type RecordingLogEntry =
     };
 
 /** One folded segment, as `GET /recordings` serves it and `retention.ts` reasons about it. */
-export interface RecordingSegment {
+export interface ScreenRecordingSegment {
   readonly id: string;
   readonly startedAt: string;
   /** `null` while this segment is still being written. */
@@ -114,7 +127,8 @@ export interface RecordingSegment {
 export interface UsageLogEntry {
   readonly timestamp: string;
   readonly model: string;
-  readonly target: TargetWindowIdentity;
+  /** `null` for a spoken-only solve -- see {@link AnswerLogEntry.target}. */
+  readonly target: TargetWindowIdentity | null;
   readonly outcome: 'done' | 'interrupted' | 'error';
   /**
    * Real token counts for `done`. `interrupted` and `error` outcomes carry
@@ -123,8 +137,61 @@ export interface UsageLogEntry {
    * limitation as `AnswerLogEntry.usage`.
    */
   readonly usage: Usage;
-  /** Present and `true` only when a `done` outcome's title was the v1 bail marker (`title.ts`). */
+  /**
+   * Present and `true` only when a `done` outcome's title was one of the bail
+   * markers (`title.ts`'s `BAIL_TITLE` or `NO_QUESTION_TITLE` -- an attempt
+   * that answered nothing, whether because the screen held no exercise or
+   * because the speech asked no question). Which of the two it was is
+   * recoverable from `answers.jsonl`... nowhere, in fact: a bail writes no
+   * answer line at all, so the marker itself is not persisted. Reach for the
+   * console or re-run if you need to know which; the two are the same fact
+   * for cost purposes, which is all this log is for.
+   */
   readonly bail?: true;
   /** Present only for an `error` outcome. */
   readonly errorKind?: ProviderErrorKind;
+  /**
+   * Present and `true` only when recent speech was actually sent to the
+   * model with this attempt -- not exclusive to an attempt that also carried
+   * a screenshot. See `SolveOutcomeEvent.withTranscript` for the full
+   * three-combination matrix against {@link target}.
+   */
+  readonly withTranscript?: true;
+}
+
+/**
+ * One `transcript.jsonl` line -- written only for a *final* transcript
+ * segment, never an interim one. Interim text is unstable by definition
+ * (Deepgram revises it, and a later message supersedes it wholesale), so
+ * persisting it would mean writing lines that later become wrong.
+ *
+ * Single append-only file across every recording session, not one file per
+ * session: `recordingSessionId` already provides the grouping, and per-session
+ * files would introduce a filesystem naming scheme this app has no other
+ * instance of. The third instance of the `jsonl.ts` shape, alongside
+ * `answers.jsonl` and `usage.jsonl`.
+ */
+export interface TranscriptEntry {
+  /** A fresh UUID per recording toggle-on -- groups the lines of one sitting. */
+  readonly recordingSessionId: string;
+  readonly channel: TranscriptChannel;
+  readonly text: string;
+  /**
+   * ISO 8601, UTC, for the END of this segment -- computed host-side as the
+   * moment the socket opened plus {@link endSeconds}.
+   *
+   * This is the only field safe to order by across a reconnect, which is
+   * exactly why it exists alongside the offsets below.
+   */
+  readonly timestamp: string;
+  /**
+   * Deepgram's own offsets, in seconds from the start of *that socket's*
+   * audio. Recorded honestly rather than normalized into a session-wide
+   * timeline: they restart at 0 every time the socket reconnects, and
+   * inventing a continuous timeline across a gap of unknown length would be
+   * fabricating precision this app does not have.
+   */
+  readonly startSeconds: number;
+  readonly endSeconds: number;
+  readonly model: string;
 }

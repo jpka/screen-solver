@@ -4,17 +4,17 @@ import type {
   OpenRecorderOptions,
   Recorder,
   SegmentId,
-} from '../host/recording/types.ts';
+} from '../host/screen-recording/types.ts';
 import {
-  RECORDING_CHANNELS,
-  type RecordingChunkMessage,
-  type RecordingStatusMessage,
-} from './recording-ipc-channels.ts';
+  SCREEN_RECORDING_CHANNELS,
+  type ScreenRecordingChunkMessage,
+  type ScreenRecordingStatusMessage,
+} from './screen-recording-ipc-channels.ts';
 
 /**
  * A renderer that never answers a `start` (crashed, wedged, or stuck
  * negotiating a `MediaRecorder` mime type) must not leave the caller waiting
- * on `createRealRecorderOpener`'s returned promise forever. Same reasoning as
+ * on `createRealScreenRecorderOpener`'s returned promise forever. Same reasoning as
  * `capture-session.ts`'s `FRAME_REQUEST_TIMEOUT_MS`, and reused below for
  * `roll()`'s own handshake and `close()`'s bounded wait for `stopped`: none of
  * these round trips should be able to hang the caller past a fixed budget,
@@ -41,11 +41,11 @@ const RECORDING_HANDSHAKE_TIMEOUT_MS = 10_000;
  *
  * Mechanism only, per `src/main`'s "nothing to decide here" rule: whether to
  * record at all, when a segment should roll, and what a failure means to the
- * user all live in `src/host/recording/`. This file only relays messages
+ * user all live in `src/host/screen-recording/`. This file only relays messages
  * across the IPC boundary and turns them into the `Recorder` shape
- * `src/host/recording/types.ts` defines.
+ * `src/host/screen-recording/types.ts` defines.
  */
-export function createRealRecorderOpener(hiddenWindowReady: Promise<BrowserWindow>): OpenRecorder {
+export function createRealScreenRecorderOpener(hiddenWindowReady: Promise<BrowserWindow>): OpenRecorder {
   return async (options: OpenRecorderOptions): Promise<Recorder> => {
     const window = await hiddenWindowReady;
     const { segmentId, sink, onFailure, timesliceMs } = options;
@@ -53,15 +53,15 @@ export function createRealRecorderOpener(hiddenWindowReady: Promise<BrowserWindo
     // Routes every `status` message to whichever step currently cares about
     // it: first the start handshake below, then (once that settles) the
     // live-session router that resolves `roll()` and reports async failures.
-    let onStatus: (message: RecordingStatusMessage) => void = () => {};
+    let onStatus: (message: ScreenRecordingStatusMessage) => void = () => {};
 
-    function chunkListener(event: IpcMainEvent, message: RecordingChunkMessage): void {
+    function chunkListener(event: IpcMainEvent, message: ScreenRecordingChunkMessage): void {
       if (event.sender !== window.webContents) return;
       const bytes = Buffer.from(message.bytesBase64, 'base64');
       sink({ segmentId: message.segmentId, bytes: new Uint8Array(bytes), last: message.last });
     }
 
-    function statusListener(event: IpcMainEvent, message: RecordingStatusMessage): void {
+    function statusListener(event: IpcMainEvent, message: ScreenRecordingStatusMessage): void {
       if (event.sender !== window.webContents) return;
       onStatus(message);
     }
@@ -76,12 +76,12 @@ export function createRealRecorderOpener(hiddenWindowReady: Promise<BrowserWindo
     // a failed start) is a leak: the next session's chunks would be delivered
     // to this session's `sink` as well, on top of `EventEmitter` eventually
     // warning about the pile-up of listeners on a process-global emitter.
-    ipcMain.on(RECORDING_CHANNELS.chunk, chunkListener);
-    ipcMain.on(RECORDING_CHANNELS.status, statusListener);
+    ipcMain.on(SCREEN_RECORDING_CHANNELS.chunk, chunkListener);
+    ipcMain.on(SCREEN_RECORDING_CHANNELS.status, statusListener);
 
     function removeListeners(): void {
-      ipcMain.removeListener(RECORDING_CHANNELS.chunk, chunkListener);
-      ipcMain.removeListener(RECORDING_CHANNELS.status, statusListener);
+      ipcMain.removeListener(SCREEN_RECORDING_CHANNELS.chunk, chunkListener);
+      ipcMain.removeListener(SCREEN_RECORDING_CHANNELS.status, statusListener);
     }
 
     const started = new Promise<string>((resolve, reject) => {
@@ -108,7 +108,7 @@ export function createRealRecorderOpener(hiddenWindowReady: Promise<BrowserWindo
       };
     });
 
-    send(window, RECORDING_CHANNELS.start, segmentId, timesliceMs);
+    send(window, SCREEN_RECORDING_CHANNELS.start, segmentId, timesliceMs);
 
     let mimeType: string;
     try {
@@ -119,7 +119,7 @@ export function createRealRecorderOpener(hiddenWindowReady: Promise<BrowserWindo
       // still have built part of a `MediaRecorder` before giving up, so tell
       // it to drop whatever it has. `stop` is idempotent on that side.
       removeListeners();
-      send(window, RECORDING_CHANNELS.stop);
+      send(window, SCREEN_RECORDING_CHANNELS.stop);
       throw error;
     }
 
@@ -187,7 +187,7 @@ export function createRealRecorderOpener(hiddenWindowReady: Promise<BrowserWindo
             },
           };
 
-          send(window, RECORDING_CHANNELS.roll, next);
+          send(window, SCREEN_RECORDING_CHANNELS.roll, next);
         });
       },
 
@@ -213,7 +213,7 @@ export function createRealRecorderOpener(hiddenWindowReady: Promise<BrowserWindo
               // `close()` only cares about the one `stopped` reply.
             };
 
-            send(window, RECORDING_CHANNELS.stop);
+            send(window, SCREEN_RECORDING_CHANNELS.stop);
           });
         } finally {
           // Runs even when the wait above hit its timeout, so a wedged

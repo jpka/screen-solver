@@ -1,12 +1,12 @@
 import { appendFile as appendFileFs, mkdir, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { silentLogger, type Logger } from '../logger.ts';
-import type { RecordingLog } from '../logs/recording-log.ts';
+import type { ScreenRecordingLog } from '../logs/screen-recording-log.ts';
 import type { TargetWindowIdentity } from '../config/types.ts';
 import type { SegmentId, VideoChunk } from './types.ts';
 
 /**
- * Chunks in, files and index lines out (#45).
+ * Chunks in, files and index lines out (#47).
  *
  * Two properties this exists to guarantee, both of which are the difference
  * between a recorder that survives a week of uptime and one that doesn't:
@@ -47,7 +47,7 @@ export const MAX_QUEUED_BYTES = 64 * 1024 * 1024;
 export interface SegmentWriterDeps {
   /** `<stateRoot>/recordings`. Created on first use. */
   readonly dir: string;
-  readonly recordingLog: RecordingLog;
+  readonly screenRecordingLog: ScreenRecordingLog;
   /**
    * Called when a write fails, or when the queue overflows. The coordinator
    * turns this into the `error` state; nothing recovers in place, because a
@@ -109,8 +109,8 @@ export function createSegmentWriter(deps: SegmentWriterDeps): SegmentWriter {
       await mkdir(deps.dir, { recursive: true });
       // Written *before* any bytes exist, so a segment killed mid-write is
       // still a listed, playable recording rather than an orphan file nothing
-      // knows about. See `RecordingLogEntry`'s doc comment.
-      await deps.recordingLog.append({ type: 'opened', id, startedAt, mimeType, target });
+      // knows about. See `ScreenRecordingLogEntry`'s doc comment.
+      await deps.screenRecordingLog.append({ type: 'opened', id, startedAt, mimeType, target });
     },
 
     write(chunk: VideoChunk): void {
@@ -157,7 +157,7 @@ export function createSegmentWriter(deps: SegmentWriterDeps): SegmentWriter {
         const finished = open.get(id);
         open.delete(id);
         try {
-          await deps.recordingLog.append({
+          await deps.screenRecordingLog.append({
             type: 'closed',
             id,
             endedAt: now().toISOString(),
@@ -191,7 +191,7 @@ export function createSegmentWriter(deps: SegmentWriterDeps): SegmentWriter {
           return;
         }
       }
-      await deps.recordingLog.append({ type: 'pruned', id, prunedAt: now().toISOString() });
+      await deps.screenRecordingLog.append({ type: 'pruned', id, prunedAt: now().toISOString() });
     },
 
     drain: () => chain,

@@ -268,13 +268,34 @@ client simply never set it, and get no static routes at all — the same
 "safe default that does less" shape every other optional `HostRuntime` field
 already has.
 
-**Continuous recording** (established by #45). A `MediaRecorder` attached to
+**Two different things are called "recording".** #35's audio/transcript feature
+and #47's video feature were built in parallel and independently arrived at the
+same word. They are kept apart by name rather than merged, because they are
+genuinely different: one follows the capture session and persists its settings
+across restarts, the other is a manual toggle that deliberately never persists;
+one writes `transcript.jsonl`, the other writes video segments plus
+`recordings.jsonl`. The convention, wherever they meet:
+
+| | audio/transcript (#35) | video (#47) |
+|---|---|---|
+| host dir | `src/host/audio/` | `src/host/screen-recording/` |
+| coordinator | `RecordingCoordinator` | `ScreenRecordingCoordinator` |
+| HTTP | `/recording`, `/transcript` | `/screen-recording*`, `/screen-recordings*` |
+| SSE frame | `recording{state,revision}` | `screen-recording{state,segmentId,bytes,…}` |
+| IPC channels | `screen-solver:audio:*` | `screen-solver:screen-recording:*` |
+| preload surface | `window.audioHost` | `window.screenRecordingHost` |
+| config key | *(not persisted)* | `screenRecording` |
+
+If a third thing ever wants the word, give it its own prefix too rather than
+overloading either of these.
+
+**Continuous screen recording** (established by #47). A `MediaRecorder` attached to
 the capture session's *existing* stream (`static/renderer/capture.js`), not a
 second `getUserMedia` grab -- a second grab would light a second OS capture
 session for one window, and would drift out of sync with the target the rest of
-the app believes it is watching. `src/host/recording/` holds every decision
+the app believes it is watching. `src/host/screen-recording/` holds every decision
 (`coordinator.ts`'s state machine, `segment-policy.ts`, `retention.ts`,
-`segment-writer.ts`); `src/main/recording.ts` and the two `static/renderer/`
+`segment-writer.ts`); `src/main/screen-recording.ts` and the two `static/renderer/`
 files hold only mechanism. Five things worth carrying forward:
 
 - **Push, not pull.** `capture/types.ts`'s session is pulled one frame at a
@@ -332,7 +353,7 @@ is permanently one segment short (found via a test that was flaky for exactly
 that reason).
 
 Recording settings are **persisted**, unlike `feat/audio-transcript`'s
-deliberately-never-persisted toggle. The premise of #45 is *automatic*
+deliberately-never-persisted toggle. The premise of #47 is *automatic*
 recording, and a recorder that forgot it was enabled on every restart would
 fail its own acceptance criterion. What the audio branch was protecting is kept
 another way: `enabled` defaults to `false`, the OS capture border is lit
@@ -342,7 +363,7 @@ and a growing byte count. The `recording` SSE frame is replayed on
 `status` are -- a phone opened mid-recording that displayed "not recording"
 would be the one genuinely unacceptable thing this feature could do.
 
-`GET /recordings/file?id=…` is the first endpoint in this codebase that needs a
+`GET /screen-recordings/file?id=…` is the first endpoint in this codebase that needs a
 parameter. It takes it in the **query string** rather than teaching `router.ts`
 path patterns, so "the v1 HTTP surface has no path parameters" stays true and
 the route table stays a `Map` lookup. Two things it must keep doing: resolve the
@@ -352,7 +373,7 @@ without depending on the route's own guards; and support `Range`, without which
 `<video>` cannot seek.
 
 **Shutdown ordering** (established by #31, tightened across three rounds of
-review; #45 joined the same phase). Anything that persists on its way out has to be drained by
+review; #47 joined the same phase). Anything that persists on its way out has to be drained by
 `StartedHost.shutdown()` (`bootstrap.ts`) *before* the resources it depends on
 are torn down, and the drain itself has to be bounded. The worked example is
 the solve loop: `SolveLoop.stop()` aborts the in-flight attempt (rather than
@@ -397,6 +418,194 @@ timeout. `before-quit`'s handler calls `event.preventDefault()` and only lets
 Electron's own quit sequence resume via an explicit `app.exit()` once
 `host.shutdown()` has settled (bound and all), so a leftover handle can't
 silently keep the process alive after shutdown has already given up on it.
+
+**Web client responsive layout** (established by #34, closing out #25's own
+spec). `static/client/` gains two phone-oriented layouts picked by
+orientation, swapping live with no reload -- nothing on the host side
+changed, this is entirely `app.js`/`styles.css`/`index.html`.
+
+- **Orientation is `innerWidth > innerHeight` directly, not a media query,
+  with a 480px landscape floor.** Verified against `prototype/21-web-client`
+  (#21's real-device prototyping, kept on that branch as prior art, not
+  promoted to `main`): a compound `matchMedia` query is one more thing that
+  can silently fail to match; a direct dimension comparison cannot.
+  `matchMedia`/`resize`/`orientationchange` are kept only as change
+  *triggers* that ask the comparison to re-run -- `orientationchange` in
+  particular re-checks again a frame later and once more after a short
+  delay, since Android fires it before the resize settles. The 480px floor
+  (clearing every phone in landscape, iPhone SE included) exists so a narrow
+  desktop window that happens to be taller-than-wide-adjacent doesn't get a
+  rail it has no room for.
+- **One `openEntryId`, not a per-layout pane mode.** Portrait
+  (`app.js`'s `renderPortrait`) is a continuous log -- one feed, physical
+  order fixed (newest/live first), whichever entry is "open" renders
+  expanded and outlined, everything else collapses to a line, tapping a
+  collapsed one opens it. Landscape (`renderLandscape`) is a 132px rail
+  (every entry, collapsed, live pinned at top) beside a single detail pane
+  holding whichever entry is open. Both layouts read the exact same
+  `openEntryId`, which is deliberately why a rotation needs no explicit
+  normalization step: the prototype's own writeup documented a "forced-
+  variant trap" where its rail's separate `paneMode: 'history'` concept
+  didn't survive being carried into the log layout unchanged (a live entry
+  rendered with history's chrome). There is only ever one open entry here,
+  full stop, so that mismatch has nowhere to live.
+- **`liveEntry` vs. `historyEntries` is folded, not duplicated.** The `#33`
+  client rendered "the current answer" and "history" as two independent
+  views, so a completed answer showed up twice (once in each). `#34`
+  collapses that: `liveEntry` is this session's current-or-just-finished
+  attempt, always referenced by the sentinel id `'live'`; `demoteLiveEntry()`
+  folds a *finished* (`state === 'done'`) one into `historyEntries` right
+  before the next `start` claims the slot, using the same
+  `completionIdentity`-keyed dedup queue #33 built for the snapshot-vs-stream
+  race (a fold that happens before `GET /answers` resolves is queued and
+  replayed after, filtered against what the snapshot already contains). A
+  bail or an `error` is simply dropped at that point, matching what
+  `logs/recorder.ts` would (not) persist -- there is nothing a reload would
+  ever show for either.
+- **The connection indicator collapses two signals onto one**, per the
+  prototype's own settled finding: the SSE socket's own state
+  (`connecting`/`connected`/`reconnecting`/`disconnected`, tracked off
+  `EventSource`'s native `open`/`error` events and `readyState`) while
+  `openEntryId === 'live'`, replaced wholesale by "Viewing history" the
+  moment it isn't -- a history view has no use for "the live socket is
+  fine underneath". A transient `syncing…` tag rides along, set on a `sync`
+  catch-up frame and cleared the moment a real `delta` resumes (or anything
+  else ends the window: `done`/`error`/a fresh `start`).
+- **Fullscreen is feature-detected, not assumed.** `document.documentElement
+  .requestFullscreen` (with the `webkit`-prefixed fallback) gates the
+  button's `disabled` state and its `title` tooltip -- confirmed functional
+  on Android Chrome by the same real-device prototyping; iPhone Safari has
+  never exposed the Fullscreen API for arbitrary elements, so there the
+  button renders visibly disabled with an explanation instead of failing
+  silently on click. ("Add to Home Screen" + a `display: standalone`
+  manifest is the prototype's noted alternate route for that case -- a
+  different mechanism, not built here.)
+
+Nothing here is unit-tested -- consistent with the ticket's own testing
+decision, and with #28's `window-enumeration.ts` / #30's `minimized-check.ts`
+precedent for "needs a real device/composited surface, stays manual/E2E-
+verified": there is no browser test runner in this repo, and orientation
+swap + fullscreen feature-detection both need a real (or at least a real
+Chromium) viewport to mean anything. Verified instead by booting the real
+HTTP surface (`createHostRoutes` + `createStaticRoutes`) against a temp
+state root and a scripted fake `Provider`, then driving it through a real
+Chromium viewport: the 480px floor's exact boundary (479px stays portrait,
+480px flips to landscape), rotation preserving whichever entry was open in
+both directions (live-open and history-open), the connection indicator's
+live/history swap, `demoteLiveEntry`'s fold-on-next-`start` behavior, and
+both the enabled and (via a feature-detection override, simulating iPhone
+Safari) disabled fullscreen-button states.
+
+**The spoken-only solve.** A third solve mode: the user asks a question out
+loud and nothing is captured at all. `POST /solve/transcript-only` +
+`static/client/`'s "Solve speech only" button, with four decisions worth
+keeping:
+
+- **`Provider.solve` takes `SolveImage | null`, and the absence of the image
+  block is the whole signal.** No second system prompt, no flag in the body --
+  `system-prompt.ts`'s own cache argument (one prompt, one 1-hour cached
+  ~1400-token prefix, so alternating between buttons never pays a cache miss)
+  applies with more force to a third mode than it did to the second. The prompt
+  gained a "Speech only, no screenshot" section instead, and the rules that
+  used to assume a screenshot always exists are now scoped to requests that
+  carry one. `anthropic.ts` also refuses a call with neither image nor
+  transcript rather than sending it: the model could only guess, and the guess
+  would still be billed.
+- **`SolveMode` is a closed union (`screen` / `screen-with-transcript` /
+  `transcript-only`), not a pair of booleans.** "Include the transcript" plus
+  "skip the screenshot" would make four combinations out of the three things
+  this app does, and the fourth has no question in it. `runAttempt` branches
+  once on a value it can exhaust; the committed half of an attempt (the
+  provider call, the single `broadcaster.start()`, the one terminal outcome,
+  the one `onOutcome`) is factored into `callProvider` so every mode shares it
+  and none of those invariants can drift per-mode.
+- **The spoken-only mode is blind to the target window, and the logs say so
+  with `target: null`.** No frame is grabbed, so a vanished, minimized or
+  entirely unconfigured window is irrelevant -- it is the one solve route that
+  answers `202` before the picker has ever been used, which is exactly the
+  case it exists for. `AnswerLogEntry.target` / `UsageLogEntry.target` /
+  `SolveOutcomeEvent.target` are nullable rather than carrying whatever
+  happened to be configured: recording a window for an attempt that never
+  looked at one would be a claim no screenshot supports. Null rather than
+  omitted, so it can't be confused with a line written before this mode
+  existed.
+- **A second bail marker, not a reused one.** `title.ts` gained
+  `NO_QUESTION_TITLE` (`# No question in the recent speech`) for speech that
+  asks nothing, because `# No exercise on screen` would be a false statement
+  about a request that was shown no screen. `isBailTitle()` accepts either, so
+  `recorder.ts`'s dispatch table needed no new branch -- both markers mean the
+  same thing to the logs (a `usage.jsonl` line, no `answers.jsonl` line).
+  `POST /solve/transcript-only` refuses `400 no_transcript` before spending a
+  call when the window is empty, so that marker only ever comes back for
+  speech that was genuinely captured and genuinely asked nothing.
+
+The transcript window is rendered twice on that route -- once by the handler to
+ask "is there anything to send?", once inside `trigger()` for the text that
+actually travels. Deliberate: the second render is what keeps "the transcript
+is what was being said when the button was pressed" true, and threading the
+first one into the loop would trade that property for the appearance of
+tidiness.
+
+**The mock quiz** (`test/fixtures/mock-quiz/`). One fixed set of problems
+covering the three ways a question reaches this app -- on the screen, out of
+the speakers, or both at once -- read by an automated e2e suite
+(`test/e2e/mock-quiz.e2e.test.ts`) and by a human at a real Windows machine
+(`npm run mock-quiz` serves the rig). Its own `README.md` is the manual
+procedure; what belongs here is the decisions behind it.
+
+- **The quiz is `quiz.json`, not a `.ts` module.** The manual rig is a browser
+  page, and nothing served to a browser in this repo can import from `src/` or
+  `test/` -- the same constraint that put `static/renderer/preload.js` in
+  hand-written plain JS. A TypeScript module holding the problems would have
+  needed a second copy for the page to render, so the data is JSON, `fetch`ed
+  by the page and `readFile`d by `quiz.ts`. `quiz.ts` is the typed *read* side
+  only, and it validates rather than trusts: a problem whose kind, screen,
+  speech and expected outcome don't line up is a thrown error, because the
+  three-kind taxonomy is the entire point of the fixture and a quiz that
+  silently lost one of them would still pass every assertion.
+- **A voice-only problem has two right answers, and the fixture holds both.**
+  Which one is correct depends on which button was pressed, so `expected` is
+  what the problem's own route should produce and `expectedIfScreenSent` is
+  what the screen-carrying button must produce instead. Pressed with "Solve
+  speech only" a spoken question is genuinely answered; pressed with "Solve
+  with transcript" the catalogue screenshot goes along with the speech and the
+  screen is still authoritative, so `# No exercise on screen` remains the only
+  correct answer. Before the spoken-only mode existed the bail was the *only*
+  expectation these problems had -- keeping it as the second one is what stops
+  the new capability from quietly eroding the older rule, which is the
+  regression a quiz is for. (Each expectation carries its own
+  `scriptedAnswer`, so the answer a fake provider streams in an automated run
+  is still the answer a human grades a real model against.)
+- **The rig never renders the spoken script.** A page that printed the question
+  would turn a voice problem into a screen problem and quietly pass the test
+  the app should fail, so the script lives in a crib sheet that is closed by
+  default and warns that it is on screen while open. That was true when a voice
+  problem could only bail and it is more load-bearing now that one can be
+  answered: with the script visible, a "spoken-only" solve would be reading its
+  own question off the screenshot it isn't sending.
+- **The e2e harness grew the audio half rather than a second harness.**
+  `bootApp` now wires fakes for `openAudioCapture` and `transcriber` at the
+  same injection points production uses, and `E2EApp` gained the recording
+  vocabulary (`startRecording`, `say`, `pushAudio`, `getTranscript`,
+  `waitForTranscriptLines`) -- so speech enters an e2e run at the
+  transcription seam, exactly where Deepgram would put it, and everything
+  downstream is the real code path. They are wired unconditionally (a
+  `recording: false` boot option exists for the "no key" state): an app whose
+  recording toggle reports `'unavailable'` is a differently-configured app,
+  and this harness's job is the fully assembled one. `ScriptedCall` also
+  carries the whole `SolveOptions` now, not just `signal`, because the
+  difference `POST /solve` promises is between "no transcript key" and "a
+  transcript key that happens to be undefined", and only the raw object can be
+  asked which one it is.
+
+What the automated run does *not* prove is worth restating wherever this
+fixture is used: the provider is faked, so `scriptedAnswer` is what the fake
+streams and `expected.mustMention` is for a human grading a real run. The
+suite covers the plumbing between the two buttons and the disk -- which route
+carries speech, that a screenshot goes out on every solve, that the transcript
+reaching the model is the speech actually captured, and that each problem
+leaves the right pair of JSONL lines. Answer *quality* stays manual, the same
+call `solve-journey.e2e.test.ts` already documents for the prompt contract.
 
 ### Environment setup
 

@@ -29,7 +29,7 @@
   /** @type {CanvasRenderingContext2D|null} */
   let ctx = null;
 
-  // Recording state (#45). This MediaRecorder sits on top of `stream` --
+  // Recording state (#47). This MediaRecorder sits on top of `stream` --
   // whatever getUserMedia grab is already live for the capture feature above
   // -- rather than opening a second one. A second getUserMedia against the
   // same desktopCapturer source would light a second OS capture session (a
@@ -69,7 +69,7 @@
   // capture-indicator border lit for a target that was already deselected.
   let sessionToken = 0;
 
-  // stopStream() is `async` (#45) so it can flush a live recorder before it
+  // stopStream() is `async` (#47) so it can flush a live recorder before it
   // rips the tracks that recorder is reading out from under it. Its callers
   // (openSession, closeSession) were already fine awaiting it -- openSession
   // is async itself, and closeSession's caller below already tolerates a
@@ -222,7 +222,7 @@
     return btoa(binary);
   }
 
-  // --- Continuous recording (#45) -------------------------------------
+  // --- Continuous recording (#47) -------------------------------------
   //
   // A MediaRecorder over the same `stream` the capture feature above already
   // owns -- see stopStream()'s comment for why this never calls getUserMedia
@@ -233,15 +233,15 @@
 
   /**
    * Base64-encodes one recorder chunk and sends it to main over
-   * window.recordingHost, tagged with the segment it belongs to.
+   * window.screenRecordingHost, tagged with the segment it belongs to.
    */
   async function sendChunk(segmentId, blob, last) {
     const bytes = new Uint8Array(await blob.arrayBuffer());
-    window.recordingHost.sendChunk({ segmentId, bytesBase64: bytesToBase64(bytes), last });
+    window.screenRecordingHost.sendChunk({ segmentId, bytesBase64: bytesToBase64(bytes), last });
   }
 
   function reportStatus(message) {
-    window.recordingHost.sendStatus(message);
+    window.screenRecordingHost.sendStatus(message);
   }
 
   /**
@@ -383,19 +383,19 @@
 
   window.captureHost.onRequestFrame(() => captureFrame());
 
-  window.recordingHost.onStart((segmentId, timesliceMs) => {
+  window.screenRecordingHost.onStart((segmentId, timesliceMs) => {
     startRecording(segmentId, timesliceMs).catch((error) => {
       reportStatus({ state: 'failed', reason: error instanceof Error ? error.message : String(error) });
     });
   });
 
-  window.recordingHost.onRoll((nextSegmentId) => {
+  window.screenRecordingHost.onRoll((nextSegmentId) => {
     rollRecording(nextSegmentId).catch((error) => {
       reportStatus({ state: 'failed', reason: error instanceof Error ? error.message : String(error) });
     });
   });
 
-  window.recordingHost.onStop(() => {
+  window.screenRecordingHost.onStop(() => {
     stopRecording().catch((error) => {
       console.error('screen-solver recording: failed to stop cleanly', error);
       reportStatus({ state: 'stopped' });

@@ -35,9 +35,19 @@ export interface ImageContentBlock {
   };
 }
 
+export interface TextContentBlock {
+  readonly type: 'text';
+  readonly text: string;
+}
+
 export interface UserMessage {
   readonly role: 'user';
-  readonly content: readonly ImageContentBlock[];
+  /**
+   * The image is always present; a text block follows it only when the caller
+   * supplied a transcript. Order is load-bearing — see `buildRequest` in
+   * `anthropic.ts`.
+   */
+  readonly content: readonly (ImageContentBlock | TextContentBlock)[];
 }
 
 /** The request body, in wire shape — snake_case on purpose, it is JSON. */

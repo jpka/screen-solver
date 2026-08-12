@@ -1,5 +1,9 @@
 import { join } from 'node:path';
-import { API_KEY_ENV_VAR, takeApiKey } from './api-key.ts';
+import { API_KEY_ENV_VAR, DEEPGRAM_API_KEY_ENV_VAR, takeApiKey, takeDeepgramApiKey } from './api-key.ts';
+import { createDeepgramTranscriber } from './audio/deepgram.ts';
+import type { RecordingCoordinator } from './audio/recording-coordinator.ts';
+import type { OpenAudioCapture, Transcriber } from './audio/types.ts';
+import { createTranscriptWindow } from './audio/window.ts';
 import { readHttpBinding, type HttpBinding } from './binding.ts';
 import {
   startCaptureSessionCoordinator,
@@ -13,11 +17,15 @@ import type { Route } from './http/router.ts';
 import { createStaticRoutes } from './http/static.ts';
 import { createAnswerLog } from './logs/answer-log.ts';
 import { createSolveLogRecorder } from './logs/recorder.ts';
-import { createRecordingLog, RECORDINGS_DIR_NAME } from './logs/recording-log.ts';
+import { createScreenRecordingLog, RECORDINGS_DIR_NAME } from './logs/screen-recording-log.ts';
+import { createTranscriptLog } from './logs/transcript-log.ts';
 import { createUsageLog } from './logs/usage-log.ts';
-import { createRecordingCoordinator, type RecordingCoordinator } from './recording/coordinator.ts';
-import { createSegmentWriter } from './recording/segment-writer.ts';
-import type { OpenRecorder } from './recording/types.ts';
+import {
+  createScreenRecordingCoordinator,
+  type ScreenRecordingCoordinator,
+} from './screen-recording/coordinator.ts';
+import { createSegmentWriter } from './screen-recording/segment-writer.ts';
+import type { OpenRecorder } from './screen-recording/types.ts';
 import { settlesWithin } from './settles-within.ts';
 import {
   startHttpServer as defaultStartHttpServer,
@@ -118,9 +126,24 @@ export interface HostRuntime {
    */
   readonly clientStaticDir?: string;
   /**
-   * Opens a `MediaRecorder` over the live capture stream (#45). Electron
-   * supplies the real implementation (`src/main/recording.ts`); tests supply a
-   * fake. Left unset, the recording coordinator is still constructed and its
+   * Loopback audio capture. Electron supplies the real implementation
+   * (`src/main/audio-capture.ts`); tests supply a fake that pushes canned
+   * PCM. Left unset, the recording toggle reports `'unavailable'` -- the same
+   * "safe default that just does less" shape as `openCaptureSession`.
+   */
+  readonly openAudioCapture?: OpenAudioCapture;
+  /**
+   * The transcription seam. Left unset, a real Deepgram transcriber is built
+   * from `DEEPGRAM_API_KEY` if one was in the environment, and recording stays
+   * `'unavailable'` if one wasn't. Tests inject a fake here instead of
+   * touching the network -- the same shape as `provider`.
+   */
+  readonly transcriber?: Transcriber;
+  /**
+   * Opens a `MediaRecorder` over the live capture stream (#47) -- the *video*
+   * recorder, distinct from `openAudioCapture` above. Electron supplies the
+   * real implementation (`src/main/screen-recording.ts`); tests supply a fake.
+   * Left unset, the screen-recording coordinator is still constructed and its
    * routes still exist, but it reports `unavailable` and never records -- the
    * same "safe default that just does less" shape as `openCaptureSession`.
    */
@@ -138,8 +161,10 @@ export interface StartedHost {
   readonly configStore: ConfigStore;
   /** #30's capture session lifecycle: one session held open for the current target, reopened on every change. */
   readonly captureSessionCoordinator: CaptureSessionCoordinator;
-  /** #45's continuous recorder, riding on top of that same capture session. */
+  /** The recording lifecycle: off until a client toggles it on, `'unavailable'` with no transcription key. */
   readonly recordingCoordinator: RecordingCoordinator;
+  /** #47's continuous *screen* recorder, riding on top of that same capture session. */
+  readonly screenRecordingCoordinator: ScreenRecordingCoordinator;
   shutdown(): Promise<void>;
 }
 
@@ -170,6 +195,11 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   }
 
   const apiKey = takeApiKey(env);
+  // Taken in the same breath, and for the same reason: `env` has to be clean
+  // of every key before Electron creates the hidden renderer, which snapshots
+  // `process.env` at creation. Optional, unlike the Anthropic key -- see
+  // `takeDeepgramApiKey`.
+  const deepgramApiKey = takeDeepgramApiKey(env);
   const binding = readHttpBinding(env);
 
   // Built here rather than in `src/main`, unlike `enumerateWindows` and
@@ -178,6 +208,16 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   // a fixed system prompt, both already available at this point in the
   // startup sequence.
   const provider = runtime.provider ?? createProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT });
+
+  // Same reasoning as `provider` above -- nothing Electron-specific is needed,
+  // only the key just taken. `undefined` when no key was set, which is what
+  // makes the recording toggle report `'unavailable'` instead of failing at
+  // the moment someone presses it.
+  const transcriber =
+    runtime.transcriber ??
+    (deepgramApiKey === null
+      ? undefined
+      : createDeepgramTranscriber({ apiKey: deepgramApiKey, logger }));
 
   const stateRoot = await ensureStateRoot(runtime.stateRoot);
   const configStore = await loadConfigStore({
@@ -193,26 +233,36 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   const usageLog = createUsageLog({ stateRoot });
   const solveLogRecorder = createSolveLogRecorder({ answerLog, usageLog, logger });
 
-  // #45's recorder. Built before the capture coordinator because that
+  // The transcript's durable half, alongside the two above; the in-memory
+  // half is the bounded window `POST /solve/with-transcript` reads. Both are
+  // created unconditionally -- an unused window costs nothing, and a
+  // `transcript.jsonl` is only actually created on the first line written.
+  const transcriptLog = createTranscriptLog({ stateRoot });
+  const transcriptWindow = createTranscriptWindow();
+
+  // #47's screen recorder. Built before the capture coordinator because that
   // coordinator's `onSessionChange` hook needs something to notify -- the
-  // recorder follows the capture session, not the other way round.
-  const recordingLog = createRecordingLog({ stateRoot });
+  // recorder follows the capture session, not the other way round. This is also
+  // why it is constructed here rather than inside `createHostRoutes` the way
+  // the audio recording coordinator is: by the time the routes exist, the
+  // capture coordinator already needs it.
+  const screenRecordingLog = createScreenRecordingLog({ stateRoot });
   const recordingsDir = join(stateRoot, RECORDINGS_DIR_NAME);
-  const recordingCoordinator = createRecordingCoordinator({
+  const screenRecordingCoordinator = createScreenRecordingCoordinator({
     writer: createSegmentWriter({
       dir: recordingsDir,
-      recordingLog,
+      screenRecordingLog,
       // Routed back through the coordinator so a write failure lands in the
       // same `error` state a renderer failure does -- from the user's side
       // "the disk stopped accepting video" and "the recorder stopped producing
       // it" are the same event, and both must stop the recording rather than
       // let it appear to continue into nothing.
-      onError: (reason) => recordingCoordinator.fail(reason),
+      onError: (reason) => screenRecordingCoordinator.fail(reason),
       logger,
     }),
-    recordingLog,
+    screenRecordingLog,
     openRecorder: runtime.openRecorder,
-    settings: () => configStore.get().recording,
+    settings: () => configStore.get().screenRecording,
     currentTarget: () => captureSessionCoordinator.currentTarget(),
     logger,
   });
@@ -227,7 +277,7 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
     openSession: runtime.openCaptureSession ?? NEVER_OPENS,
     // #45: awaited (bounded) so the recorder flushes its last chunk against a
     // live stream rather than a stopped one. See `onSessionChange`'s own doc.
-    onSessionChange: (target) => recordingCoordinator.onCaptureSessionChange(target),
+    onSessionChange: (target) => screenRecordingCoordinator.onCaptureSessionChange(target),
     logger,
   });
 
@@ -235,16 +285,23 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   // retention. Not awaited, for the same reason the capture session isn't:
   // reading the index and stat-ing files has nothing to do with whether the
   // HTTP surface can accept its first request.
-  void recordingCoordinator.reconcile().catch((error: unknown) => {
-    logger.error(`recording: startup reconciliation failed: ${describeError(error)}`);
+  void screenRecordingCoordinator.reconcile().catch((error: unknown) => {
+    logger.error(`screen recording: startup reconciliation failed: ${describeError(error)}`);
   });
 
   // `solveLoop` is `null` when `runtime.routes` was injected directly (tests
   // that bypass `createHostRoutes` entirely) -- shutdown then has no attempt
   // to await, the same "nothing to do" shape `solveLogRecorder.drain()` has
   // when nothing was ever recorded.
-  const { routes, solveLoop } = runtime.routes
-    ? { routes: runtime.routes, solveLoop: null }
+  const { routes, solveLoop, recordingCoordinator } = runtime.routes
+    ? {
+        routes: runtime.routes,
+        solveLoop: null,
+        // The full-bypass escape hatch gets a coordinator with nothing wired
+        // into it, so `shutdown()` below has the same shape either way and
+        // simply has nothing to close.
+        recordingCoordinator: createHostRoutes({}).recordingCoordinator,
+      }
     : createHostRoutes({
         configStore,
         captureSessionCoordinator,
@@ -253,8 +310,12 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
         isTargetMinimized: runtime.isTargetMinimized,
         onOutcome: (event) => solveLogRecorder.record(event),
         answerLog,
-        recordingCoordinator,
-        recordingLog,
+        transcriber,
+        openAudioCapture: runtime.openAudioCapture,
+        transcriptLog,
+        transcriptWindow,
+        screenRecordingCoordinator,
+        screenRecordingLog,
         recordingsDir,
         logger,
       });
@@ -284,6 +345,7 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
       server,
       configStore,
       captureSessionCoordinator,
+      screenRecordingCoordinator,
       recordingCoordinator,
       shutdown: async () => {
         // Let whatever solve attempt is currently in flight reach a terminal
@@ -302,29 +364,43 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
         // nor the disk write is something this process can force to complete,
         // and shutdown has to end regardless.
         //
-        // #45's recorder joins this same bounded phase rather than adding a
-        // second unbounded await after it (AGENTS.md, "Shutdown ordering"). Its
-        // `stop()` is what makes the renderer flush the segment's final chunk,
-        // and `drain()` waits for that chunk and its `closed` index line to
-        // reach disk. Both run *before* `captureSessionCoordinator.stop()`
-        // below, because stopping the capture session kills the very stream the
-        // recorder is flushing from -- the same ordering the target-change path
-        // gets from `onSessionChange`, applied to shutdown.
+        // Recording joins this same phase rather than getting a second one
+        // after it, per `AGENTS.md`: "A future subsystem with the same shape
+        // belongs in the same bounded phase, not in a second unbounded await
+        // appended after it." Its order within the phase is load-bearing too --
+        // `recordingCoordinator.stop()` sends Deepgram `CloseStream`, which is
+        // what produces the *last* final of the session, so it has to run
+        // before the `drain()` that waits for that final to reach disk. Each
+        // transcription stream bounds its own close (`CLOSE_TIMEOUT_MS`,
+        // 1.5s), which is what keeps two subsystems fitting inside one 5s
+        // budget instead of the audio half starving the solve half.
         //
-        // Losing the tail here is survivable in a way losing the last answer
+        // #47's screen recorder joins the same phase for the same reason, and
+        // its ordering is load-bearing in the same way: `stop()` is what makes
+        // the renderer flush the segment's final chunk, and `drain()` waits for
+        // that chunk and its `closed` index line to reach disk. Both run
+        // *before* `captureSessionCoordinator.stop()` below, because stopping
+        // the capture session kills the very stream being flushed from -- the
+        // same ordering the target-change path gets from `onSessionChange`,
+        // applied to shutdown.
+        //
+        // Losing the video tail is survivable in a way losing the last answer
         // line isn't: the segment's bytes are already on disk, and the next
         // launch's `reconcile()` writes the `closed` line this gave up on.
         const drained = (async () => {
           await solveLoop?.stop();
-          await solveLogRecorder.drain();
           await recordingCoordinator.stop();
+          await screenRecordingCoordinator.stop();
+          await solveLogRecorder.drain();
           await recordingCoordinator.drain();
+          await screenRecordingCoordinator.drain();
         })();
         if (!(await settlesWithin(drained, runtime.solveDrainTimeoutMs ?? SOLVE_DRAIN_TIMEOUT_MS))) {
           logger.warn(
             'Shutting down without waiting any longer for in-flight work to finish persisting. ' +
-              'The last answers.jsonl / usage.jsonl line may be missing, and the recording in ' +
-              'progress will be closed out on the next launch instead.',
+              'The last answers.jsonl / usage.jsonl / transcript.jsonl line may be missing or ' +
+              'truncated, and any screen recording in progress will be closed out on the next ' +
+              'launch instead.',
           );
         }
 
@@ -342,4 +418,9 @@ function describeError(error: unknown): string {
 /** True once the key has been taken — asserted by tests, and cheap insurance. */
 export function apiKeyIsOutOfEnvironment(env: NodeJS.ProcessEnv): boolean {
   return !(API_KEY_ENV_VAR in env);
+}
+
+/** The same assertion for the transcription key, which has the same must-not-reach-the-renderer rule. */
+export function deepgramKeyIsOutOfEnvironment(env: NodeJS.ProcessEnv): boolean {
+  return !(DEEPGRAM_API_KEY_ENV_VAR in env);
 }

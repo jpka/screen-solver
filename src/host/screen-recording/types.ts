@@ -1,5 +1,5 @@
 /**
- * Continuous recording's public vocabulary (#45).
+ * Continuous recording's public vocabulary (#47).
  *
  * The same seam shape as `capture/types.ts` and `config/types.ts`: every
  * capability that only exists through Electron/Chromium is declared here as an

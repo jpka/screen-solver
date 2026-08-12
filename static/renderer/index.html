@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; media-src 'self' blob:"
+      content="default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'unsafe-inline'; media-src 'self' blob:"
     />
     <title>Screen Solver capture host</title>
   </head>
@@ -20,9 +20,20 @@
       src/host/capture/, run from main. capture.js is plain JavaScript, not
       compiled from TypeScript, per static/ being loaded/served as-is.
 
+      audio.js is the second, independent mechanism this page hosts: Windows
+      render loopback -> AudioWorklet -> 16 kHz PCM, handed to main over
+      window.audioHost. It is why the CSP above carries `worker-src 'self'` --
+      audioWorklet.addModule() is gated by worker-src (falling back to
+      script-src only when worker-src is absent entirely), and this page's
+      `default-src 'none'` is exactly such a fallback, so without the explicit
+      directive the worklet module load is blocked. Everything about *when* to
+      record and what to do with the audio lives in src/host/audio/, run from
+      main; audio.js decides nothing, same as capture.js.
+
       The web client (#33) is a different thing entirely and will be served over
       HTTP from static/client/, not loaded here.
     -->
     <script src="capture.js"></script>
+    <script src="audio.js"></script>
   </body>
 </html>

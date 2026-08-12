@@ -6,7 +6,10 @@ import { hiddenRendererPage, hiddenRendererPreload } from './paths.ts';
  *
  * It exists to do mechanism the main process can't: turn a `desktopCapturer`
  * source into a live `MediaStream`, draw it to a canvas, downscale, encode
- * (#30). No decision logic runs here.
+ * (#30), and — the second, unrelated pipeline sharing this same page — turn
+ * Windows render loopback into 16 kHz PCM through an `AudioWorklet`
+ * (`static/renderer/audio.js`, driven by `audio-capture.ts`). No decision
+ * logic runs here.
  *
  * Created only after {@link bootstrapHost} has already deleted the API key from
  * `process.env`, so the renderer cannot inherit it.
@@ -42,6 +45,14 @@ export async function createHiddenWindow(): Promise<BrowserWindow> {
       // A hidden window is by definition never visible; without this Chromium
       // throttles its timers and rAF, which would stall the capture pipeline.
       backgroundThrottling: false,
+      // A hidden window never receives a user gesture either, and Chromium's
+      // default autoplay policy refuses to let an `AudioContext` leave the
+      // suspended state without one. A suspended context never pulls its
+      // graph, so `static/renderer/audio.js`'s worklet would simply never run
+      // and the recording pipeline would produce silence with no error
+      // anywhere. Safe to relax here in a way it wouldn't be for a real page:
+      // nothing but our own two scripts ever loads in this renderer.
+      autoplayPolicy: 'no-user-gesture-required',
       preload: hiddenRendererPreload,
     },
   });
