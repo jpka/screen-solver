@@ -35,3 +35,27 @@ export function takeApiKey(env: NodeJS.ProcessEnv): Secret {
 
   return createSecret(value);
 }
+
+export const DEEPGRAM_API_KEY_ENV_VAR = 'DEEPGRAM_API_KEY';
+
+/**
+ * The same take-it-and-delete-it rule as {@link takeApiKey}, for the
+ * transcription key -- including on the missing path, since the renderer
+ * snapshots `process.env` at creation and must never see either key.
+ *
+ * Returns `null` instead of throwing, which is the one real difference. A
+ * missing Anthropic key means the app has nothing to do and refuses to start
+ * (`errors.ts`: "The app either comes up in a fully usable state or it prints
+ * one clear line and exits"). A missing Deepgram key only means the recording
+ * toggle reports `'unavailable'` -- every other thing this app does still
+ * works, so refusing to start over it would be a strictly worse trade. That is
+ * a deliberate carve-out from the no-degraded-mode rule, scoped to one
+ * optional capability rather than a general loosening of it.
+ */
+export function takeDeepgramApiKey(env: NodeJS.ProcessEnv): Secret | null {
+  const raw = env[DEEPGRAM_API_KEY_ENV_VAR];
+  delete env[DEEPGRAM_API_KEY_ENV_VAR];
+
+  const value = raw?.trim() ?? '';
+  return value === '' ? null : createSecret(value);
+}

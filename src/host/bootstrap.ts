@@ -1,4 +1,8 @@
-import { API_KEY_ENV_VAR, takeApiKey } from './api-key.ts';
+import { API_KEY_ENV_VAR, DEEPGRAM_API_KEY_ENV_VAR, takeApiKey, takeDeepgramApiKey } from './api-key.ts';
+import { createDeepgramTranscriber } from './audio/deepgram.ts';
+import type { RecordingCoordinator } from './audio/recording-coordinator.ts';
+import type { OpenAudioCapture, Transcriber } from './audio/types.ts';
+import { createTranscriptWindow } from './audio/window.ts';
 import { readHttpBinding, type HttpBinding } from './binding.ts';
 import {
   startCaptureSessionCoordinator,
@@ -12,6 +16,7 @@ import type { Route } from './http/router.ts';
 import { createStaticRoutes } from './http/static.ts';
 import { createAnswerLog } from './logs/answer-log.ts';
 import { createSolveLogRecorder } from './logs/recorder.ts';
+import { createTranscriptLog } from './logs/transcript-log.ts';
 import { createUsageLog } from './logs/usage-log.ts';
 import {
   startHttpServer as defaultStartHttpServer,
@@ -111,6 +116,20 @@ export interface HostRuntime {
    * about the JSON routes don't have to know this exists.
    */
   readonly clientStaticDir?: string;
+  /**
+   * Loopback audio capture. Electron supplies the real implementation
+   * (`src/main/audio-capture.ts`); tests supply a fake that pushes canned
+   * PCM. Left unset, the recording toggle reports `'unavailable'` -- the same
+   * "safe default that just does less" shape as `openCaptureSession`.
+   */
+  readonly openAudioCapture?: OpenAudioCapture;
+  /**
+   * The transcription seam. Left unset, a real Deepgram transcriber is built
+   * from `DEEPGRAM_API_KEY` if one was in the environment, and recording stays
+   * `'unavailable'` if one wasn't. Tests inject a fake here instead of
+   * touching the network -- the same shape as `provider`.
+   */
+  readonly transcriber?: Transcriber;
 }
 
 /** The state the app lives in for the rest of its life. */
@@ -124,6 +143,8 @@ export interface StartedHost {
   readonly configStore: ConfigStore;
   /** #30's capture session lifecycle: one session held open for the current target, reopened on every change. */
   readonly captureSessionCoordinator: CaptureSessionCoordinator;
+  /** The recording lifecycle: off until a client toggles it on, `'unavailable'` with no transcription key. */
+  readonly recordingCoordinator: RecordingCoordinator;
   shutdown(): Promise<void>;
 }
 
@@ -154,6 +175,11 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   }
 
   const apiKey = takeApiKey(env);
+  // Taken in the same breath, and for the same reason: `env` has to be clean
+  // of every key before Electron creates the hidden renderer, which snapshots
+  // `process.env` at creation. Optional, unlike the Anthropic key -- see
+  // `takeDeepgramApiKey`.
+  const deepgramApiKey = takeDeepgramApiKey(env);
   const binding = readHttpBinding(env);
 
   // Built here rather than in `src/main`, unlike `enumerateWindows` and
@@ -162,6 +188,16 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   // a fixed system prompt, both already available at this point in the
   // startup sequence.
   const provider = runtime.provider ?? createProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT });
+
+  // Same reasoning as `provider` above -- nothing Electron-specific is needed,
+  // only the key just taken. `undefined` when no key was set, which is what
+  // makes the recording toggle report `'unavailable'` instead of failing at
+  // the moment someone presses it.
+  const transcriber =
+    runtime.transcriber ??
+    (deepgramApiKey === null
+      ? undefined
+      : createDeepgramTranscriber({ apiKey: deepgramApiKey, logger }));
 
   const stateRoot = await ensureStateRoot(runtime.stateRoot);
   const configStore = await loadConfigStore({
@@ -176,6 +212,13 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   const answerLog = createAnswerLog({ stateRoot });
   const usageLog = createUsageLog({ stateRoot });
   const solveLogRecorder = createSolveLogRecorder({ answerLog, usageLog, logger });
+
+  // The transcript's durable half, alongside the two above; the in-memory
+  // half is the bounded window `POST /solve/with-transcript` reads. Both are
+  // created unconditionally -- an unused window costs nothing, and a
+  // `transcript.jsonl` is only actually created on the first line written.
+  const transcriptLog = createTranscriptLog({ stateRoot });
+  const transcriptWindow = createTranscriptWindow();
 
   // Not awaited: opening a session can take a moment (in production it waits
   // on the hidden renderer), and there is no reason to hold the HTTP bind
@@ -192,8 +235,15 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   // that bypass `createHostRoutes` entirely) -- shutdown then has no attempt
   // to await, the same "nothing to do" shape `solveLogRecorder.drain()` has
   // when nothing was ever recorded.
-  const { routes, solveLoop } = runtime.routes
-    ? { routes: runtime.routes, solveLoop: null }
+  const { routes, solveLoop, recordingCoordinator } = runtime.routes
+    ? {
+        routes: runtime.routes,
+        solveLoop: null,
+        // The full-bypass escape hatch gets a coordinator with nothing wired
+        // into it, so `shutdown()` below has the same shape either way and
+        // simply has nothing to close.
+        recordingCoordinator: createHostRoutes({}).recordingCoordinator,
+      }
     : createHostRoutes({
         configStore,
         captureSessionCoordinator,
@@ -202,6 +252,10 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
         isTargetMinimized: runtime.isTargetMinimized,
         onOutcome: (event) => solveLogRecorder.record(event),
         answerLog,
+        transcriber,
+        openAudioCapture: runtime.openAudioCapture,
+        transcriptLog,
+        transcriptWindow,
         logger,
       });
 
@@ -230,6 +284,7 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
       server,
       configStore,
       captureSessionCoordinator,
+      recordingCoordinator,
       shutdown: async () => {
         // Let whatever solve attempt is currently in flight reach a terminal
         // outcome -- and #31's persistence of it -- before tearing anything
@@ -246,14 +301,27 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
         // Bounded as a whole, per `SOLVE_DRAIN_TIMEOUT_MS`: neither the abort
         // nor the disk write is something this process can force to complete,
         // and shutdown has to end regardless.
+        //
+        // Recording joins this same phase rather than getting a second one
+        // after it, per `AGENTS.md`: "A future subsystem with the same shape
+        // belongs in the same bounded phase, not in a second unbounded await
+        // appended after it." Its order within the phase is load-bearing too --
+        // `recordingCoordinator.stop()` sends Deepgram `CloseStream`, which is
+        // what produces the *last* final of the session, so it has to run
+        // before the `drain()` that waits for that final to reach disk. Each
+        // transcription stream bounds its own close (`CLOSE_TIMEOUT_MS`,
+        // 1.5s), which is what keeps two subsystems fitting inside one 5s
+        // budget instead of the audio half starving the solve half.
         const drained = (async () => {
           await solveLoop?.stop();
+          await recordingCoordinator.stop();
           await solveLogRecorder.drain();
+          await recordingCoordinator.drain();
         })();
         if (!(await settlesWithin(drained, runtime.solveDrainTimeoutMs ?? SOLVE_DRAIN_TIMEOUT_MS))) {
           logger.warn(
-            'Shutting down without waiting any longer for the in-flight solve to finish persisting. ' +
-              'Its answers.jsonl / usage.jsonl line may be missing or truncated.',
+            'Shutting down without waiting any longer for in-flight work to finish persisting. ' +
+              'The last answers.jsonl / usage.jsonl / transcript.jsonl line may be missing or truncated.',
           );
         }
 
@@ -290,4 +358,9 @@ function settlesWithin(work: Promise<void>, timeoutMs: number): Promise<boolean>
 /** True once the key has been taken — asserted by tests, and cheap insurance. */
 export function apiKeyIsOutOfEnvironment(env: NodeJS.ProcessEnv): boolean {
   return !(API_KEY_ENV_VAR in env);
+}
+
+/** The same assertion for the transcription key, which has the same must-not-reach-the-renderer rule. */
+export function deepgramKeyIsOutOfEnvironment(env: NodeJS.ProcessEnv): boolean {
+  return !(DEEPGRAM_API_KEY_ENV_VAR in env);
 }
