@@ -14,6 +14,20 @@
  * on close and `capture-session.ts` doesn't (its listeners are per-request and
  * self-removing).
  */
+/**
+ * Every message on these channels carries a `sessionId` minted by main when it
+ * opens a recorder.
+ *
+ * Without it, a session that main has already given up on can contaminate the
+ * next one. `close()` is bounded, so a renderer slower than the handshake
+ * timeout returns control to main while its own teardown is still running; when
+ * that teardown finally finishes it emits `stopped`, and a *new* session's
+ * start handshake -- listening on the same process-global channel -- would
+ * receive it, see a state that isn't `started`, and reject (review). Correlating
+ * on a session key is the same fix `capture-session.ts` already applies per
+ * request with `randomUUID()`; it just has to live for a subscription here
+ * rather than a single round trip.
+ */
 export const SCREEN_RECORDING_CHANNELS = {
   /** main -> renderer: begin recording the open capture stream into `segmentId`. */
   start: 'screen-solver:screen-recording:start',
@@ -54,8 +68,9 @@ export interface ScreenRecordingChunkMessage {
  * `failed` is the only channel a mid-session failure has — by then there is no
  * outstanding call left to reject.
  */
-export type ScreenRecordingStatusMessage =
+export type ScreenRecordingStatusMessage = { readonly sessionId: string } & (
   | { readonly state: 'started'; readonly mimeType: string }
   | { readonly state: 'rolled'; readonly segmentId: string }
   | { readonly state: 'stopped' }
-  | { readonly state: 'failed'; readonly reason: string };
+  | { readonly state: 'failed'; readonly reason: string }
+);

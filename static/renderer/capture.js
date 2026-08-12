@@ -43,6 +43,9 @@
   let currentSegmentId = null;
   /** Negotiated once at startRecording() and reused for every later segment. */
   let recordingMimeType = null;
+  /** Session key main minted for the live recording; echoed on every status so a
+   *  superseded session's late messages can be told apart from this one's. */
+  let currentRecordingSession = null;
   /** Timeslice main asked for at startRecording() time; every roll reuses it. */
   let recordingTimesliceMs = null;
 
@@ -91,7 +94,8 @@
       // main has no other way to learn that.
       recordingMimeType = null;
       recordingTimesliceMs = null;
-      reportStatus({ state: 'failed', reason: 'capture stream stopped underneath the active recording' });
+      reportCurrentStatus({ state: 'failed', reason: 'capture stream stopped underneath the active recording' });
+      currentRecordingSession = null;
     }
     if (stream) {
       for (const track of stream.getTracks()) track.stop();
@@ -240,8 +244,18 @@
     window.screenRecordingHost.sendChunk({ segmentId, bytesBase64: bytesToBase64(bytes), last });
   }
 
-  function reportStatus(message) {
-    window.screenRecordingHost.sendStatus(message);
+  // Every status carries the session it belongs to. Main drops anything whose
+  // session it doesn't recognise, which is what stops a slow teardown -- one
+  // main already timed out on and moved past -- from landing in the *next*
+  // session's start handshake. See src/main/screen-recording-ipc-channels.ts.
+  function reportStatus(sessionId, message) {
+    window.screenRecordingHost.sendStatus({ ...message, sessionId });
+  }
+
+  /** Reports against whatever session is live right now, for unsolicited failures. */
+  function reportCurrentStatus(message) {
+    if (currentRecordingSession === null) return;
+    reportStatus(currentRecordingSession, message);
   }
 
   /**
@@ -318,7 +332,7 @@
       if (recorder !== newRecorder) return;
       recorder = null;
       currentSegmentId = null;
-      reportStatus({
+      reportCurrentStatus({
         state: 'failed',
         reason: event && event.error && event.error.message ? event.error.message : 'MediaRecorder error',
       });
@@ -327,22 +341,23 @@
     newRecorder.start(recordingTimesliceMs);
   }
 
-  async function startRecording(segmentId, timesliceMs) {
+  async function startRecording(sessionId, segmentId, timesliceMs) {
     if (!stream) {
-      reportStatus({ state: 'failed', reason: 'no active capture stream to record' });
+      reportStatus(sessionId, { state: 'failed', reason: 'no active capture stream to record' });
       return;
     }
 
     const mimeType = RECORDING_MIME_CANDIDATES.find((candidate) => MediaRecorder.isTypeSupported(candidate));
     if (!mimeType) {
-      reportStatus({ state: 'failed', reason: 'no supported MediaRecorder mime type on this platform' });
+      reportStatus(sessionId, { state: 'failed', reason: 'no supported MediaRecorder mime type on this platform' });
       return;
     }
 
     recordingMimeType = mimeType;
     recordingTimesliceMs = timesliceMs;
+    currentRecordingSession = sessionId;
     createRecorder(segmentId);
-    reportStatus({ state: 'started', mimeType });
+    reportStatus(sessionId, { state: 'started', mimeType });
   }
 
   /**
@@ -356,17 +371,32 @@
    * knows the byte count each segment has reached (it's the one writing
    * segments to disk); this file just carries out the roll it's told to do.
    */
-  async function rollRecording(nextSegmentId) {
+  async function rollRecording(sessionId, nextSegmentId) {
+    if (sessionId !== currentRecordingSession) return;
     await stopCurrentRecorder(); // sends the outgoing segment's final chunk, last: true
+    if (sessionId !== currentRecordingSession) return; // superseded while flushing
     createRecorder(nextSegmentId);
-    reportStatus({ state: 'rolled', segmentId: nextSegmentId });
+    reportStatus(sessionId, { state: 'rolled', segmentId: nextSegmentId });
   }
 
-  async function stopRecording() {
+  async function stopRecording(sessionId) {
     await stopCurrentRecorder(); // sends the final chunk, last: true
-    recordingMimeType = null;
-    recordingTimesliceMs = null;
-    reportStatus({ state: 'stopped' });
+
+    // Only tear down the shared module state if this stop still owns it.
+    // `stopCurrentRecorder()` above awaits a real `dataavailable`/`onstop`
+    // pair, which can outlast main's bounded wait for `stopped` -- and once
+    // main gives up it is free to start a *new* session, which writes these
+    // same globals. Clearing them unconditionally here would null out the new
+    // session's mime type and timeslice from inside the old session's
+    // teardown (review). The `stopped` below is still reported either way, but
+    // tagged with this session, so main drops it unless it is still the one
+    // waiting.
+    if (sessionId === currentRecordingSession) {
+      recordingMimeType = null;
+      recordingTimesliceMs = null;
+      currentRecordingSession = null;
+    }
+    reportStatus(sessionId, { state: 'stopped' });
   }
 
   window.captureHost.onOpen((sourceId) => {
@@ -383,22 +413,28 @@
 
   window.captureHost.onRequestFrame(() => captureFrame());
 
-  window.screenRecordingHost.onStart((segmentId, timesliceMs) => {
-    startRecording(segmentId, timesliceMs).catch((error) => {
-      reportStatus({ state: 'failed', reason: error instanceof Error ? error.message : String(error) });
+  window.screenRecordingHost.onStart((sessionId, segmentId, timesliceMs) => {
+    startRecording(sessionId, segmentId, timesliceMs).catch((error) => {
+      reportStatus(sessionId, {
+        state: 'failed',
+        reason: error instanceof Error ? error.message : String(error),
+      });
     });
   });
 
-  window.screenRecordingHost.onRoll((nextSegmentId) => {
-    rollRecording(nextSegmentId).catch((error) => {
-      reportStatus({ state: 'failed', reason: error instanceof Error ? error.message : String(error) });
+  window.screenRecordingHost.onRoll((sessionId, nextSegmentId) => {
+    rollRecording(sessionId, nextSegmentId).catch((error) => {
+      reportStatus(sessionId, {
+        state: 'failed',
+        reason: error instanceof Error ? error.message : String(error),
+      });
     });
   });
 
-  window.screenRecordingHost.onStop(() => {
-    stopRecording().catch((error) => {
+  window.screenRecordingHost.onStop((sessionId) => {
+    stopRecording(sessionId).catch((error) => {
       console.error('screen-solver recording: failed to stop cleanly', error);
-      reportStatus({ state: 'stopped' });
+      reportStatus(sessionId, { state: 'stopped' });
     });
   });
 })();

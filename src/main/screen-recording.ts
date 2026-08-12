@@ -1,4 +1,5 @@
 import { ipcMain, type BrowserWindow, type IpcMainEvent } from 'electron';
+import { randomUUID } from 'node:crypto';
 import type {
   OpenRecorder,
   OpenRecorderOptions,
@@ -48,6 +49,8 @@ const RECORDING_HANDSHAKE_TIMEOUT_MS = 10_000;
 export function createRealScreenRecorderOpener(hiddenWindowReady: Promise<BrowserWindow>): OpenRecorder {
   return async (options: OpenRecorderOptions): Promise<Recorder> => {
     const window = await hiddenWindowReady;
+    // Correlates every message of this session; see SCREEN_RECORDING_CHANNELS.
+    const sessionId = randomUUID();
     const { segmentId, sink, onFailure, timesliceMs } = options;
 
     // Routes every `status` message to whichever step currently cares about
@@ -63,6 +66,13 @@ export function createRealScreenRecorderOpener(hiddenWindowReady: Promise<Browse
 
     function statusListener(event: IpcMainEvent, message: ScreenRecordingStatusMessage): void {
       if (event.sender !== window.webContents) return;
+      // Anything from a session this opener didn't start belongs to a previous
+      // one whose `close()` timed out and returned before the renderer had
+      // finished tearing it down. Its late `stopped` would otherwise land in
+      // this session's start handshake and reject it (review). Dropped rather
+      // than logged as an error: it is expected on a slow renderer, and the
+      // session it refers to has already been reported as failed or stopped.
+      if (message.sessionId !== sessionId) return;
       onStatus(message);
     }
 
@@ -108,7 +118,7 @@ export function createRealScreenRecorderOpener(hiddenWindowReady: Promise<Browse
       };
     });
 
-    send(window, SCREEN_RECORDING_CHANNELS.start, segmentId, timesliceMs);
+    send(window, SCREEN_RECORDING_CHANNELS.start, sessionId, segmentId, timesliceMs);
 
     let mimeType: string;
     try {
@@ -119,7 +129,7 @@ export function createRealScreenRecorderOpener(hiddenWindowReady: Promise<Browse
       // still have built part of a `MediaRecorder` before giving up, so tell
       // it to drop whatever it has. `stop` is idempotent on that side.
       removeListeners();
-      send(window, SCREEN_RECORDING_CHANNELS.stop);
+      send(window, SCREEN_RECORDING_CHANNELS.stop, sessionId);
       throw error;
     }
 
@@ -187,7 +197,7 @@ export function createRealScreenRecorderOpener(hiddenWindowReady: Promise<Browse
             },
           };
 
-          send(window, SCREEN_RECORDING_CHANNELS.roll, next);
+          send(window, SCREEN_RECORDING_CHANNELS.roll, sessionId, next);
         });
       },
 
@@ -213,7 +223,7 @@ export function createRealScreenRecorderOpener(hiddenWindowReady: Promise<Browse
               // `close()` only cares about the one `stopped` reply.
             };
 
-            send(window, SCREEN_RECORDING_CHANNELS.stop);
+            send(window, SCREEN_RECORDING_CHANNELS.stop, sessionId);
           });
         } finally {
           // Runs even when the wait above hit its timeout, so a wedged

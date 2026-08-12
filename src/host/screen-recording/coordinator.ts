@@ -474,6 +474,17 @@ export function createScreenRecordingCoordinator(deps: ScreenRecordingCoordinato
 
       for (const segment of index) {
         if (segment.endedAt !== null) continue;
+        if (segment.id === segmentId) {
+          // The segment being written *right now* also has no `closed` line,
+          // and looks exactly like a crash survivor from the index alone.
+          // Reachable because `bootstrap.ts` kicks `reconcile()` off without
+          // awaiting it, so with `enabled` set, an automatic start can open a
+          // live segment before this loop reads the index (review). Closing it
+          // here would publish a half-written byte count and stamp
+          // `recovered: true` on a recording that never crashed -- and the
+          // real `closed` line, written later, could not undo either.
+          continue;
+        }
         const path = deps.writer.pathFor(segment.id, segment.mimeType);
         let bytes: number;
         try {

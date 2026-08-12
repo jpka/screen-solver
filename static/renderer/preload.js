@@ -96,17 +96,21 @@ contextBridge.exposeInMainWorld('captureHost', {
 contextBridge.exposeInMainWorld('screenRecordingHost', {
   /** Fires when main wants recording started against segmentId, at timesliceMs. */
   onStart(handler) {
-    ipcRenderer.on(SCREEN_RECORDING_CHANNELS.start, (_event, segmentId, timesliceMs) => handler(segmentId, timesliceMs));
+    ipcRenderer.on(SCREEN_RECORDING_CHANNELS.start, (_event, sessionId, segmentId, timesliceMs) =>
+      handler(sessionId, segmentId, timesliceMs),
+    );
   },
 
   /** Fires when main wants the current segment finished and nextSegmentId begun. */
   onRoll(handler) {
-    ipcRenderer.on(SCREEN_RECORDING_CHANNELS.roll, (_event, nextSegmentId) => handler(nextSegmentId));
+    ipcRenderer.on(SCREEN_RECORDING_CHANNELS.roll, (_event, sessionId, nextSegmentId) =>
+      handler(sessionId, nextSegmentId),
+    );
   },
 
   /** Fires when main wants the open segment flushed and the recorder torn down. */
   onStop(handler) {
-    ipcRenderer.on(SCREEN_RECORDING_CHANNELS.stop, () => handler());
+    ipcRenderer.on(SCREEN_RECORDING_CHANNELS.stop, (_event, sessionId) => handler(sessionId));
   },
 
   /** Sends one dataavailable payload (base64 bytes, tagged with its segment) to main. */

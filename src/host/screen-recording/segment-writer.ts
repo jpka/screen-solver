@@ -104,6 +104,19 @@ export function createSegmentWriter(deps: SegmentWriterDeps): SegmentWriter {
 
   return {
     async begin(id, mimeType, target): Promise<void> {
+      // Clears a previous overflow. This writer outlives any one recording
+      // session -- `bootstrap.ts` builds exactly one for the process -- so a
+      // latched `overflowed` used to mean that after the disk fell behind
+      // once, *every* later recording silently discarded every chunk while
+      // the UI cheerfully reported `recording` (review). Nothing else can
+      // clear it: an overflow always routes through `onError` -> `fail()`,
+      // which tears the recorder down, so the only path back here is a fresh
+      // `start()`, which is exactly when a retry deserves a clean slate.
+      // In-flight writes from the previous session keep decrementing
+      // `queuedBytes` as they land, so that counter is deliberately *not*
+      // reset -- it is still tracking real outstanding bytes.
+      overflowed = false;
+
       const startedAt = now().toISOString();
       open.set(id, { bytes: 0, mimeType, startedAt });
       await mkdir(deps.dir, { recursive: true });
@@ -127,14 +140,21 @@ export function createSegmentWriter(deps: SegmentWriterDeps): SegmentWriter {
 
       if (overflowed) return;
 
-      queuedBytes += chunk.bytes.byteLength;
-      if (queuedBytes > MAX_QUEUED_BYTES) {
+      // Measured *before* committing, so the chunk that trips the bound isn't
+      // counted against a backlog it was never added to. Adding first and
+      // returning early leaked that increment permanently -- `queuedBytes`
+      // could only ever be decremented by a write that actually got enqueued
+      // -- which left the writer's idea of its own backlog inflated for the
+      // rest of the process's life (review).
+      const queuedAfter = queuedBytes + chunk.bytes.byteLength;
+      if (queuedAfter > MAX_QUEUED_BYTES) {
         overflowed = true;
         deps.onError(
           `The disk is not keeping up: over ${MAX_QUEUED_BYTES} bytes of video are queued unwritten.`,
         );
         return;
       }
+      queuedBytes = queuedAfter;
 
       state.bytes += chunk.bytes.byteLength;
       const path = segmentPath(deps.dir, chunk.segmentId, state.mimeType);

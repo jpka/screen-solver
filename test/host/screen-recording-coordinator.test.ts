@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, it, type TestContext } from 'node:test';
 import type { TargetWindowIdentity } from '../../src/host/config/types.ts';
@@ -244,6 +244,30 @@ describe('ScreenRecordingCoordinator', () => {
     assert.equal(h.coordinator.snapshot().state, 'recording');
   });
 
+  it('records again after an overflow, instead of silently discarding every later chunk', async (t) => {
+    const h = await harness(t);
+
+    // Overflow, which stops the recording and reports the fault.
+    await h.coordinator.start();
+    h.renderer.emit(65 * 1024 * 1024);
+    assert.equal(h.coordinator.snapshot().state, 'error');
+
+    // The user acknowledges it and tries again. The writer outlives the
+    // session, so before the review fix its latched `overflowed` flag meant
+    // every subsequent recording reported `recording` while writing nothing at
+    // all -- the worst possible failure for this feature, since it looks like
+    // it is working.
+    await h.coordinator.stop();
+    await h.coordinator.start();
+    h.renderer.emit(2_000);
+    await h.coordinator.drain();
+
+    assert.equal(h.coordinator.snapshot().state, 'recording');
+    const segmentId = h.coordinator.snapshot().segmentId!;
+    const bytes = await readFile(join(h.recordingsDir, `${segmentId}.webm`));
+    assert.equal(bytes.byteLength, 2_000, 'the retry actually wrote video');
+  });
+
   it('stops and reports an error when the disk falls far enough behind to threaten memory', async (t) => {
     const h = await harness(t);
 
@@ -405,24 +429,54 @@ describe('ScreenRecordingCoordinator', () => {
     it('closes out a segment left open by an unclean exit, measuring the file that survived', async (t) => {
       const h = await harness(t);
 
-      // Exactly the on-disk state a `kill -9` mid-segment leaves behind: an
-      // `opened` line, real bytes, and no `closed` line.
-      await h.coordinator.start();
-      h.renderer.emit(7_000);
-      await h.coordinator.drain();
-
-      const revived = await harness(t, {});
-      await writeFile(join(revived.recordingsDir, 'seg-1.webm'), Buffer.alloc(7_000)).catch(
-        () => {},
-      );
+      // Exactly the on-disk state a `kill -9` mid-segment leaves behind, as
+      // the *next* launch finds it: an `opened` line, real bytes, no `closed`
+      // line, and nothing recording. Seeded directly rather than by recording
+      // and then reconciling on the same live coordinator -- that would be
+      // reconciliation racing a segment this process still has open, which is
+      // a different scenario, and one that must now be left alone (see the
+      // test below).
+      await mkdir(h.recordingsDir, { recursive: true });
+      await writeFile(join(h.recordingsDir, 'crashed.webm'), Buffer.alloc(7_000));
+      const log = createScreenRecordingLog({ stateRoot: h.stateRoot });
+      await log.append({
+        type: 'opened',
+        id: 'crashed',
+        startedAt: '2026-08-12T08:55:00.000Z',
+        mimeType: 'video/webm',
+        target: KATA_TAB,
+      });
 
       await h.coordinator.reconcile();
 
       const index = await h.readIndex();
-      const segment = index.find((candidate) => candidate.id === 'seg-1');
+      const segment = index.find((candidate) => candidate.id === 'crashed');
       assert.notEqual(segment?.endedAt, null, 'it was closed out');
       assert.equal(segment?.bytes, 7_000, 'measured from the file, not guessed');
       assert.equal(segment?.recovered, true, '"the process died" stays distinguishable from "the user stopped"');
+    });
+
+    it('leaves the segment being written right now alone, rather than treating it as a crash survivor', async (t) => {
+      const h = await harness(t);
+
+      // `bootstrap.ts` kicks `reconcile()` off without awaiting it, so with
+      // `enabled` set an automatic start can open a live segment before
+      // reconciliation reads the index. From the index alone that segment is
+      // indistinguishable from a crash survivor: no `closed` line. Closing it
+      // here would publish a half-written byte count and stamp it `recovered`
+      // -- and the real `closed` line, written later, could undo neither.
+      await h.coordinator.start();
+      h.renderer.emit(3_000);
+      await h.coordinator.drain();
+      const liveId = h.coordinator.snapshot().segmentId;
+
+      await h.coordinator.reconcile();
+
+      const index = await h.readIndex();
+      const live = index.find((segment) => segment.id === liveId);
+      assert.equal(live?.endedAt, null, 'still open');
+      assert.equal(live?.recovered, undefined, 'and not mislabelled as recovered');
+      assert.equal(h.coordinator.snapshot().state, 'recording', 'and still recording');
     });
 
     it('tombstones an indexed segment whose file no longer exists', async (t) => {
