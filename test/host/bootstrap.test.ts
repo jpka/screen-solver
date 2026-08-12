@@ -1,11 +1,23 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { stat, writeFile } from 'node:fs/promises';
+import { readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, it, type TestContext } from 'node:test';
-import { API_KEY_ENV_VAR } from '../../src/host/api-key.ts';
+import { API_KEY_ENV_VAR, DEEPGRAM_API_KEY_ENV_VAR } from '../../src/host/api-key.ts';
+import type {
+  OpenAudioCapture,
+  Transcriber,
+  TranscriberStream,
+  TranscriptEvent,
+} from '../../src/host/audio/types.ts';
 import { HTTP_HOST_ENV_VAR, HTTP_PORT_ENV_VAR } from '../../src/host/binding.ts';
-import { apiKeyIsOutOfEnvironment, bootstrapHost } from '../../src/host/bootstrap.ts';
+import {
+  apiKeyIsOutOfEnvironment,
+  bootstrapHost,
+  deepgramKeyIsOutOfEnvironment,
+} from '../../src/host/bootstrap.ts';
+import { TRANSCRIPT_LOG_FILE_NAME } from '../../src/host/logs/transcript-log.ts';
+import type { TranscriptEntry } from '../../src/host/logs/types.ts';
 import type { CapturedFrame } from '../../src/host/capture/types.ts';
 import { CONFIG_FILE_NAME } from '../../src/host/config/store.ts';
 import type { TargetWindowIdentity } from '../../src/host/config/types.ts';
@@ -440,6 +452,161 @@ describe('bootstrapHost', () => {
     await assert.rejects(
       () => fetch(`http://${LOOPBACK}:${result.host.binding.port}/health`),
       'the server really did close, rather than shutdown returning early with teardown left undone',
+    );
+  });
+});
+
+describe('bootstrapHost: recording', () => {
+  /** A transcriber whose one stream the test drives by hand, plus a capture that produces nothing. */
+  function fakeAudio(): {
+    transcriber: Transcriber;
+    openAudioCapture: OpenAudioCapture;
+    emit(event: TranscriptEvent): void;
+    closes(): number;
+  } {
+    let emit: ((event: TranscriptEvent) => void) | null = null;
+    let closes = 0;
+
+    const transcriber: Transcriber = {
+      model: 'nova-3',
+      open({ onEvent }) {
+        emit = onEvent;
+        const stream: TranscriberStream = {
+          send() {},
+          async close() {
+            closes += 1;
+          },
+        };
+        return stream;
+      },
+    };
+
+    return {
+      transcriber,
+      openAudioCapture: async () => ({ async close() {} }),
+      emit: (event) => emit?.(event),
+      closes: () => closes,
+    };
+  }
+
+  it('still starts with no DEEPGRAM_API_KEY -- a missing transcription key is a degraded mode, not a refusal', async (t) => {
+    const s = await scenario(t);
+
+    const result = await bootstrapHost(runtimeFor(s));
+    assert.equal(result.status, 'started');
+    if (result.status !== 'started') return;
+    t.after(() => result.host.shutdown());
+
+    assert.equal(result.host.recordingCoordinator.state(), 'unavailable');
+  });
+
+  it('takes DEEPGRAM_API_KEY out of the environment, the same as the Anthropic key', async (t) => {
+    const s = await scenario(t, {
+      env: {
+        [API_KEY_ENV_VAR]: KEY,
+        [DEEPGRAM_API_KEY_ENV_VAR]: 'dg-test-key',
+        [HTTP_HOST_ENV_VAR]: LOOPBACK,
+        [HTTP_PORT_ENV_VAR]: '0',
+      },
+    });
+
+    // The capture opener is supplied too: a key alone isn't enough to make
+    // recording available, since Electron owns the audio device half.
+    const result = await bootstrapHost({
+      ...runtimeFor(s),
+      openAudioCapture: async () => ({ async close() {} }),
+    });
+    assert.equal(result.status, 'started');
+    if (result.status !== 'started') return;
+    t.after(() => result.host.shutdown());
+
+    // The hidden renderer snapshots `process.env` at creation and must never
+    // see either key.
+    assert.equal(deepgramKeyIsOutOfEnvironment(s.env), true);
+    assert.equal(apiKeyIsOutOfEnvironment(s.env), true);
+    // A real transcriber was built from the key, so recording is offered.
+    assert.equal(result.host.recordingCoordinator.state(), 'off');
+  });
+
+  it('is unavailable with a key but no audio capture opener -- both halves are required', async (t) => {
+    const s = await scenario(t, {
+      env: {
+        [API_KEY_ENV_VAR]: KEY,
+        [DEEPGRAM_API_KEY_ENV_VAR]: 'dg-test-key',
+        [HTTP_HOST_ENV_VAR]: LOOPBACK,
+        [HTTP_PORT_ENV_VAR]: '0',
+      },
+    });
+
+    const result = await bootstrapHost(runtimeFor(s));
+    assert.equal(result.status, 'started');
+    if (result.status !== 'started') return;
+    t.after(() => result.host.shutdown());
+
+    assert.equal(result.host.recordingCoordinator.state(), 'unavailable');
+    assert.equal(deepgramKeyIsOutOfEnvironment(s.env), true, 'the key is still taken either way');
+  });
+
+  it('shutdown stops recording and drains transcript.jsonl inside the bounded phase', async (t) => {
+    const s = await scenario(t);
+    const audio = fakeAudio();
+
+    const result = await bootstrapHost({
+      ...runtimeFor(s),
+      transcriber: audio.transcriber,
+      openAudioCapture: audio.openAudioCapture,
+    });
+    assert.equal(result.status, 'started');
+    if (result.status !== 'started') return;
+
+    await result.host.recordingCoordinator.start();
+    audio.emit({ type: 'open' });
+    audio.emit({ type: 'final', text: 'said just before quitting', startSeconds: 0, endSeconds: 1 });
+
+    await result.host.shutdown();
+
+    assert.equal(audio.closes(), 1, 'the transcription stream was closed');
+    const raw = await readFile(join(s.stateRoot, TRANSCRIPT_LOG_FILE_NAME), 'utf8');
+    const entries = raw
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .map((line) => JSON.parse(line) as TranscriptEntry);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0]?.text, 'said just before quitting');
+  });
+
+  it('shutdown gives up rather than hanging when a transcription stream never closes', async (t) => {
+    const s = await scenario(t);
+    const logger = recordingLogger();
+
+    // A stream whose close() never settles -- the audio analogue of the
+    // solve that ignores its abort.
+    const wedged: Transcriber = {
+      model: 'nova-3',
+      open: () => ({ send() {}, close: () => new Promise<void>(() => {}) }),
+    };
+
+    const result = await bootstrapHost({
+      ...runtimeFor(s, logger),
+      transcriber: wedged,
+      openAudioCapture: async () => ({ async close() {} }),
+      solveDrainTimeoutMs: 50,
+    });
+    assert.equal(result.status, 'started');
+    if (result.status !== 'started') return;
+
+    await result.host.recordingCoordinator.start();
+
+    // The assertion is that this resolves at all.
+    await result.host.shutdown();
+
+    assert.ok(
+      logger.lines.some((line) => line.includes('without waiting any longer')),
+      'giving up on the drain is reported, not silent',
+    );
+    await assert.rejects(
+      () => fetch(`http://${LOOPBACK}:${result.host.binding.port}/health`),
+      'the server really did close',
     );
   });
 });

@@ -1,3 +1,4 @@
+import type { TranscriptChannel } from '../audio/types.ts';
 import type { TargetWindowIdentity } from '../config/types.ts';
 import type { ProviderErrorKind, Usage } from '../provider/types.ts';
 
@@ -31,6 +32,8 @@ export interface AnswerLogEntry {
   readonly target: TargetWindowIdentity;
   /** Present and `true` only when the outcome was `interrupted`. */
   readonly interrupted?: true;
+  /** Present and `true` only when recent speech was sent alongside the screenshot -- see `SolveOutcomeEvent`. */
+  readonly withTranscript?: true;
 }
 
 /**
@@ -54,4 +57,43 @@ export interface UsageLogEntry {
   readonly bail?: true;
   /** Present only for an `error` outcome. */
   readonly errorKind?: ProviderErrorKind;
+  /** Present and `true` only when recent speech was sent alongside the screenshot -- see `SolveOutcomeEvent`. */
+  readonly withTranscript?: true;
+}
+
+/**
+ * One `transcript.jsonl` line -- written only for a *final* transcript
+ * segment, never an interim one. Interim text is unstable by definition
+ * (Deepgram revises it, and a later message supersedes it wholesale), so
+ * persisting it would mean writing lines that later become wrong.
+ *
+ * Single append-only file across every recording session, not one file per
+ * session: `recordingSessionId` already provides the grouping, and per-session
+ * files would introduce a filesystem naming scheme this app has no other
+ * instance of. The third instance of the `jsonl.ts` shape, alongside
+ * `answers.jsonl` and `usage.jsonl`.
+ */
+export interface TranscriptEntry {
+  /** A fresh UUID per recording toggle-on -- groups the lines of one sitting. */
+  readonly recordingSessionId: string;
+  readonly channel: TranscriptChannel;
+  readonly text: string;
+  /**
+   * ISO 8601, UTC, for the END of this segment -- computed host-side as the
+   * moment the socket opened plus {@link endSeconds}.
+   *
+   * This is the only field safe to order by across a reconnect, which is
+   * exactly why it exists alongside the offsets below.
+   */
+  readonly timestamp: string;
+  /**
+   * Deepgram's own offsets, in seconds from the start of *that socket's*
+   * audio. Recorded honestly rather than normalized into a session-wide
+   * timeline: they restart at 0 every time the socket reconnects, and
+   * inventing a continuous timeline across a gap of unknown length would be
+   * fabricating precision this app does not have.
+   */
+  readonly startSeconds: number;
+  readonly endSeconds: number;
+  readonly model: string;
 }

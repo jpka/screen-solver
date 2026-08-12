@@ -2,6 +2,7 @@ import { app, type BrowserWindow } from 'electron';
 import { bootstrapHost, type StartedHost } from '../host/bootstrap.ts';
 import { isStartupError } from '../host/errors.ts';
 import { consoleLogger } from '../host/logger.ts';
+import { createRealAudioCaptureOpener } from './audio-capture.ts';
 import { createRealCaptureSessionOpener } from './capture-session.ts';
 import { createHiddenWindow } from './hidden-window.ts';
 import { isTargetMinimizedReal } from './minimized-check.ts';
@@ -49,6 +50,11 @@ async function main(): Promise<void> {
     logger: consoleLogger,
     enumerateWindows: enumerateOpenWindows,
     openCaptureSession: createRealCaptureSessionOpener(hiddenWindowReady),
+    // Same promise, same reason (see `createRealCaptureSessionOpener`'s doc
+    // comment), though nothing calls this one during `bootstrapHost`:
+    // recording is off on every launch and only starts when a client toggles
+    // it, by which point the window has long existed.
+    openAudioCapture: createRealAudioCaptureOpener(hiddenWindowReady),
     isTargetMinimized: isTargetMinimizedReal,
     clientStaticDir: webClientDir,
   });

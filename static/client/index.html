@@ -11,8 +11,18 @@
       <h1>Screen Solver</h1>
       <span id="connection-indicator" class="connection-indicator"></span>
       <span id="status-pill" class="status-pill" hidden></span>
-      <button id="fullscreen-button" type="button" class="icon-button" title="Fullscreen">&#9974;</button>
-      <button id="solve-button" type="button" disabled>Solve now</button>
+      <!-- #35 adds two buttons to #34's header, so all four are wrapped:
+           the flex layout then needs one auto-margin (on the wrapper) rather
+           than relying on auto-margins collapsing correctly across four
+           siblings, and the wrapper is what wraps to a second row on a narrow
+           phone instead of the buttons overflowing. The two solve buttons stay
+           adjacent -- they are the same action with and without speech. -->
+      <div class="header-actions">
+        <button id="record-toggle" type="button" data-state="off">Start recording</button>
+        <button id="fullscreen-button" type="button" class="icon-button" title="Fullscreen">&#9974;</button>
+        <button id="solve-transcript-button" type="button" disabled>Solve with transcript</button>
+        <button id="solve-button" type="button" disabled>Solve now</button>
+      </div>
     </header>
 
     <div id="target-bar" class="target-bar" hidden>
@@ -36,6 +46,33 @@
         #34 / prototype/21-web-client for why.
       -->
       <section id="entries-root" class="entries-root" hidden></section>
+
+      <!-- #35: the running transcript of recorded system audio.
+           Deliberately static markup outside #entries-root rather than
+           another thing render() draws: it is a continuous log with its own
+           scroll position, and re-rendering it on every entry change (or on
+           rotation) would throw that scroll position away mid-sentence.
+           Hidden until recording has something to say -- see app.js's
+           `applyRecording`. -->
+      <section id="transcript-pane" class="panel" hidden>
+        <h2>Transcript</h2>
+        <div id="recording-error" class="error-message" hidden></div>
+        <div id="transcript-list" class="transcript-list">
+          <!-- Finalized lines (app.js's addTranscriptEntry) are inserted
+               just above these two, which stay the last two children always,
+               so the "in progress" rows stay pinned at the bottom no matter
+               how many finals accumulate above them. One per channel since
+               `transcript-interim` replaces wholesale per-channel, not
+               globally; `me` is reserved and never populated by today's
+               server, but the row exists so it is ready the day it is. -->
+          <div id="transcript-interim-them" class="transcript-line transcript-interim" data-channel="them" hidden>
+            <span class="transcript-channel">Them:</span><span class="transcript-text"></span>
+          </div>
+          <div id="transcript-interim-me" class="transcript-line transcript-interim" data-channel="me" hidden>
+            <span class="transcript-channel">Me:</span><span class="transcript-text"></span>
+          </div>
+        </div>
+      </section>
     </main>
 
     <script src="/app.js"></script>

@@ -13,12 +13,17 @@
 // ipcRenderer need.
 //
 // `contextBridge.exposeInMainWorld` is what makes this safe under
-// `contextIsolation: true`: it copies these functions into capture.js's main
-// world without giving capture.js's own script any access to `ipcRenderer`,
-// `require`, or anything else this file can see. Three inbound events (open,
-// close, request-frame) and one outbound reply (frame-result), all
-// capture-shaped, nothing else -- capture.js gets exactly this surface and
-// nothing more.
+// `contextIsolation: true`: it copies these functions into the page's main
+// world without giving the page's own scripts any access to `ipcRenderer`,
+// `require`, or anything else this file can see.
+//
+// Two surfaces, exposed separately rather than merged into one object:
+// `window.captureHost` (#30) is three inbound events (open, close,
+// request-frame) and one outbound reply (frame-result), all capture-shaped;
+// `window.audioHost` is the recording pipeline's own four. They stay apart
+// because the modules behind them do -- capture-ipc-channels.ts and
+// audio-ipc-channels.ts are separate for reasons the latter spells out -- and
+// because capture.js and audio.js should each see only what they use.
 'use strict';
 
 const { contextBridge, ipcRenderer } = require('electron');
@@ -64,5 +69,53 @@ contextBridge.exposeInMainWorld('captureHost', {
           ipcRenderer.send(CAPTURE_CHANNELS.frameResult, requestId, message);
         });
     });
+  },
+});
+
+// Mirrors src/main/audio-ipc-channels.ts, duplicated by hand for the same
+// reason CAPTURE_CHANNELS above is: nothing under static/ can require a
+// module from src/, compiled or otherwise. Keep these four strings in sync
+// with audio-ipc-channels.ts by hand if either changes.
+const AUDIO_CHANNELS = {
+  start: 'screen-solver:audio:start',
+  stop: 'screen-solver:audio:stop',
+  chunk: 'screen-solver:audio:chunk',
+  status: 'screen-solver:audio:status',
+};
+
+contextBridge.exposeInMainWorld('audioHost', {
+  /** Fires when main wants loopback capture running. */
+  onStart(handler) {
+    ipcRenderer.on(AUDIO_CHANNELS.start, () => handler());
+  },
+
+  /** Fires when main wants whatever capture is running torn down. */
+  onStop(handler) {
+    ipcRenderer.on(AUDIO_CHANNELS.stop, () => handler());
+  },
+
+  /**
+   * Sends one ~100 ms block of 16 kHz signed-16 little-endian PCM to main.
+   *
+   * `pcm` is a plain `ArrayBuffer`, not a `Uint8Array` view and not base64 --
+   * see src/main/audio-ipc-channels.ts for why this stream makes the opposite
+   * call from capture.js's frames. Note that the buffer is *copied* twice on
+   * the way out (once by contextBridge into this world, once by ipcRenderer's
+   * own structured clone); the transfer list audio.js's worklet uses only
+   * saves the copy from the audio thread. Two 3.2 KB memcpys ten times a
+   * second is not worth a `postMessage` port to avoid.
+   */
+  sendChunk(channel, pcm) {
+    ipcRenderer.send(AUDIO_CHANNELS.chunk, channel, pcm);
+  },
+
+  /**
+   * Reports whether a `start` actually produced a running graph: 'started',
+   * or 'failed' with a reason. Main turns a failure into a rejected
+   * `openAudioCapture`, which is what lets the recording coordinator say
+   * 'error' instead of sitting in 'starting' forever.
+   */
+  reportStatus(state, reason) {
+    ipcRenderer.send(AUDIO_CHANNELS.status, { state, reason });
   },
 });
