@@ -85,6 +85,22 @@ export interface SolveOptions {
    * question that belongs to the window, not to the wire.
    */
   readonly transcript?: string;
+  /**
+   * Reference material the user preloaded ahead of time -- site conventions,
+   * a style guide, a reminder of which patterns to prefer -- read fresh from
+   * wherever `config.json`'s `contextPath` points
+   * (`context/preload-context.ts`) and optional here for the same reason
+   * {@link transcript} is: most installs have nothing configured.
+   *
+   * Unlike {@link transcript}, this rides as a *second system block*, not
+   * user content (`anthropic.ts`'s `buildRequest`) -- it is background the
+   * model should read the way it reads its own instructions, not something
+   * that arrived with this particular question. Appended after the cached
+   * base system prompt without its own `cache_control`, so it costs nothing
+   * in cache hits on the (already-cached) base prompt and simply rides along
+   * as extra, uncached input whenever it's present.
+   */
+  readonly preloadContext?: string;
 }
 
 /** The one thing the rest of the app calls to turn a screenshot, recent speech, or both into an answer. */

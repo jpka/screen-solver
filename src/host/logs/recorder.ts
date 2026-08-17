@@ -112,6 +112,8 @@ export function createSolveLogRecorder(deps: SolveLogRecorderDeps): SolveLogReco
     const bail = outcome.type === 'done' && isBailTitle(title);
 
     const withTranscript = event.withTranscript === true ? { withTranscript: true as const } : {};
+    const withPreloadContext =
+      event.withPreloadContext === true ? { withPreloadContext: true as const } : {};
 
     const usageEntry: UsageLogEntry = {
       timestamp,
@@ -122,6 +124,7 @@ export function createSolveLogRecorder(deps: SolveLogRecorderDeps): SolveLogReco
       ...(bail ? { bail: true as const } : {}),
       ...(outcome.type === 'error' ? { errorKind: outcome.kind } : {}),
       ...withTranscript,
+      ...withPreloadContext,
     };
     try {
       await deps.usageLog.append(usageEntry);
@@ -141,6 +144,7 @@ export function createSolveLogRecorder(deps: SolveLogRecorderDeps): SolveLogReco
       target,
       ...(outcome.type === 'interrupted' ? { interrupted: true as const } : {}),
       ...withTranscript,
+      ...withPreloadContext,
     };
     try {
       await deps.answerLog.append(answerEntry);

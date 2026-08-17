@@ -35,9 +35,18 @@ export interface ProviderSelection {
   readonly model: string;
 }
 
+/**
+ * A file or folder of reference material the user sets up ahead of time --
+ * site conventions, a style guide, a reminder of which patterns to prefer.
+ * Read fresh on every solve (`context/preload-context.ts`), so editing the
+ * file takes effect on the next answer with no restart, even though the path
+ * itself is fixed at startup like {@link ProviderSelection} -- there is no
+ * live setter for this field, only the value `config.json` was loaded with.
+ */
 export interface ScreenSolverConfig {
   readonly targetWindow: TargetWindowIdentity | null;
   readonly provider: ProviderSelection | null;
+  readonly contextPath: string | null;
 }
 
 /**

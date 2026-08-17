@@ -20,21 +20,23 @@ describe('loadConfigStore', () => {
 
     const store = await loadConfigStore({ stateRoot });
 
-    assert.deepEqual(store.get(), { targetWindow: null, provider: null });
+    assert.deepEqual(store.get(), { targetWindow: null, provider: null, contextPath: null });
 
     const onDisk = JSON.parse(await readFile(join(stateRoot, CONFIG_FILE_NAME), 'utf8'));
-    assert.deepEqual(onDisk, { targetWindow: null, provider: null });
+    assert.deepEqual(onDisk, { targetWindow: null, provider: null, contextPath: null });
   });
 
   it('is a no-op on a config.json that already exists', async (t) => {
     const stateRoot = await tempStateRoot(t);
     const configPath = join(stateRoot, CONFIG_FILE_NAME);
+    // Deliberately the pre-`contextPath` shape, to prove loading an older
+    // config.json neither rewrites it nor loses the fields it does have.
     const saved = { targetWindow: KATA_TAB, provider: null };
     await writeFile(configPath, JSON.stringify(saved));
 
     const store = await loadConfigStore({ stateRoot, enumerateWindows: async () => [KATA_TAB] });
 
-    assert.deepEqual(store.get(), saved);
+    assert.deepEqual(store.get(), { ...saved, contextPath: null });
     assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')), saved);
   });
 
@@ -161,6 +163,26 @@ describe('loadConfigStore', () => {
     // back to null, so the same window reappearing later resolves again.
     const onDisk = JSON.parse(await readFile(configPath, 'utf8'));
     assert.deepEqual(onDisk.targetWindow, KATA_TAB);
+  });
+
+  it('parses a saved contextPath', async (t) => {
+    const stateRoot = await tempStateRoot(t);
+    const configPath = join(stateRoot, CONFIG_FILE_NAME);
+    await writeFile(configPath, JSON.stringify({ targetWindow: null, provider: null, contextPath: '/notes' }));
+
+    const store = await loadConfigStore({ stateRoot });
+
+    assert.equal(store.get().contextPath, '/notes');
+  });
+
+  it('falls back to null for a non-string contextPath rather than refusing to load', async (t) => {
+    const stateRoot = await tempStateRoot(t);
+    const configPath = join(stateRoot, CONFIG_FILE_NAME);
+    await writeFile(configPath, JSON.stringify({ targetWindow: null, provider: null, contextPath: 7 }));
+
+    const store = await loadConfigStore({ stateRoot });
+
+    assert.equal(store.get().contextPath, null);
   });
 
   it('starts up with no live target, rather than refusing to start, when enumerateWindows rejects', async (t) => {

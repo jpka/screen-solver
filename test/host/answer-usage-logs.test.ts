@@ -491,6 +491,36 @@ describe('recorder: target: null for a spoken-only solve', () => {
   });
 });
 
+describe('recorder: withPreloadContext', () => {
+  it('persists withPreloadContext: true into both usage.jsonl and answers.jsonl when the outcome carries it, and omits it when not', async (t) => {
+    const stateRoot = await tempStateRoot(t);
+    const answerLog = createAnswerLog({ stateRoot });
+    const usageLog = createUsageLog({ stateRoot });
+    const recorder = createSolveLogRecorder({ answerLog, usageLog, logger: silentLogger });
+
+    const base = {
+      outcome: {
+        type: 'done' as const,
+        text: '# Two Sum\ncode here',
+        usage: USAGE,
+        stopReason: 'end_turn',
+      },
+      target: TARGET,
+      model: MODEL,
+    };
+    await recorder.record({ ...base, withPreloadContext: true });
+    await recorder.record(base);
+
+    const answers = await readJsonlLines<AnswerLogEntry>(join(stateRoot, ANSWER_LOG_FILE_NAME));
+    assert.equal(answers[0]?.withPreloadContext, true);
+    assert.equal(answers[1]?.withPreloadContext, undefined);
+
+    const usageEntries = await readJsonlLines<UsageLogEntry>(join(stateRoot, USAGE_LOG_FILE_NAME));
+    assert.equal(usageEntries[0]?.withPreloadContext, true);
+    assert.equal(usageEntries[1]?.withPreloadContext, undefined);
+  });
+});
+
 describe('GET /events sync{text} mid-flight join', () => {
   it('a client connecting mid-solve receives sync{text} carrying the accumulated text so far, not start', async (t) => {
     const h = await startTestServer(t);
