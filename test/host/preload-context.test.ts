@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import {
@@ -63,6 +63,22 @@ describe('createPreloadContextReader', () => {
     const text = await reader.read();
     assert.equal(text, '## top.md\n\ntop-level note');
     assert.equal(text?.includes('must not appear'), false);
+  });
+
+  it('skips a symlink inside a configured directory rather than following it -- CWE-200: a link could otherwise smuggle an arbitrary file elsewhere on disk into every solve request', async (t) => {
+    const outside = await tempStateRoot(t);
+    const secret = join(outside, 'secret.txt');
+    await writeFile(secret, 'do not send this to the model');
+
+    const dir = await tempStateRoot(t);
+    await writeFile(join(dir, 'real.md'), 'real note');
+    await symlink(secret, join(dir, 'linked.md'));
+
+    const reader = createPreloadContextReader({ path: dir });
+
+    const text = await reader.read();
+    assert.equal(text, '## real.md\n\nreal note');
+    assert.equal(text?.includes('do not send this to the model'), false);
   });
 
   it('reads null, with a logged warning, when the path does not exist', async (t) => {

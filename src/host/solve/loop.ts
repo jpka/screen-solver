@@ -353,6 +353,18 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     // it reads is not a record of something said just now, so reading it a
     // few pre-flight guards later changes nothing about what it means.
     const preloadContext = (await deps.preloadContextReader?.read()) ?? null;
+    // Re-checked here, and only here between entering this function and the
+    // commit point below: this is the one `await` `callProvider` does before
+    // `broadcaster.start()`, so it is the one place a later `trigger()` can
+    // have aborted `signal` out from under an attempt that hasn't committed
+    // yet. Skipping this check would let `broadcaster.start()` fire for an
+    // attempt already known to be superseded -- the provider then ends
+    // quietly for the aborted signal with no `delta`/`done`/`error` of its
+    // own, and the `interrupted` branch below never calls `broadcaster.done()`
+    // / `.error()` to close out the `start` this would have just broadcast,
+    // leaving a connected client stuck showing "in flight" until some later,
+    // unrelated attempt happens to start again.
+    if (signal.aborted) return;
     const withPreloadContext: { readonly withPreloadContext?: true } =
       preloadContext === null ? {} : { withPreloadContext: true };
 

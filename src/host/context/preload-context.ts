@@ -1,4 +1,4 @@
-import { readdir as readdirFs, readFile as readFileFs, stat as statFs } from 'node:fs/promises';
+import { lstat as lstatFs, readdir as readdirFs, readFile as readFileFs, stat as statFs } from 'node:fs/promises';
 import { join } from 'node:path';
 import { silentLogger, type Logger } from '../logger.ts';
 
@@ -44,6 +44,8 @@ export interface PreloadContextReaderOptions {
   readonly logger?: Logger;
   /** Injected for tests; production reads the real filesystem. */
   readonly stat?: (path: string) => Promise<{ isDirectory(): boolean; isFile(): boolean }>;
+  /** Injected for tests; production `lstat`s the real filesystem -- see {@link readPath} for why this, and not {@link stat}, decides which directory entries get read. */
+  readonly lstat?: (path: string) => Promise<{ isFile(): boolean }>;
   readonly readFile?: (path: string) => Promise<string>;
   readonly readdir?: (path: string) => Promise<string[]>;
 }
@@ -58,6 +60,7 @@ export function createPreloadContextReader(options: PreloadContextReaderOptions)
   const { path } = options;
   const logger = options.logger ?? silentLogger;
   const statImpl = options.stat ?? statFs;
+  const lstatImpl = options.lstat ?? lstatFs;
   const readFileImpl = options.readFile ?? ((p: string) => readFileFs(p, 'utf8'));
   const readdirImpl = options.readdir ?? ((p: string) => readdirFs(p));
 
@@ -69,7 +72,12 @@ export function createPreloadContextReader(options: PreloadContextReaderOptions)
     async read(): Promise<string | null> {
       let text: string;
       try {
-        text = await readPath(path, { stat: statImpl, readFile: readFileImpl, readdir: readdirImpl });
+        text = await readPath(path, {
+          stat: statImpl,
+          lstat: lstatImpl,
+          readFile: readFileImpl,
+          readdir: readdirImpl,
+        });
       } catch (error) {
         // Misconfiguration (a typo'd path, a folder that got moved, a
         // permissions change) must degrade the same way a vanished target
@@ -89,6 +97,7 @@ export function createPreloadContextReader(options: PreloadContextReaderOptions)
 
 interface FsDeps {
   readonly stat: (path: string) => Promise<{ isDirectory(): boolean; isFile(): boolean }>;
+  readonly lstat: (path: string) => Promise<{ isFile(): boolean }>;
   readonly readFile: (path: string) => Promise<string>;
   readonly readdir: (path: string) => Promise<string[]>;
 }
@@ -101,6 +110,9 @@ interface FsDeps {
  * reads.
  */
 async function readPath(path: string, fs: FsDeps): Promise<string> {
+  // `stat`, not `lstat`, for the top-level path: it's the exact string the
+  // user put in `config.json`, so following a symlink there is the same as
+  // if they'd typed the target path directly.
   const info = await fs.stat(path);
 
   if (info.isFile()) {
@@ -115,8 +127,15 @@ async function readPath(path: string, fs: FsDeps): Promise<string> {
   const sections: string[] = [];
   for (const name of names) {
     const entryPath = join(path, name);
-    const entryInfo = await fs.stat(entryPath);
-    if (!entryInfo.isFile()) continue; // subdirectories are skipped, not recursed into
+    // `lstat`, not `stat`, for a *directory entry*: `stat` follows a symlink
+    // to whatever it points at and would report `isFile()` for a link
+    // pointing anywhere on disk, which `fs.readFile` below would then happily
+    // read and send to the model -- an entry a user never explicitly
+    // configured, unlike the top-level path above. `lstat` reports the
+    // symlink itself, which is never a plain file, so a symlink is skipped
+    // exactly like a subdirectory: not recursed into, not followed.
+    const entryInfo = await fs.lstat(entryPath);
+    if (!entryInfo.isFile()) continue;
     sections.push(`## ${name}\n\n${await fs.readFile(entryPath)}`);
   }
   return sections.join('\n\n');

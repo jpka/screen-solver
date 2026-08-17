@@ -12,7 +12,8 @@ import { createHostRoutes } from '../../src/host/http/routes.ts';
 import { startHttpServer, type ListeningHttpServer } from '../../src/host/http/server.ts';
 import { silentLogger } from '../../src/host/logger.ts';
 import type { Provider, SolveOptions } from '../../src/host/provider/types.ts';
-import type { SolveLoop } from '../../src/host/solve/loop.ts';
+import { createEventBroadcaster, type EventBroadcaster } from '../../src/host/solve/broadcaster.ts';
+import { startSolveLoop, type SolveLoop } from '../../src/host/solve/loop.ts';
 import type { SolveOutcomeEvent } from '../../src/host/solve/types.ts';
 import { tempStateRoot } from '../helpers/temp-state-root.ts';
 
@@ -226,5 +227,109 @@ describe('GET /config', () => {
     const response = await fetch(`${server.url}/config`);
     const body = (await response.json()) as { contextPath: string | null };
     assert.equal(body.contextPath, '/notes');
+  });
+});
+
+/**
+ * A `preloadContextReader.read()` whose call N doesn't resolve until the test
+ * says so, and whose call N is itself only observable once the loop has
+ * actually reached it (`waitForCall`) -- what a review-fix regression test for
+ * an abort landing mid-read needs, and something `fixedReader` above (a
+ * reader that always resolves immediately) cannot express.
+ */
+function deferredReader(): {
+  readonly reader: PreloadContextReader;
+  resolveCall(n: number, text: string | null): void;
+  waitForCall(n: number): Promise<void>;
+} {
+  const resolvers: Array<(text: string | null) => void> = [];
+  const waiters = new Map<number, () => void>();
+
+  return {
+    reader: {
+      read(): Promise<string | null> {
+        return new Promise((resolve) => {
+          resolvers.push(resolve);
+          waiters.get(resolvers.length)?.();
+        });
+      },
+    },
+    resolveCall(n, text) {
+      resolvers[n - 1]?.(text);
+    },
+    waitForCall(n) {
+      if (resolvers.length >= n) return Promise.resolve();
+      return new Promise((resolve) => waiters.set(n, resolve));
+    },
+  };
+}
+
+describe('an abort landing while preloadContextReader.read() is still pending', () => {
+  it('never starts the broadcaster or calls the provider for the superseded attempt, and reports no outcome for it at all', async (t) => {
+    // Review fix: `callProvider` used to call `broadcaster.start()`
+    // unconditionally right after this await, with no re-check of `signal`.
+    // A second `trigger()` landing while the first attempt's read() was still
+    // pending would abort that first attempt's signal *during* the await, and
+    // execution would resume straight into `broadcaster.start()` for an
+    // attempt already known to be dead -- the provider then ends quietly for
+    // the aborted signal, and the `interrupted` branch never calls
+    // `broadcaster.done()` / `.error()` to close out the `start` that had
+    // just gone out, leaving a connected client stuck showing "in flight".
+    const pre = deferredReader();
+
+    const realBroadcaster = createEventBroadcaster();
+    let startCalls = 0;
+    const broadcaster: EventBroadcaster = {
+      ...realBroadcaster,
+      start: () => {
+        startCalls += 1;
+        realBroadcaster.start();
+      },
+    };
+
+    let providerCalls = 0;
+    const provider: Provider = {
+      model: 'fake-model',
+      async *solve() {
+        providerCalls += 1;
+        yield { type: 'done', usage: ZERO_USAGE, stopReason: 'end_turn' } as const;
+      },
+    };
+
+    const outcomes: SolveOutcomeEvent[] = [];
+    const configStore = await loadConfigStore({
+      stateRoot: await tempStateRoot(t),
+      enumerateWindows: async () => [TARGET],
+    });
+    await configStore.setTargetWindow(TARGET);
+
+    const loop = startSolveLoop({
+      configStore,
+      captureSessionCoordinator: captureCoordinator(),
+      provider,
+      broadcaster,
+      enumerateWindows: async () => [TARGET],
+      isTargetMinimized: async () => false,
+      preloadContextReader: pre.reader,
+      onOutcome: (event) => void outcomes.push(event),
+      logger: silentLogger,
+    });
+    t.after(() => loop.stop());
+
+    assert.equal(loop.trigger(), true, 'attempt 1');
+    await pre.waitForCall(1);
+
+    assert.equal(loop.trigger(), true, 'attempt 2, supersedes and aborts attempt 1');
+    pre.resolveCall(1, 'ignored -- attempt 1 is already aborted by the time this resumes');
+    await pre.waitForCall(2);
+    pre.resolveCall(2, null);
+
+    await loop.settled();
+    await loop.stop();
+
+    assert.equal(startCalls, 1, 'the broadcaster is started exactly once, for attempt 2 only');
+    assert.equal(providerCalls, 1, 'the provider is called exactly once, for attempt 2 only');
+    assert.equal(outcomes.length, 1, 'attempt 1 produced no outcome at all -- the same total silence any other pre-commit guard failure produces');
+    assert.equal(outcomes[0]?.outcome.type, 'done');
   });
 });
