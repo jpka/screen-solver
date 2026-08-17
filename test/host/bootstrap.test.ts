@@ -234,7 +234,7 @@ describe('bootstrapHost', () => {
     if (result.status !== 'started') return;
     t.after(() => result.host.shutdown());
 
-    assert.deepEqual(result.host.configStore.get(), { targetWindow: null, provider: null });
+    assert.deepEqual(result.host.configStore.get(), { targetWindow: null, provider: null, contextPath: null });
     assert.deepEqual(
       await result.host.configStore.listWindows(),
       injectedWindows,

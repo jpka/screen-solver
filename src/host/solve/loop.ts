@@ -5,6 +5,7 @@ import { createTargetIntentTracker, type TargetIntentTracker } from '../capture/
 import type { IsTargetMinimized } from '../capture/types.ts';
 import type { ConfigStore } from '../config/store.ts';
 import type { EnumerateWindows, TargetWindowIdentity } from '../config/types.ts';
+import type { PreloadContextReader } from '../context/preload-context.ts';
 import { silentLogger, type Logger } from '../logger.ts';
 import type { Provider, SolveImage } from '../provider/types.ts';
 import type { EventBroadcaster } from './broadcaster.ts';
@@ -51,6 +52,15 @@ export interface SolveLoopDeps {
    * dep here uses.
    */
   readonly transcriptWindow?: TranscriptWindow;
+  /**
+   * Reads whatever `config.json`'s `contextPath` points at (`context/
+   * preload-context.ts`), fresh, for every attempt that reaches the
+   * provider -- every mode, not just the screen ones, since preloaded
+   * context is background that applies regardless of how the question
+   * arrived. Left unset, no attempt ever carries any -- the same "safe
+   * default that just does less" shape as `transcriptWindow`.
+   */
+  readonly preloadContextReader?: PreloadContextReader;
   readonly logger?: Logger;
 }
 
@@ -337,18 +347,40 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     signal: AbortSignal,
     withTranscript: { readonly withTranscript?: true },
   ): Promise<void> {
+    // Read fresh for every attempt that reaches here, regardless of mode --
+    // there is no "instant of the trigger" concern for this the way there is
+    // for the transcript window (`trigger()`'s own comment above): the file
+    // it reads is not a record of something said just now, so reading it a
+    // few pre-flight guards later changes nothing about what it means.
+    const preloadContext = (await deps.preloadContextReader?.read()) ?? null;
+    // Re-checked here, and only here between entering this function and the
+    // commit point below: this is the one `await` `callProvider` does before
+    // `broadcaster.start()`, so it is the one place a later `trigger()` can
+    // have aborted `signal` out from under an attempt that hasn't committed
+    // yet. Skipping this check would let `broadcaster.start()` fire for an
+    // attempt already known to be superseded -- the provider then ends
+    // quietly for the aborted signal with no `delta`/`done`/`error` of its
+    // own, and the `interrupted` branch below never calls `broadcaster.done()`
+    // / `.error()` to close out the `start` this would have just broadcast,
+    // leaving a connected client stuck showing "in flight" until some later,
+    // unrelated attempt happens to start again.
+    if (signal.aborted) return;
+    const withPreloadContext: { readonly withPreloadContext?: true } =
+      preloadContext === null ? {} : { withPreloadContext: true };
+
     // Committed: a provider call is genuinely attempted from here on, so the
     // wire and the outcome bus both go live for this attempt.
     deps.broadcaster.start();
     let text = '';
 
-    for await (const event of deps.provider.solve(
-      image,
-      // `transcript` stays absent rather than `undefined`-valued when there is
-      // none, so a plain solve builds a request byte-identical to the one it
-      // built before this option existed.
-      transcript === null ? { signal } : { signal, transcript },
-    )) {
+    for await (const event of deps.provider.solve(image, {
+      signal,
+      // Both stay absent rather than `undefined`-valued when there is
+      // nothing to send, so a plain solve builds a request byte-identical to
+      // the one it built before either option existed.
+      ...(transcript === null ? {} : { transcript }),
+      ...(preloadContext === null ? {} : { preloadContext }),
+    })) {
       switch (event.type) {
         case 'delta':
           text += event.text;
@@ -358,14 +390,26 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
           deps.broadcaster.done(event.usage);
           const outcome: SolveOutcome = { type: 'done', text, usage: event.usage, stopReason: event.stopReason };
           applyStatusTransition(outcome);
-          await deps.onOutcome?.({ outcome, target, model: deps.provider.model, ...withTranscript });
+          await deps.onOutcome?.({
+            outcome,
+            target,
+            model: deps.provider.model,
+            ...withTranscript,
+            ...withPreloadContext,
+          });
           return;
         }
         case 'error': {
           deps.broadcaster.error(event.kind);
           const outcome: SolveOutcome = { type: 'error', kind: event.kind, message: event.message, text };
           applyStatusTransition(outcome);
-          await deps.onOutcome?.({ outcome, target, model: deps.provider.model, ...withTranscript });
+          await deps.onOutcome?.({
+            outcome,
+            target,
+            model: deps.provider.model,
+            ...withTranscript,
+            ...withPreloadContext,
+          });
           return;
         }
       }
@@ -380,7 +424,13 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
       // rules) -- called anyway so the "one place decides" property holds
       // even though this call is always a no-op today.
       applyStatusTransition(outcome);
-      await deps.onOutcome?.({ outcome, target, model: deps.provider.model, ...withTranscript });
+      await deps.onOutcome?.({
+        outcome,
+        target,
+        model: deps.provider.model,
+        ...withTranscript,
+        ...withPreloadContext,
+      });
     } else {
       logger.error(
         'solve loop: the provider iterable ended without a terminal event and no abort was requested ' +

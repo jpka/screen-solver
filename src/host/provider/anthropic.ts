@@ -86,9 +86,27 @@ export function createProvider(config: ProviderConfig): Provider {
     text: config.systemPrompt,
     cache_control: { type: 'ephemeral', ttl: SYSTEM_PROMPT_CACHE_TTL },
   };
-  const system: readonly SystemBlock[] = Object.freeze([systemBlock]);
+  const baseSystem: readonly SystemBlock[] = Object.freeze([systemBlock]);
 
-  function buildRequest(image: SolveImage | null, transcript: string | undefined): MessagesRequest {
+  function buildRequest(
+    image: SolveImage | null,
+    transcript: string | undefined,
+    preloadContext: string | undefined,
+  ): MessagesRequest {
+    // A second, uncached system block appended after the cached one, rather
+    // than folded into `config.systemPrompt` itself: that block's whole value
+    // depends on staying byte-identical across every call, which preloaded
+    // context -- read fresh from disk per solve (`context/preload-context.ts`)
+    // -- cannot promise. Appending after it, instead of before, means the cache
+    // breakpoint on `baseSystem[0]` still matches regardless of what (if
+    // anything) follows it, so an empty preload config costs nothing beyond
+    // this one extra check, and a filled one costs no cache hit on the base
+    // prompt.
+    const system: readonly SystemBlock[] =
+      preloadContext === undefined || preloadContext === ''
+        ? baseSystem
+        : Object.freeze([...baseSystem, { type: 'text', text: wrapPreloadContext(preloadContext) }]);
+
     return {
       model,
       max_tokens: maxTokens,
@@ -108,9 +126,12 @@ export function createProvider(config: ProviderConfig): Provider {
       // A spoken-only solve (`image === null`) simply omits the image block,
       // leaving the transcript as the whole user turn. That absence is the
       // *only* signal the model gets that there is no screen — there is no
-      // second system prompt and no flag in the body, for the cache reason
-      // `system-prompt.ts` documents. Dropping the block rather than sending a
-      // placeholder image also means a spoken-only call costs no image tokens.
+      // mode flag in the body, for the cache reason `system-prompt.ts`
+      // documents. (The preloaded-context block above can also make `system`
+      // grow a second entry, but that entry is the same for every mode and
+      // says nothing about whether a screen was sent — it is not this
+      // signal.) Dropping the block rather than sending a placeholder image
+      // also means a spoken-only call costs no image tokens.
       messages: [
         {
           role: 'user',
@@ -161,7 +182,7 @@ export function createProvider(config: ProviderConfig): Provider {
       return;
     }
 
-    const body = buildRequest(image, options.transcript);
+    const body = buildRequest(image, options.transcript, options.preloadContext);
 
     for (let attempt = 0; ; attempt += 1) {
       if (aborted()) return;
@@ -262,6 +283,11 @@ export function createProvider(config: ProviderConfig): Provider {
  */
 function wrapTranscript(transcript: string): string {
   return `<recent_transcript>\n${transcript}\n</recent_transcript>`;
+}
+
+/** The tag pair `system-prompt.ts`'s "Preloaded context" section tells the model to expect -- see `wrapTranscript` above for why this lives here rather than there. */
+function wrapPreloadContext(preloadContext: string): string {
+  return `<preloaded_context>\n${preloadContext}\n</preloaded_context>`;
 }
 
 interface MutableUsage {

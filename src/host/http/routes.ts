@@ -9,6 +9,7 @@ import type { IsTargetMinimized } from '../capture/types.ts';
 import type { CaptureSessionCoordinator } from '../capture/session-coordinator.ts';
 import type { ConfigStore } from '../config/store.ts';
 import type { EnumerateWindows, TargetWindowIdentity } from '../config/types.ts';
+import type { PreloadContextReader } from '../context/preload-context.ts';
 import type { AnswerLog } from '../logs/answer-log.ts';
 import type { TranscriptLog } from '../logs/transcript-log.ts';
 import type { Logger } from '../logger.ts';
@@ -67,6 +68,8 @@ export interface HostRoutesDeps {
   readonly transcriptLog?: TranscriptLog;
   /** The bounded recent-speech buffer `POST /solve/with-transcript` reads. Left unset, nothing accumulates. */
   readonly transcriptWindow?: TranscriptWindow;
+  /** Preloaded context (`config.json`'s `contextPath`). Left unset, no attempt of any mode ever carries any -- see `SolveLoopDeps.preloadContextReader`. */
+  readonly preloadContextReader?: PreloadContextReader;
   readonly logger?: Logger;
 }
 
@@ -122,6 +125,7 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
           targetIntent: deps.targetIntent,
           onOutcome: deps.onOutcome,
           transcriptWindow: deps.transcriptWindow,
+          preloadContextReader: deps.preloadContextReader,
           logger: deps.logger,
         })
       : null;
@@ -313,6 +317,12 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
         }
         sendJson(res, 200, {
           targetWindow: configStore.get().targetWindow,
+          // Read-only here, matching `provider`'s own precedent (still
+          // "reserved" per `config/types.ts`): there is no `POST` route for
+          // this field, only the value `config.json` was loaded with, so it
+          // rides `GET /config` purely for visibility into what a solve is
+          // actually sending -- not because a client can change it.
+          contextPath: configStore.get().contextPath,
           revision: broadcaster.currentConfigRevision(),
         });
       },

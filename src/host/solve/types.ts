@@ -115,4 +115,13 @@ export interface SolveOutcomeEvent {
    * time anyone reads the log.
    */
   readonly withTranscript?: true;
+  /**
+   * Present and `true` only when preloaded context (`config.json`'s
+   * `contextPath`, `context/preload-context.ts`) was actually read and sent
+   * with this attempt -- absent when nothing is configured, the configured
+   * path didn't resolve to anything readable, or what it resolved to was
+   * empty. Same `?: true` idiom as {@link withTranscript}, and independent of
+   * it: either, both, or neither can be present on one outcome.
+   */
+  readonly withPreloadContext?: true;
 }

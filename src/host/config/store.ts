@@ -15,6 +15,7 @@ export const CONFIG_FILE_NAME = 'config.json';
 const EMPTY_CONFIG: ScreenSolverConfig = Object.freeze({
   targetWindow: null,
   provider: null,
+  contextPath: null,
 });
 
 /** No enumerator was injected. Nothing ever resolves, which is the same as the documented "no target configured" fallback. */
@@ -195,6 +196,7 @@ function parseConfig(raw: string, configPath: string): ScreenSolverConfig {
   return {
     targetWindow: isTargetWindowIdentity(candidate.targetWindow) ? candidate.targetWindow : null,
     provider: isProviderSelection(candidate.provider) ? candidate.provider : null,
+    contextPath: typeof candidate.contextPath === 'string' ? candidate.contextPath : null,
   };
 }
 

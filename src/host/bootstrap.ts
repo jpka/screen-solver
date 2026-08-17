@@ -11,6 +11,7 @@ import {
 import type { IsTargetMinimized, OpenCaptureSession } from './capture/types.ts';
 import { loadConfigStore, type ConfigStore } from './config/store.ts';
 import type { EnumerateWindows } from './config/types.ts';
+import { createPreloadContextReader } from './context/preload-context.ts';
 import { createHostRoutes } from './http/routes.ts';
 import type { Route } from './http/router.ts';
 import { createStaticRoutes } from './http/static.ts';
@@ -205,6 +206,16 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
     enumerateWindows: runtime.enumerateWindows,
   });
 
+  // `contextPath` has no live setter (`config/types.ts`), so the path is
+  // fixed here, at startup, from whatever `config.json` was loaded with --
+  // the file or folder it points to is still read fresh on every solve
+  // (`preload-context.ts`'s own reasoning), just not re-pointed without a
+  // restart.
+  const preloadContextReader = createPreloadContextReader({
+    path: configStore.get().contextPath,
+    logger,
+  });
+
   // #31's durable memory: `answers.jsonl` / `usage.jsonl` under the same
   // state root. `answerLog` is also handed to `createHostRoutes` directly
   // (`GET /answers` reads it fresh on every request); `usageLog` only ever
@@ -256,6 +267,7 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
         openAudioCapture: runtime.openAudioCapture,
         transcriptLog,
         transcriptWindow,
+        preloadContextReader,
         logger,
       });
 

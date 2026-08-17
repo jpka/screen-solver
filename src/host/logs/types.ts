@@ -44,6 +44,13 @@ export interface AnswerLogEntry {
    * three-combination matrix against {@link target}.
    */
   readonly withTranscript?: true;
+  /**
+   * Present and `true` only when preloaded context was actually sent with
+   * this attempt. See `SolveOutcomeEvent.withPreloadContext` for what counts
+   * as "actually sent" -- independent of {@link withTranscript}; either,
+   * both, or neither can be set.
+   */
+  readonly withPreloadContext?: true;
 }
 
 /**
@@ -84,6 +91,8 @@ export interface UsageLogEntry {
    * three-combination matrix against {@link target}.
    */
   readonly withTranscript?: true;
+  /** Same field, same meaning, as {@link AnswerLogEntry.withPreloadContext}. */
+  readonly withPreloadContext?: true;
 }
 
 /**

@@ -280,6 +280,92 @@ describe('createProvider().solve', () => {
     });
   });
 
+  describe('the preload-context block', () => {
+    it('appends a second, uncached system block wrapped in tags the prompt names', async () => {
+      const fake = fakeTransport([answer(['ok'])]);
+
+      await collect(provider(fake).solve(IMAGE, { preloadContext: 'Prefer iterative solutions.' }));
+
+      const [body] = fake.requests;
+      assert.ok(body !== undefined);
+      assert.deepEqual(body.system, [
+        { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral', ttl: '1h' } },
+        { type: 'text', text: '<preloaded_context>\nPrefer iterative solutions.\n</preloaded_context>' },
+      ]);
+    });
+
+    it('sends exactly one system block when there is no preloaded context', async () => {
+      const fake = fakeTransport([answer(['ok'])]);
+
+      await collect(provider(fake).solve(IMAGE));
+
+      const [body] = fake.requests;
+      assert.ok(body !== undefined);
+      assert.equal(body.system.length, 1);
+    });
+
+    it('treats an empty string as no preloaded context rather than an empty block', async () => {
+      const fake = fakeTransport([answer(['ok'])]);
+
+      await collect(provider(fake).solve(IMAGE, { preloadContext: '' }));
+
+      const [body] = fake.requests;
+      assert.ok(body !== undefined);
+      assert.equal(body.system.length, 1);
+    });
+
+    it('leaves the cached base block byte-identical whether or not preloaded context rides along', async () => {
+      const fake = fakeTransport([answer(['a']), answer(['b'])]);
+      const seam = provider(fake);
+
+      await collect(seam.solve(IMAGE));
+      await collect(seam.solve(IMAGE, { preloadContext: 'notes on this site' }));
+
+      const [plain, withContext] = fake.requests;
+      assert.ok(plain !== undefined && withContext !== undefined);
+      assert.deepEqual(plain.system[0], withContext.system[0]);
+      assert.equal(withContext.system.length, 2);
+    });
+
+    it('never touches the message turn -- it rides on system, not user content', async () => {
+      const fake = fakeTransport([answer(['ok'])]);
+
+      await collect(provider(fake).solve(IMAGE, { preloadContext: 'notes' }));
+
+      const [body] = fake.requests;
+      assert.ok(body !== undefined);
+      assert.equal(body.messages[0]?.content.length, 1);
+    });
+
+    it('combines with a transcript block at the same time, each in its own place', async () => {
+      const fake = fakeTransport([answer(['ok'])]);
+
+      await collect(
+        provider(fake).solve(IMAGE, { transcript: 'Them: hello', preloadContext: 'notes on this site' }),
+      );
+
+      const [body] = fake.requests;
+      assert.ok(body !== undefined);
+      assert.equal(body.system.length, 2, 'preload context is a system block');
+      assert.equal(body.messages[0]?.content.length, 2, 'transcript is still a message-content block');
+    });
+
+    it('works on a spoken-only request too -- it is independent of whether there is a screen', async () => {
+      const fake = fakeTransport([answer(['ok'])]);
+
+      await collect(
+        provider(fake).solve(null, { transcript: 'Them: hello', preloadContext: 'notes on this site' }),
+      );
+
+      const [body] = fake.requests;
+      assert.ok(body !== undefined);
+      assert.deepEqual(body.system[1], {
+        type: 'text',
+        text: '<preloaded_context>\nnotes on this site\n</preloaded_context>',
+      });
+    });
+  });
+
   describe('the spoken-only request shape (image === null)', () => {
     it('sends exactly one content block -- text only, wrapped in <recent_transcript> -- with no image block at all', async () => {
       const fake = fakeTransport([answer(['ok'])]);
