@@ -110,7 +110,7 @@ describe('createPreloadContextReader', () => {
     assert.equal(await reader.read(), null);
   });
 
-  it('truncates content past the size cap, with a trailing marker', async () => {
+  it('truncates content past the size cap, with a trailing marker, never exceeding the cap itself', async () => {
     const oversized = 'x'.repeat(MAX_PRELOAD_CONTEXT_CHARS + 500);
     const reader = createPreloadContextReader({
       path: '/fake/notes.md',
@@ -123,6 +123,52 @@ describe('createPreloadContextReader', () => {
     assert.ok(text.startsWith('x'.repeat(100)));
     assert.ok(text.endsWith('[preloaded context truncated: it exceeded the size limit]'));
     assert.ok(text.length < oversized.length);
+    // Review fix: the marker used to be appended on top of a full-length
+    // slice, so the returned value could run a few dozen characters past the
+    // cap it's supposed to be. The marker's length is now reserved out of the
+    // budget instead.
+    assert.equal(text.length, MAX_PRELOAD_CONTEXT_CHARS, 'the cap is a real ceiling, marker included');
+  });
+
+  it('reads only a bounded head of a real file far larger than the cap, rather than materializing all of it', async (t) => {
+    const dir = await tempStateRoot(t);
+    const path = join(dir, 'huge.md');
+    // Larger than MAX_READ_BYTES (4x MAX_PRELOAD_CONTEXT_CHARS), not just
+    // larger than the char cap -- proves the real default readFile
+    // implementation (a bounded head-read, not the old whole-file read) still
+    // produces a correctly truncated result for a file bigger than its own
+    // read window, not just bigger than the final cap.
+    await writeFile(path, 'y'.repeat(MAX_PRELOAD_CONTEXT_CHARS * 5));
+
+    const reader = createPreloadContextReader({ path });
+
+    const text = await reader.read();
+    assert.ok(text !== null);
+    assert.equal(text.length, MAX_PRELOAD_CONTEXT_CHARS);
+    assert.ok(text.endsWith('[preloaded context truncated: it exceeded the size limit]'));
+  });
+
+  it('stops reading further directory entries once enough content has already been gathered', async () => {
+    // Content-based assertions alone can't distinguish "stopped early" from
+    // "read everything, then the final trim discarded the tail" -- both look
+    // identical from the returned string when the first entry alone already
+    // exceeds the cap, which is exactly this scenario. Asserting on the I/O
+    // call count is what actually proves the second entry was never opened.
+    const touched: string[] = [];
+    const reader = createPreloadContextReader({
+      path: '/fake/dir',
+      stat: async () => ({ isDirectory: () => true, isFile: () => false }),
+      readdir: async () => ['a-big.md', 'z-should-not-be-touched.md'],
+      lstat: async (p) => {
+        touched.push(p);
+        return { isFile: () => true };
+      },
+      readFile: async () => 'x'.repeat(MAX_PRELOAD_CONTEXT_CHARS + 500),
+    });
+
+    const text = await reader.read();
+    assert.ok(text !== null);
+    assert.deepEqual(touched, ['/fake/dir/a-big.md'], 'the second entry is never lstat\'d, let alone read');
   });
 
   it('reads the same path fresh on every call -- a later edit is picked up with no restart', async (t) => {

@@ -1,4 +1,5 @@
-import { lstat as lstatFs, readdir as readdirFs, readFile as readFileFs, stat as statFs } from 'node:fs/promises';
+import { Buffer } from 'node:buffer';
+import { lstat as lstatFs, open as openFs, readdir as readdirFs, stat as statFs } from 'node:fs/promises';
 import { join } from 'node:path';
 import { silentLogger, type Logger } from '../logger.ts';
 
@@ -38,6 +39,20 @@ export const MAX_PRELOAD_CONTEXT_CHARS = 20_000;
 
 const TRUNCATION_MARKER = '\n\n[preloaded context truncated: it exceeded the size limit]';
 
+/**
+ * The byte budget for one file read (top-level file or directory entry),
+ * head-only rather than the whole file. 4 bytes/char is UTF-8's own worst
+ * case, so this comfortably covers {@link MAX_PRELOAD_CONTEXT_CHARS}
+ * characters of anything the encoding can produce, with slack to spare.
+ *
+ * Reading a bounded head instead of the whole file (review fix) is what keeps
+ * a misconfigured `contextPath` -- pointed at a huge file by accident, or a
+ * directory holding one -- from fully materializing that file in memory, and
+ * spending the time to do so, on every single solve attempt only to throw
+ * away everything past {@link MAX_PRELOAD_CONTEXT_CHARS} a moment later.
+ */
+const MAX_READ_BYTES = MAX_PRELOAD_CONTEXT_CHARS * 4;
+
 export interface PreloadContextReaderOptions {
   /** `null` (the default in a fresh `config.json`) means the feature is off -- `read()` always resolves `null` with no I/O. */
   readonly path: string | null;
@@ -46,6 +61,7 @@ export interface PreloadContextReaderOptions {
   readonly stat?: (path: string) => Promise<{ isDirectory(): boolean; isFile(): boolean }>;
   /** Injected for tests; production `lstat`s the real filesystem -- see {@link readPath} for why this, and not {@link stat}, decides which directory entries get read. */
   readonly lstat?: (path: string) => Promise<{ isFile(): boolean }>;
+  /** Injected for tests; production reads at most {@link MAX_READ_BYTES} off the front of the real file, never the whole thing. */
   readonly readFile?: (path: string) => Promise<string>;
   readonly readdir?: (path: string) => Promise<string[]>;
 }
@@ -61,7 +77,7 @@ export function createPreloadContextReader(options: PreloadContextReaderOptions)
   const logger = options.logger ?? silentLogger;
   const statImpl = options.stat ?? statFs;
   const lstatImpl = options.lstat ?? lstatFs;
-  const readFileImpl = options.readFile ?? ((p: string) => readFileFs(p, 'utf8'));
+  const readFileImpl = options.readFile ?? ((p: string) => readHeadBytes(p, MAX_READ_BYTES));
   const readdirImpl = options.readdir ?? ((p: string) => readdirFs(p));
 
   if (path === null) {
@@ -90,9 +106,33 @@ export function createPreloadContextReader(options: PreloadContextReaderOptions)
       const trimmed = text.trim();
       if (trimmed === '') return null;
       if (trimmed.length <= MAX_PRELOAD_CONTEXT_CHARS) return trimmed;
-      return trimmed.slice(0, MAX_PRELOAD_CONTEXT_CHARS) + TRUNCATION_MARKER;
+      // The marker's own length is reserved out of the budget, not appended
+      // on top of it (review fix) -- the returned value never exceeds
+      // MAX_PRELOAD_CONTEXT_CHARS, marker included.
+      const budget = Math.max(0, MAX_PRELOAD_CONTEXT_CHARS - TRUNCATION_MARKER.length);
+      return trimmed.slice(0, budget) + TRUNCATION_MARKER;
     },
   };
+}
+
+/**
+ * Reads at most `maxBytes` off the front of a file, decoded as UTF-8.
+ *
+ * A read that lands mid-multi-byte-character at the very end of the window
+ * decodes that trailing fragment as a replacement character rather than
+ * throwing -- the same tradeoff `MAX_READ_BYTES`'s own comment accepts: this
+ * is preloaded reference material, not code, and the far more common case
+ * (a file under the byte budget entirely) is unaffected.
+ */
+async function readHeadBytes(path: string, maxBytes: number): Promise<string> {
+  const handle = await openFs(path, 'r');
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+    return buffer.subarray(0, bytesRead).toString('utf8');
+  } finally {
+    await handle.close();
+  }
 }
 
 interface FsDeps {
@@ -125,7 +165,14 @@ async function readPath(path: string, fs: FsDeps): Promise<string> {
 
   const names = (await fs.readdir(path)).sort((a, b) => a.localeCompare(b));
   const sections: string[] = [];
+  let accumulated = 0;
   for (const name of names) {
+    // Stops opening further entries once there's already enough to fill the
+    // cap -- a directory of many large files would otherwise pay the read
+    // cost (bounded per-file, but not in aggregate) for every entry before
+    // the final trim below discards everything past the cap anyway.
+    if (accumulated >= MAX_PRELOAD_CONTEXT_CHARS) break;
+
     const entryPath = join(path, name);
     // `lstat`, not `stat`, for a *directory entry*: `stat` follows a symlink
     // to whatever it points at and would report `isFile()` for a link
@@ -136,7 +183,9 @@ async function readPath(path: string, fs: FsDeps): Promise<string> {
     // exactly like a subdirectory: not recursed into, not followed.
     const entryInfo = await fs.lstat(entryPath);
     if (!entryInfo.isFile()) continue;
-    sections.push(`## ${name}\n\n${await fs.readFile(entryPath)}`);
+    const section = `## ${name}\n\n${await fs.readFile(entryPath)}`;
+    sections.push(section);
+    accumulated += section.length;
   }
   return sections.join('\n\n');
 }
