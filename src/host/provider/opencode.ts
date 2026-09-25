@@ -1,6 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
 import type { Secret } from '../secret.ts';
+import { createPostSseTransport, type PostSseTransport } from './http-transport.ts';
 import { isAbortError, parseServerSentEvents } from './transport.ts';
 import type { ModelChoice, Provider, ProviderErrorKind, SolveEvent, SolveImage, SolveOptions, Usage } from './types.ts';
 
@@ -33,6 +34,7 @@ export interface OpenCodeProviderConfig {
   readonly models?: readonly ModelChoice[];
   readonly baseUrl?: string;
   readonly fetch?: typeof globalThis.fetch;
+  readonly transport?: PostSseTransport;
   /** Go uses this stable process-session ID for routing and prompt caching. */
   readonly sessionId?: string;
 }
@@ -45,7 +47,7 @@ export function createOpenCodeProvider(config: OpenCodeProviderConfig): Provider
   const model = config.model ?? DEFAULT_OPENCODE_MODEL;
   const models = config.models ?? OPENCODE_MODELS;
   const baseUrl = (config.baseUrl ?? OPENCODE_BASE_URL).replace(/\/+$/, '');
-  const doFetch = config.fetch ?? globalThis.fetch;
+  const transport = config.transport ?? createPostSseTransport(config.fetch);
   const sessionId = config.sessionId ?? randomUUID();
 
   async function* solve(image: SolveImage | null, options: SolveOptions = {}): AsyncGenerator<SolveEvent> {
@@ -58,18 +60,13 @@ export function createOpenCodeProvider(config: OpenCodeProviderConfig): Provider
     const selectedModel = options.model ?? model;
     let response: Response;
     try {
-      response = await doFetch(`${baseUrl}/responses`, {
-        method: 'POST',
-        headers: {
+      response = await transport({ url: `${baseUrl}/responses`, headers: {
           authorization: `Bearer ${config.apiKey.reveal()}`,
           'content-type': 'application/json',
           accept: 'text/event-stream',
           'user-agent': 'screen-solver/1.0',
           ...(baseUrl === OPENCODE_GO_BASE_URL ? { 'x-opencode-session': sessionId } : {}),
-        },
-        body: JSON.stringify(buildRequest(config.systemPrompt, selectedModel, image, options.transcript)),
-        signal,
-      });
+        }, body: buildRequest(config.systemPrompt, selectedModel, image, options.transcript), signal });
     } catch (error) {
       if (isAbortError(error) || signal?.aborted) return;
       yield { type: 'error', kind: 'transient', message: `Could not reach ${baseUrl}/responses.` };
