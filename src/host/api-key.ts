@@ -4,6 +4,8 @@ import { createSecret, type Secret } from './secret.ts';
 export const API_KEY_ENV_VAR = 'ANTHROPIC_API_KEY';
 export const OPENCODE_API_KEY_ENV_VAR = 'OPENCODE_API_KEY';
 export const OPENCODE_GO_API_KEY_ENV_VAR = 'OPENCODE_GO_API_KEY';
+export const OPENROUTER_API_KEY_ENV_VAR = 'OPENROUTER_API_KEY';
+export const GEMINI_API_KEY_ENV_VAR = 'GEMINI_API_KEY';
 
 const MISSING_KEY_MESSAGE = [
   `${API_KEY_ENV_VAR} is not set.`,
@@ -50,6 +52,21 @@ export function takeOpenCodeApiKey(env: NodeJS.ProcessEnv): Secret | null {
 export function takeOpenCodeGoApiKey(env: NodeJS.ProcessEnv): Secret | null {
   const raw = env[OPENCODE_GO_API_KEY_ENV_VAR];
   delete env[OPENCODE_GO_API_KEY_ENV_VAR];
+  const value = raw?.trim() ?? '';
+  return value === '' ? null : createSecret(value);
+}
+
+export function takeOpenRouterApiKey(env: NodeJS.ProcessEnv): Secret | null {
+  return takeOptionalKey(env, OPENROUTER_API_KEY_ENV_VAR);
+}
+
+export function takeGeminiApiKey(env: NodeJS.ProcessEnv): Secret | null {
+  return takeOptionalKey(env, GEMINI_API_KEY_ENV_VAR);
+}
+
+function takeOptionalKey(env: NodeJS.ProcessEnv, name: string): Secret | null {
+  const raw = env[name];
+  delete env[name];
   const value = raw?.trim() ?? '';
   return value === '' ? null : createSecret(value);
 }

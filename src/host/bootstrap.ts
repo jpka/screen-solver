@@ -1,4 +1,4 @@
-import { API_KEY_ENV_VAR, DEEPGRAM_API_KEY_ENV_VAR, takeApiKey, takeDeepgramApiKey, takeOpenCodeApiKey, takeOpenCodeGoApiKey } from './api-key.ts';
+import { API_KEY_ENV_VAR, DEEPGRAM_API_KEY_ENV_VAR, takeApiKey, takeDeepgramApiKey, takeGeminiApiKey, takeOpenCodeApiKey, takeOpenCodeGoApiKey, takeOpenRouterApiKey } from './api-key.ts';
 import { createDeepgramTranscriber } from './audio/deepgram.ts';
 import type { RecordingCoordinator } from './audio/recording-coordinator.ts';
 import type { OpenAudioCapture, Transcriber } from './audio/types.ts';
@@ -26,6 +26,8 @@ import {
 import type { Logger } from './logger.ts';
 import { createProvider } from './provider/anthropic.ts';
 import { createOpenCodeGoProvider, createOpenCodeProvider } from './provider/opencode.ts';
+import { createOpenRouterProvider } from './provider/openrouter.ts';
+import { createGeminiProvider } from './provider/gemini.ts';
 import { DEFAULT_SYSTEM_PROMPT } from './provider/system-prompt.ts';
 import type { Provider } from './provider/types.ts';
 import type { Secret } from './secret.ts';
@@ -177,10 +179,12 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
 
   const openCodeGoApiKey = takeOpenCodeGoApiKey(env);
   const openCodeApiKey = takeOpenCodeApiKey(env);
+  const openRouterApiKey = takeOpenRouterApiKey(env);
+  const geminiApiKey = takeGeminiApiKey(env);
   // Prefer the Go subscription, then OpenCode Zen, when explicitly configured. Always remove the Anthropic
   // variable too, even when it is not selected, so Electron never inherits it.
-  const apiKey = openCodeGoApiKey ?? openCodeApiKey ?? takeApiKey(env);
-  if (openCodeGoApiKey !== null || openCodeApiKey !== null) delete env[API_KEY_ENV_VAR];
+  const apiKey = geminiApiKey ?? openRouterApiKey ?? openCodeGoApiKey ?? openCodeApiKey ?? takeApiKey(env);
+  if (geminiApiKey !== null || openRouterApiKey !== null || openCodeGoApiKey !== null || openCodeApiKey !== null) delete env[API_KEY_ENV_VAR];
   // Taken in the same breath, and for the same reason: `env` has to be clean
   // of every key before Electron creates the hidden renderer, which snapshots
   // `process.env` at creation. Optional, unlike the Anthropic key -- see
@@ -193,11 +197,15 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   // needs nothing Electron-specific, only the API key (just taken above) and
   // a fixed system prompt, both already available at this point in the
   // startup sequence.
-  const provider = runtime.provider ?? (openCodeGoApiKey !== null
-    ? createOpenCodeGoProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT })
-    : openCodeApiKey !== null
-      ? createOpenCodeProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT })
-      : createProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT }));
+  const provider = runtime.provider ?? (geminiApiKey !== null
+    ? createGeminiProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT })
+    : openRouterApiKey !== null
+      ? createOpenRouterProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT })
+      : openCodeGoApiKey !== null
+        ? createOpenCodeGoProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT })
+        : openCodeApiKey !== null
+          ? createOpenCodeProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT })
+          : createProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT }));
 
   // Same reasoning as `provider` above -- nothing Electron-specific is needed,
   // only the key just taken. `undefined` when no key was set, which is what

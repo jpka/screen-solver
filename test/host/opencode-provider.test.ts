@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { createOpenCodeGoProvider, createOpenCodeProvider } from '../../src/host/provider/opencode.ts';
+import { createOpenRouterProvider } from '../../src/host/provider/openrouter.ts';
+import { createGeminiProvider } from '../../src/host/provider/gemini.ts';
 import type { SolveEvent, SolveImage } from '../../src/host/provider/types.ts';
 import { createSecret } from '../../src/host/secret.ts';
 
@@ -78,5 +80,42 @@ describe('createOpenCodeProvider', () => {
     assert.equal((headers as Record<string, string>)['x-opencode-session'], 'screen-solver-session');
     assert.equal(provider.model, 'gpt-5.6-luna');
     assert.equal(provider.models?.some((choice) => choice.id === 'gpt-6-luna'), true);
+  });
+});
+
+describe('OpenRouter and Gemini providers', () => {
+  it('sends OpenRouter an OpenAI-compatible multimodal request and maps stream chunks', async () => {
+    let body = '';
+    const provider = createOpenRouterProvider({
+      apiKey: createSecret('router-key'), systemPrompt: 'Solve it.',
+      fetch: async (_url, init) => {
+        body = String(init?.body);
+        return sse(
+          { choices: [{ delta: { content: 'answer' }, finish_reason: null }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 8, completion_tokens: 2 } },
+        );
+      },
+    });
+    const events = await collect(provider.solve(IMAGE));
+    assert.equal(events[0]?.type, 'delta');
+    assert.deepEqual(events.at(-1), { type: 'done', stopReason: 'stop', usage: { inputTokens: 8, outputTokens: 2, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } });
+    assert.match(body, /image_url/);
+    assert.match(body, /data:image\/png;base64,AQID/);
+  });
+
+  it('sends Gemini inline image data and maps its stream and usage metadata', async () => {
+    let url = '';
+    let body = '';
+    const provider = createGeminiProvider({
+      apiKey: createSecret('gemini-key'), systemPrompt: 'Solve it.',
+      fetch: async (nextUrl, init) => {
+        url = String(nextUrl); body = String(init?.body);
+        return sse({ candidates: [{ content: { parts: [{ text: 'answer' }] }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 9, candidatesTokenCount: 3, cachedContentTokenCount: 2 } });
+      },
+    });
+    const events = await collect(provider.solve(IMAGE));
+    assert.equal(url.includes(':streamGenerateContent?alt=sse'), true);
+    assert.match(body, /inlineData/);
+    assert.deepEqual(events.at(-1), { type: 'done', stopReason: 'stop', usage: { inputTokens: 9, outputTokens: 3, cacheCreationInputTokens: 0, cacheReadInputTokens: 2 } });
   });
 });
