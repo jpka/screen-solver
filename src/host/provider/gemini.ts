@@ -23,11 +23,12 @@ export function createGeminiProvider(config: GeminiProviderConfig): Provider {
     catch (error) { if (isAbortError(error) || options.signal?.aborted) return; yield { type: 'error', kind: 'transient', message: 'Could not reach Gemini.' }; return; }
     if (!response.ok) { yield { type: 'error', kind: response.status === 401 || response.status === 403 ? 'auth' : 'transient', message: await errorMessage(response) }; return; }
     if (response.body === null) { yield { type: 'error', kind: 'transient', message: 'Gemini returned no response body.' }; return; }
-    let usage: Usage = ZERO_USAGE; let finished = false;
-    try { for await (const raw of parseServerSentEvents(readBytes(response.body))) { if (options.signal?.aborted) return; const event = raw as GeminiChunk; const candidate = event.candidates?.[0]; for (const part of candidate?.content?.parts ?? []) if (part.text) yield { type: 'delta', text: part.text }; if (candidate?.finishReason) finished = true; if (event.usageMetadata) usage = { inputTokens: event.usageMetadata.promptTokenCount ?? 0, outputTokens: event.usageMetadata.candidatesTokenCount ?? 0, cacheCreationInputTokens: 0, cacheReadInputTokens: event.usageMetadata.cachedContentTokenCount ?? 0 }; } }
+    let usage: Usage = ZERO_USAGE; let finishReason: string | null = null;
+    try { for await (const raw of parseServerSentEvents(readBytes(response.body))) { if (options.signal?.aborted) return; const event = raw as GeminiChunk; const candidate = event.candidates?.[0]; for (const part of candidate?.content?.parts ?? []) if (part.text) yield { type: 'delta', text: part.text }; if (candidate?.finishReason) finishReason = candidate.finishReason; if (event.usageMetadata) usage = { inputTokens: event.usageMetadata.promptTokenCount ?? 0, outputTokens: event.usageMetadata.candidatesTokenCount ?? 0, cacheCreationInputTokens: 0, cacheReadInputTokens: event.usageMetadata.cachedContentTokenCount ?? 0 }; } }
     catch (error) { if (isAbortError(error) || options.signal?.aborted) return; yield { type: 'error', kind: 'transient', message: error instanceof Error ? error.message : String(error) }; return; }
-    if (!finished) { yield { type: 'error', kind: 'transient', message: 'The Gemini stream ended before the answer was complete.' }; return; }
-    yield { type: 'done', usage, stopReason: 'stop' };
+    if (finishReason === null) { yield { type: 'error', kind: 'transient', message: 'The Gemini stream ended before the answer was complete.' }; return; }
+    if (finishReason === 'SAFETY' || finishReason === 'RECITATION') { yield { type: 'error', kind: 'refusal', message: `Gemini declined this answer (${finishReason}).` }; return; }
+    yield { type: 'done', usage, stopReason: finishReason };
   }
   return Object.freeze({ model, models: Object.freeze([...models]), solve });
 }

@@ -116,8 +116,8 @@
    * authoritative allow-list; this client merely sends the currently selected
    * ID with whichever of the three solve modes the user chooses.
    */
-  function selectedModelBody() {
-    return modelSelect.value === '' ? undefined : JSON.stringify({ model: modelSelect.value });
+  function selectedModelBody(mode) {
+    return modelSelect.value === '' ? undefined : JSON.stringify({ mode, model: modelSelect.value });
   }
 
   async function loadModels() {
@@ -538,8 +538,8 @@
     solveError.hidden = true;
     solveButton.disabled = true;
     try {
-      const body = selectedModelBody();
-      const res = await fetch('/solve', body === undefined ? { method: 'POST' } : {
+      const body = selectedModelBody('screen');
+      const res = await fetch(body === undefined ? '/solve' : '/solve/model', body === undefined ? { method: 'POST' } : {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body,
@@ -568,8 +568,8 @@
     solveError.hidden = true;
     solveTranscriptButton.disabled = true;
     try {
-      const body = selectedModelBody();
-      const res = await fetch('/solve/with-transcript', body === undefined ? { method: 'POST' } : {
+      const body = selectedModelBody('screen-with-transcript');
+      const res = await fetch(body === undefined ? '/solve/with-transcript' : '/solve/model', body === undefined ? { method: 'POST' } : {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body,
@@ -600,8 +600,8 @@
     solveVoiceButton.disabled = true;
     voiceSolveInFlight = true;
     try {
-      const body = selectedModelBody();
-      const res = await fetch('/solve/transcript-only', body === undefined ? { method: 'POST' } : {
+      const body = selectedModelBody('transcript-only');
+      const res = await fetch(body === undefined ? '/solve/transcript-only' : '/solve/model', body === undefined ? { method: 'POST' } : {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body,

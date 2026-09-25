@@ -116,6 +116,6 @@ describe('OpenRouter and Gemini providers', () => {
     const events = await collect(provider.solve(IMAGE));
     assert.equal(url.includes(':streamGenerateContent?alt=sse'), true);
     assert.match(body, /inlineData/);
-    assert.deepEqual(events.at(-1), { type: 'done', stopReason: 'stop', usage: { inputTokens: 9, outputTokens: 3, cacheCreationInputTokens: 0, cacheReadInputTokens: 2 } });
+    assert.deepEqual(events.at(-1), { type: 'done', stopReason: 'STOP', usage: { inputTokens: 9, outputTokens: 3, cacheCreationInputTokens: 0, cacheReadInputTokens: 2 } });
   });
 });

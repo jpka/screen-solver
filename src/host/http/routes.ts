@@ -183,7 +183,29 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
    * doesn't abort the solve already in flight on its way out.
    */
   function solveHandler(mode: SolveMode): Route['handle'] {
-    return async ({ req, res }) => {
+    return ({ res }) => startSolve(mode, undefined, res);
+  }
+
+  /** New selection surface; the established solve routes deliberately keep their body-free contracts. */
+  const modelSolveHandler: Route['handle'] = async ({ req, res }) => {
+    let body: unknown;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      sendJson(res, error instanceof PayloadTooLargeError ? 413 : 400, {
+        error: error instanceof PayloadTooLargeError ? 'payload_too_large' : 'bad_request',
+      });
+      return;
+    }
+    const requested = parseModelSolveBody(body);
+    if (requested === INVALID_MODEL_SOLVE) {
+      sendJson(res, 400, { error: 'bad_request' });
+      return;
+    }
+    startSolve(requested.mode, requested.model, res);
+  };
+
+  function startSolve(mode: SolveMode, model: string | undefined, res: import('node:http').ServerResponse): void {
       if (solveLoop === null || configStore === undefined || provider === undefined) {
         sendJson(res, 503, { error: 'not_ready' });
         return;
@@ -212,17 +234,8 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
         return;
       }
 
-      let model: string | undefined | typeof INVALID_MODEL = INVALID_MODEL;
-      try {
-        model = parseSolveModel(await readJsonBody(req));
-      } catch (error) {
-        sendJson(res, error instanceof PayloadTooLargeError ? 413 : 400, {
-          error: error instanceof PayloadTooLargeError ? 'payload_too_large' : 'bad_request',
-        });
-        return;
-      }
       const availableModels = provider.models ?? [{ id: provider.model, name: provider.model }];
-      if (model === INVALID_MODEL || (model !== undefined && !availableModels.some((choice) => choice.id === model))) {
+      if (model !== undefined && !availableModels.some((choice) => choice.id === model)) {
         sendJson(res, 400, { error: 'unsupported_model' });
         return;
       }
@@ -241,7 +254,6 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
         return;
       }
       sendJson(res, 202, { status: 'accepted' });
-    };
   }
 
   const routes: Route[] = [
@@ -283,6 +295,7 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
       path: '/solve/transcript-only',
       handle: solveHandler('transcript-only'),
     },
+    { method: 'POST', path: '/solve/model', handle: modelSolveHandler },
     {
       method: 'GET',
       path: '/models',
@@ -507,14 +520,15 @@ function parseLimit(raw: string | null): number | null {
 }
 
 const INVALID_TARGET = Symbol('invalid-target');
-const INVALID_MODEL = Symbol('invalid-model');
-
-/** Empty body keeps the configured default; `{model}` selects one advertised by `GET /models`. */
-function parseSolveModel(body: unknown): string | undefined | typeof INVALID_MODEL {
-  if (body === null) return undefined;
-  if (typeof body !== 'object') return INVALID_MODEL;
-  const model = (body as Record<string, unknown>).model;
-  return typeof model === 'string' && model.trim() !== '' ? model : INVALID_MODEL;
+const INVALID_MODEL_SOLVE = Symbol('invalid-model-solve');
+function parseModelSolveBody(body: unknown): { readonly mode: SolveMode; readonly model: string } | typeof INVALID_MODEL_SOLVE {
+  if (typeof body !== 'object' || body === null) return INVALID_MODEL_SOLVE;
+  const record = body as Record<string, unknown>;
+  const mode = record.mode;
+  const model = record.model;
+  return (mode === 'screen' || mode === 'screen-with-transcript' || mode === 'transcript-only') && typeof model === 'string' && model !== ''
+    ? { mode, model }
+    : INVALID_MODEL_SOLVE;
 }
 
 /** `null` (clear), a well-formed `{processName, title}` (set), or {@link INVALID_TARGET}. */

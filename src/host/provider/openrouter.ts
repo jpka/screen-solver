@@ -26,18 +26,19 @@ export function createOpenRouterProvider(config: OpenRouterProviderConfig): Prov
     } catch (error) { if (isAbortError(error) || options.signal?.aborted) return; yield { type: 'error', kind: 'transient', message: 'Could not reach OpenRouter.' }; return; }
     if (!response.ok) { yield { type: 'error', kind: response.status === 401 || response.status === 403 ? 'auth' : 'transient', message: await errorMessage(response) }; return; }
     if (response.body === null) { yield { type: 'error', kind: 'transient', message: 'OpenRouter returned no response body.' }; return; }
-    let usage: Usage = ZERO_USAGE; let finished = false;
+    let usage: Usage = ZERO_USAGE; let finishReason: string | null = null;
     try {
       for await (const raw of parseServerSentEvents(readBytes(response.body))) {
         if (options.signal?.aborted) return;
         const event = raw as ChatChunk; const choice = event.choices?.[0];
         if (choice?.delta?.content) yield { type: 'delta', text: choice.delta.content };
-        if (choice?.finish_reason) finished = true;
+        if (choice?.finish_reason) finishReason = choice.finish_reason;
         if (event.usage) usage = { inputTokens: event.usage.prompt_tokens ?? 0, outputTokens: event.usage.completion_tokens ?? 0, cacheCreationInputTokens: 0, cacheReadInputTokens: event.usage.prompt_tokens_details?.cached_tokens ?? 0 };
       }
     } catch (error) { if (isAbortError(error) || options.signal?.aborted) return; yield { type: 'error', kind: 'transient', message: error instanceof Error ? error.message : String(error) }; return; }
-    if (!finished) { yield { type: 'error', kind: 'transient', message: 'The OpenRouter stream ended before the answer was complete.' }; return; }
-    yield { type: 'done', usage, stopReason: 'stop' };
+    if (finishReason === null) { yield { type: 'error', kind: 'transient', message: 'The OpenRouter stream ended before the answer was complete.' }; return; }
+    if (finishReason === 'content_filter') { yield { type: 'error', kind: 'refusal', message: 'OpenRouter filtered this answer.' }; return; }
+    yield { type: 'done', usage, stopReason: finishReason };
   }
   return Object.freeze({ model, models: Object.freeze([...models]), solve });
 }

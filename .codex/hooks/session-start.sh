@@ -5,12 +5,11 @@
 # out of date.
 set -euo pipefail
 
-# Local dev machines set this up themselves; only web sessions need it.
-if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
-  exit 0
-fi
-
-cd "$CLAUDE_PROJECT_DIR"
+# Both Codex and Claude sessions run hooks from the checkout. Prefer their
+# project variables when supplied, but never silently skip provisioning just
+# because one host uses different variable names.
+PROJECT_DIR="${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}"
+cd "$PROJECT_DIR"
 
 # --- Agent skills -----------------------------------------------------
 # The `skills` CLI version is pinned via package.json. It always installs
