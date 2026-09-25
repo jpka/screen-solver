@@ -2,6 +2,8 @@ import { StartupError } from './errors.ts';
 import { createSecret, type Secret } from './secret.ts';
 
 export const API_KEY_ENV_VAR = 'ANTHROPIC_API_KEY';
+export const OPENCODE_API_KEY_ENV_VAR = 'OPENCODE_API_KEY';
+export const OPENCODE_GO_API_KEY_ENV_VAR = 'OPENCODE_GO_API_KEY';
 
 const MISSING_KEY_MESSAGE = [
   `${API_KEY_ENV_VAR} is not set.`,
@@ -34,6 +36,22 @@ export function takeApiKey(env: NodeJS.ProcessEnv): Secret {
   }
 
   return createSecret(value);
+}
+
+/** Optional because an Anthropic key remains a supported fallback provider. */
+export function takeOpenCodeApiKey(env: NodeJS.ProcessEnv): Secret | null {
+  const raw = env[OPENCODE_API_KEY_ENV_VAR];
+  delete env[OPENCODE_API_KEY_ENV_VAR];
+  const value = raw?.trim() ?? '';
+  return value === '' ? null : createSecret(value);
+}
+
+/** The Go subscription key is separate from the pay-as-you-go Zen key. */
+export function takeOpenCodeGoApiKey(env: NodeJS.ProcessEnv): Secret | null {
+  const raw = env[OPENCODE_GO_API_KEY_ENV_VAR];
+  delete env[OPENCODE_GO_API_KEY_ENV_VAR];
+  const value = raw?.trim() ?? '';
+  return value === '' ? null : createSecret(value);
 }
 
 export const DEEPGRAM_API_KEY_ENV_VAR = 'DEEPGRAM_API_KEY';

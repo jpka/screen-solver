@@ -18,6 +18,7 @@ import type {
   SolveImage,
   SolveOptions,
   Usage,
+  ModelChoice,
 } from './types.ts';
 
 /**
@@ -88,9 +89,9 @@ export function createProvider(config: ProviderConfig): Provider {
   };
   const system: readonly SystemBlock[] = Object.freeze([systemBlock]);
 
-  function buildRequest(image: SolveImage | null, transcript: string | undefined): MessagesRequest {
+  function buildRequest(image: SolveImage | null, transcript: string | undefined, requestModel: string): MessagesRequest {
     return {
-      model,
+      model: requestModel,
       max_tokens: maxTokens,
       stream: true,
       system,
@@ -161,7 +162,8 @@ export function createProvider(config: ProviderConfig): Provider {
       return;
     }
 
-    const body = buildRequest(image, options.transcript);
+    const requestModel = options.model ?? model;
+    const body = buildRequest(image, options.transcript, requestModel);
 
     for (let attempt = 0; ; attempt += 1) {
       if (aborted()) return;
@@ -252,7 +254,8 @@ export function createProvider(config: ProviderConfig): Provider {
     }
   }
 
-  return Object.freeze({ model, solve });
+  const models: readonly ModelChoice[] = Object.freeze([{ id: model, name: model }]);
+  return Object.freeze({ model, models, solve });
 }
 
 /**
