@@ -183,8 +183,30 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
    * doesn't abort the solve already in flight on its way out.
    */
   function solveHandler(mode: SolveMode): Route['handle'] {
-    return ({ res }) => {
-      if (solveLoop === null || configStore === undefined) {
+    return ({ res }) => startSolve(mode, undefined, res);
+  }
+
+  /** New selection surface; the established solve routes deliberately keep their body-free contracts. */
+  const modelSolveHandler: Route['handle'] = async ({ req, res }) => {
+    let body: unknown;
+    try {
+      body = await readJsonBody(req);
+    } catch (error) {
+      sendJson(res, error instanceof PayloadTooLargeError ? 413 : 400, {
+        error: error instanceof PayloadTooLargeError ? 'payload_too_large' : 'bad_request',
+      });
+      return;
+    }
+    const requested = parseModelSolveBody(body);
+    if (requested === INVALID_MODEL_SOLVE) {
+      sendJson(res, 400, { error: 'bad_request' });
+      return;
+    }
+    startSolve(requested.mode, requested.model, res);
+  };
+
+  function startSolve(mode: SolveMode, model: string | undefined, res: import('node:http').ServerResponse): void {
+      if (solveLoop === null || configStore === undefined || provider === undefined) {
         sendJson(res, 503, { error: 'not_ready' });
         return;
       }
@@ -212,6 +234,12 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
         return;
       }
 
+      const availableModels = provider.models ?? [{ id: provider.model, name: provider.model }];
+      if (model !== undefined && !availableModels.some((choice) => choice.id === model)) {
+        sendJson(res, 400, { error: 'unsupported_model' });
+        return;
+      }
+
       // Synchronous with the 202 below: whatever solve was in flight is
       // aborted right here. The pre-flight guards and the provider call for
       // this new solve run asynchronously, after the response has already
@@ -221,12 +249,11 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
       // (`SolveLoop.stop()`): the server is still listening for the moment it
       // takes to close, but nothing is left to run or persist a new attempt,
       // so say so rather than accepting work that will silently evaporate.
-      if (!solveLoop.trigger({ mode })) {
+      if (!solveLoop.trigger(model === undefined ? { mode } : { mode, model })) {
         sendJson(res, 503, { error: 'shutting_down' });
         return;
       }
       sendJson(res, 202, { status: 'accepted' });
-    };
   }
 
   const routes: Route[] = [
@@ -245,14 +272,10 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
     {
       // The transcript-flavoured solve.
       //
-      // A separate route rather than a body flag on `POST /solve`, deliberately.
-      // That route reads no request body at all today, and its contract is
-      // total: 202 unless not-ready / no-target / shutting-down. Adding a body
-      // would introduce `400 bad_request` and `413 payload_too_large` failure
-      // modes to a route several existing tests assert has none, to express one
-      // bit. `AGENTS.md` frames this flat route list as a place where new
-      // capability is an append, not surgery -- so this is an append, and both
-      // handlers come from the same factory so the two can't drift.
+      // A separate route rather than a mode flag. Its optional `{model}` body
+      // is shared with every solve route; the route itself still says which
+      // inputs make up the request, so the three modes cannot be combined into
+      // incoherent boolean combinations.
       method: 'POST',
       path: '/solve/with-transcript',
       handle: solveHandler('screen-with-transcript'),
@@ -271,6 +294,18 @@ export function createHostRoutes(deps: HostRoutesDeps = {}): HostRoutes {
       method: 'POST',
       path: '/solve/transcript-only',
       handle: solveHandler('transcript-only'),
+    },
+    { method: 'POST', path: '/solve/model', handle: modelSolveHandler },
+    {
+      method: 'GET',
+      path: '/models',
+      handle: ({ res }) => {
+        if (provider === undefined) {
+          sendJson(res, 503, { error: 'not_ready' });
+          return;
+        }
+        sendJson(res, 200, { defaultModel: provider.model, models: provider.models ?? [{ id: provider.model, name: provider.model }] });
+      },
     },
     {
       method: 'GET',
@@ -485,6 +520,16 @@ function parseLimit(raw: string | null): number | null {
 }
 
 const INVALID_TARGET = Symbol('invalid-target');
+const INVALID_MODEL_SOLVE = Symbol('invalid-model-solve');
+function parseModelSolveBody(body: unknown): { readonly mode: SolveMode; readonly model: string } | typeof INVALID_MODEL_SOLVE {
+  if (typeof body !== 'object' || body === null) return INVALID_MODEL_SOLVE;
+  const record = body as Record<string, unknown>;
+  const mode = record.mode;
+  const model = record.model;
+  return (mode === 'screen' || mode === 'screen-with-transcript' || mode === 'transcript-only') && typeof model === 'string' && model !== ''
+    ? { mode, model }
+    : INVALID_MODEL_SOLVE;
+}
 
 /** `null` (clear), a well-formed `{processName, title}` (set), or {@link INVALID_TARGET}. */
 function parseTargetBody(body: unknown): TargetWindowIdentity | null | typeof INVALID_TARGET {

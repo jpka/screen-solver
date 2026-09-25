@@ -80,6 +80,8 @@ export type SolveMode =
 export interface TriggerOptions {
   /** Defaults to `'screen'`, which is what keeps `POST /solve` unchanged -- see `SolveLoop.trigger`. */
   readonly mode?: SolveMode;
+  /** The model chosen for this one solve, if any. */
+  readonly model?: string;
 }
 
 export interface SolveLoop {
@@ -182,6 +184,7 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     if (stopped) return false;
 
     const mode = options.mode ?? 'screen';
+    const model = options.model;
 
     const previous = controller;
     const next = new AbortController();
@@ -211,7 +214,7 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     const nothingToSolve = mode !== 'transcript-only' && target === null;
     const run = nothingToSolve
       ? Promise.resolve()
-      : runAttempt(target, next.signal, transcript).catch((error: unknown) => {
+      : runAttempt(target, next.signal, transcript, model).catch((error: unknown) => {
           logger.error(`solve loop: attempt failed unexpectedly: ${describeError(error)}`);
         });
 
@@ -245,6 +248,7 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     target: TargetWindowIdentity | null,
     signal: AbortSignal,
     transcript: string | null,
+    model: string | undefined,
   ): Promise<void> {
     // Only tagged when a transcript was actually sent. A "Solve with
     // transcript" pressed during silence is, on the wire and in the logs,
@@ -259,7 +263,7 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
       // it covers a window that emptied between the route's check and here.
       if (transcript === null) return;
 
-      await callProvider(null, target, transcript, signal, withTranscript);
+      await callProvider(null, target, transcript, signal, withTranscript, model);
       return;
     }
 
@@ -315,6 +319,7 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
       transcript,
       signal,
       withTranscript,
+      model,
     );
   }
 
@@ -336,6 +341,7 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
     transcript: string | null,
     signal: AbortSignal,
     withTranscript: { readonly withTranscript?: true },
+    model: string | undefined,
   ): Promise<void> {
     // Committed: a provider call is genuinely attempted from here on, so the
     // wire and the outcome bus both go live for this attempt.
@@ -347,7 +353,9 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
       // `transcript` stays absent rather than `undefined`-valued when there is
       // none, so a plain solve builds a request byte-identical to the one it
       // built before this option existed.
-      transcript === null ? { signal } : { signal, transcript },
+      transcript === null
+        ? model === undefined ? { signal } : { signal, model }
+        : model === undefined ? { signal, transcript } : { signal, transcript, model },
     )) {
       switch (event.type) {
         case 'delta':
@@ -358,14 +366,14 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
           deps.broadcaster.done(event.usage);
           const outcome: SolveOutcome = { type: 'done', text, usage: event.usage, stopReason: event.stopReason };
           applyStatusTransition(outcome);
-          await deps.onOutcome?.({ outcome, target, model: deps.provider.model, ...withTranscript });
+          await deps.onOutcome?.({ outcome, target, model: model ?? deps.provider.model, ...withTranscript });
           return;
         }
         case 'error': {
           deps.broadcaster.error(event.kind);
           const outcome: SolveOutcome = { type: 'error', kind: event.kind, message: event.message, text };
           applyStatusTransition(outcome);
-          await deps.onOutcome?.({ outcome, target, model: deps.provider.model, ...withTranscript });
+          await deps.onOutcome?.({ outcome, target, model: model ?? deps.provider.model, ...withTranscript });
           return;
         }
       }
@@ -380,7 +388,7 @@ export function startSolveLoop(deps: SolveLoopDeps): SolveLoop {
       // rules) -- called anyway so the "one place decides" property holds
       // even though this call is always a no-op today.
       applyStatusTransition(outcome);
-      await deps.onOutcome?.({ outcome, target, model: deps.provider.model, ...withTranscript });
+      await deps.onOutcome?.({ outcome, target, model: model ?? deps.provider.model, ...withTranscript });
     } else {
       logger.error(
         'solve loop: the provider iterable ended without a terminal event and no abort was requested ' +

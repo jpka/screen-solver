@@ -11,9 +11,9 @@
       <h1>Screen Solver</h1>
       <span id="connection-indicator" class="connection-indicator"></span>
       <span id="status-pill" class="status-pill" hidden></span>
-      <!-- #35 adds two buttons to #34's header, so all four are wrapped:
+      <!-- The model picker and action controls are wrapped together:
            the flex layout then needs one auto-margin (on the wrapper) rather
-           than relying on auto-margins collapsing correctly across four
+           than relying on auto-margins collapsing correctly across several
            siblings, and the wrapper is what wraps to a second row on a narrow
            phone instead of the buttons overflowing. The two solve buttons stay
            adjacent -- they are the same action with and without speech.
@@ -25,6 +25,12 @@
       <div class="header-actions">
         <button id="record-toggle" type="button" data-state="off">Start recording</button>
         <button id="fullscreen-button" type="button" class="icon-button" title="Fullscreen">&#9974;</button>
+        <label class="model-picker" for="model-select">
+          <span>Model</span>
+          <select id="model-select" disabled>
+            <option value="">Loading models…</option>
+          </select>
+        </label>
         <button id="solve-voice-button" type="button" disabled>Solve speech only</button>
         <button id="solve-transcript-button" type="button" disabled>Solve with transcript</button>
         <button id="solve-button" type="button" disabled>Solve now</button>

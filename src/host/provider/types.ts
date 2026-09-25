@@ -85,12 +85,26 @@ export interface SolveOptions {
    * question that belongs to the window, not to the wire.
    */
   readonly transcript?: string;
+  /**
+   * An explicitly selected model for this attempt. It is intentionally a
+   * per-solve option: changing the picker must not mutate an attempt that is
+   * already streaming (or make its usage line name the wrong model).
+   */
+  readonly model?: string;
+}
+
+/** A model the active provider is willing to accept from the solve picker. */
+export interface ModelChoice {
+  readonly id: string;
+  readonly name: string;
 }
 
 /** The one thing the rest of the app calls to turn a screenshot, recent speech, or both into an answer. */
 export interface Provider {
   /** The model actually in use, for the usage log. */
   readonly model: string;
+  /** Models offered by the web client. Absent for legacy injected test providers. */
+  readonly models?: readonly ModelChoice[];
   /**
    * `image` is `null` for a spoken-only solve: the user asked a question out
    * loud and there is no screen to read it off. The transcript is then the

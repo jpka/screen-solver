@@ -16,6 +16,7 @@
 //   GET  /transcript?limit=N    -> TranscriptEntry[]               (#35)
 //   POST /solve/with-transcript -> 202/400/503, same shape as /solve (#35)
 //   POST /solve/transcript-only -> 202/400/503, speech only, no target needed
+//   GET  /models              -> { models: [{ id, name }], defaultModel }  (#36)
 //   GET  /events (SSE)  -> start/delta/done/error/sync/status/config{,revision}
 //                          /recording/transcript/transcript-interim (#35)
 
@@ -65,6 +66,7 @@
   const statusPill = document.getElementById('status-pill');
   const connectionIndicator = document.getElementById('connection-indicator');
   const fullscreenButton = document.getElementById('fullscreen-button');
+  const modelSelect = document.getElementById('model-select');
   const picker = document.getElementById('picker');
   const pickerError = document.getElementById('picker-error');
   const windowList = document.getElementById('window-list');
@@ -108,6 +110,44 @@
    * this guess turns out to be stale.
    */
   let hasHeardSpeech = false;
+
+  /**
+   * The picker selects a model for the next attempt only. The server owns the
+   * authoritative allow-list; this client merely sends the currently selected
+   * ID with whichever of the three solve modes the user chooses.
+   */
+  function selectedModelBody(mode) {
+    return modelSelect.value === '' ? undefined : JSON.stringify({ mode, model: modelSelect.value });
+  }
+
+  async function loadModels() {
+    try {
+      const res = await fetch('/models');
+      if (!res.ok) throw new Error(`GET /models -> ${res.status}`);
+      const body = await res.json();
+      if (!Array.isArray(body.models) || body.models.length === 0) {
+        throw new Error('no models available');
+      }
+
+      modelSelect.replaceChildren();
+      for (const choice of body.models) {
+        if (typeof choice?.id !== 'string' || typeof choice?.name !== 'string') continue;
+        const option = document.createElement('option');
+        option.value = choice.id;
+        option.textContent = choice.name;
+        option.selected = choice.id === body.defaultModel;
+        modelSelect.append(option);
+      }
+      if (modelSelect.options.length === 0) throw new Error('no valid models available');
+      modelSelect.disabled = false;
+    } catch (err) {
+      // Model selection is an enhancement, not a reason to disable solving:
+      // the host falls back to its configured default when no model arrives.
+      modelSelect.replaceChildren(new Option('Default model', ''));
+      modelSelect.disabled = true;
+      console.warn(`Could not load model choices: ${err.message}`);
+    }
+  }
 
   function markSpeechHeard() {
     if (hasHeardSpeech) return;
@@ -498,7 +538,12 @@
     solveError.hidden = true;
     solveButton.disabled = true;
     try {
-      const res = await fetch('/solve', { method: 'POST' });
+      const body = selectedModelBody('screen');
+      const res = await fetch(body === undefined ? '/solve' : '/solve/model', body === undefined ? { method: 'POST' } : {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      });
       if (res.status !== 202) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || `unexpected status ${res.status}`);
@@ -523,7 +568,12 @@
     solveError.hidden = true;
     solveTranscriptButton.disabled = true;
     try {
-      const res = await fetch('/solve/with-transcript', { method: 'POST' });
+      const body = selectedModelBody('screen-with-transcript');
+      const res = await fetch(body === undefined ? '/solve/with-transcript' : '/solve/model', body === undefined ? { method: 'POST' } : {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      });
       if (res.status !== 202) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || `unexpected status ${res.status}`);
@@ -550,7 +600,12 @@
     solveVoiceButton.disabled = true;
     voiceSolveInFlight = true;
     try {
-      const res = await fetch('/solve/transcript-only', { method: 'POST' });
+      const body = selectedModelBody('transcript-only');
+      const res = await fetch(body === undefined ? '/solve/transcript-only' : '/solve/model', body === undefined ? { method: 'POST' } : {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      });
       if (res.status !== 202) {
         const body = await res.json().catch(() => ({}));
         if (body.error === 'no_transcript') {
@@ -1239,6 +1294,7 @@
   }
 
   loadConfig();
+  loadModels();
   loadHistory();
   loadRecording();
   loadTranscript();

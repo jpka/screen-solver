@@ -1,4 +1,4 @@
-import { API_KEY_ENV_VAR, DEEPGRAM_API_KEY_ENV_VAR, takeApiKey, takeDeepgramApiKey } from './api-key.ts';
+import { API_KEY_ENV_VAR, DEEPGRAM_API_KEY_ENV_VAR, takeApiKey, takeDeepgramApiKey, takeGeminiApiKey, takeOpenCodeApiKey, takeOpenCodeGoApiKey, takeOpenRouterApiKey } from './api-key.ts';
 import { createDeepgramTranscriber } from './audio/deepgram.ts';
 import type { RecordingCoordinator } from './audio/recording-coordinator.ts';
 import type { OpenAudioCapture, Transcriber } from './audio/types.ts';
@@ -25,6 +25,9 @@ import {
 } from './http/server.ts';
 import type { Logger } from './logger.ts';
 import { createProvider } from './provider/anthropic.ts';
+import { createOpenCodeGoProvider, createOpenCodeProvider } from './provider/opencode.ts';
+import { createOpenRouterProvider } from './provider/openrouter.ts';
+import { createGeminiProvider } from './provider/gemini.ts';
 import { DEFAULT_SYSTEM_PROMPT } from './provider/system-prompt.ts';
 import type { Provider } from './provider/types.ts';
 import type { Secret } from './secret.ts';
@@ -95,10 +98,10 @@ export interface HostRuntime {
   readonly isTargetMinimized?: IsTargetMinimized;
   /**
    * The provider seam (#27) the solve loop (#29) calls to turn a captured
-   * frame into an answer. Left unset, a real Anthropic provider is
-   * constructed from the API key just taken out of `env` and a fixed system
-   * prompt (`src/host/provider/system-prompt.ts`); tests inject a fake here
-   * instead of touching the network.
+   * frame into an answer. Left unset, an OpenCode provider is constructed
+   * when `OPENCODE_API_KEY` is set; otherwise Anthropic remains the fallback.
+   * Both use the fixed system prompt; tests inject a fake here instead of
+   * touching the network.
    */
   readonly provider?: Provider;
   /**
@@ -174,7 +177,14 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
     return { status: 'already-running' };
   }
 
-  const apiKey = takeApiKey(env);
+  const openCodeGoApiKey = takeOpenCodeGoApiKey(env);
+  const openCodeApiKey = takeOpenCodeApiKey(env);
+  const openRouterApiKey = takeOpenRouterApiKey(env);
+  const geminiApiKey = takeGeminiApiKey(env);
+  // Prefer the Go subscription, then OpenCode Zen, when explicitly configured. Always remove the Anthropic
+  // variable too, even when it is not selected, so Electron never inherits it.
+  const apiKey = geminiApiKey ?? openRouterApiKey ?? openCodeGoApiKey ?? openCodeApiKey ?? takeApiKey(env);
+  if (geminiApiKey !== null || openRouterApiKey !== null || openCodeGoApiKey !== null || openCodeApiKey !== null) delete env[API_KEY_ENV_VAR];
   // Taken in the same breath, and for the same reason: `env` has to be clean
   // of every key before Electron creates the hidden renderer, which snapshots
   // `process.env` at creation. Optional, unlike the Anthropic key -- see
@@ -187,7 +197,15 @@ export async function bootstrapHost(runtime: HostRuntime): Promise<BootstrapResu
   // needs nothing Electron-specific, only the API key (just taken above) and
   // a fixed system prompt, both already available at this point in the
   // startup sequence.
-  const provider = runtime.provider ?? createProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT });
+  const provider = runtime.provider ?? (geminiApiKey !== null
+    ? createGeminiProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT })
+    : openRouterApiKey !== null
+      ? createOpenRouterProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT })
+      : openCodeGoApiKey !== null
+        ? createOpenCodeGoProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT })
+        : openCodeApiKey !== null
+          ? createOpenCodeProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT })
+          : createProvider({ apiKey, systemPrompt: DEFAULT_SYSTEM_PROMPT }));
 
   // Same reasoning as `provider` above -- nothing Electron-specific is needed,
   // only the key just taken. `undefined` when no key was set, which is what

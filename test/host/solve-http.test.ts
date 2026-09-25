@@ -53,6 +53,7 @@ interface ScriptedCall {
   /** `null` for a spoken-only solve. */
   readonly image: SolveImage | null;
   readonly signal: AbortSignal | undefined;
+  readonly model: string | undefined;
   push(event: SolveEvent): void;
 }
 
@@ -77,6 +78,7 @@ function fakeProvider(): FakeProvider {
 
   const provider: Provider = {
     model: 'fake-model',
+    models: [{ id: 'fake-model', name: 'Fake model' }, { id: 'fast-model', name: 'Fast model' }],
     solve(image, options) {
       const queue: SolveEvent[] = [];
       let notify: (() => void) | null = null;
@@ -84,6 +86,7 @@ function fakeProvider(): FakeProvider {
       const call: ScriptedCall = {
         image,
         signal: options?.signal,
+        model: options?.model,
         push(event) {
           queue.push(event);
           const wake = notify;
@@ -662,5 +665,51 @@ describe('POST /solve + GET /events', () => {
       framesA.map((f) => f.type),
       ['start', 'delta', 'done'],
     );
+  });
+
+  it('serves the provider model catalog and its default model', async (t) => {
+    const h = await startTestServer(t);
+
+    const response = await fetch(`${h.server.url}/models`);
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      defaultModel: 'fake-model',
+      models: [{ id: 'fake-model', name: 'Fake model' }, { id: 'fast-model', name: 'Fast model' }],
+    });
+  });
+
+  it('rejects an unsupported selected model before it starts a solve', async (t) => {
+    const h = await startTestServer(t);
+
+    const response = await fetch(`${h.server.url}/solve/model`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'screen', model: 'not-in-the-catalog' }),
+    });
+
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: 'unsupported_model' });
+    await flush();
+    assert.equal(h.fakeProvider.calls.length, 0);
+  });
+
+  it('passes an allowed selected model through to the provider', async (t) => {
+    const h = await startTestServer(t);
+
+    const response = await fetch(`${h.server.url}/solve/model`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'screen', model: 'fast-model' }),
+    });
+
+    assert.equal(response.status, 202);
+    const call = await h.fakeProvider.waitForCall(1);
+    assert.equal(call.model, 'fast-model');
+    call.push({
+      type: 'done',
+      usage: { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+      stopReason: 'completed',
+    });
   });
 });

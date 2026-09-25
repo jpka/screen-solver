@@ -61,9 +61,9 @@ body {
   flex: 0 0 auto;
 }
 
-/* #35: the record toggle, the fullscreen button and the two solve buttons
+/* The record toggle, fullscreen button, model picker, and solve buttons
    live together so the header's flex layout only needs one auto-margin (here)
-   to push the whole group right, instead of relying on four buttons'
+   to push the whole group right, instead of relying on individual controls'
    individual auto margins collapsing into the same result. `flex-wrap` keeps
    them from overflowing a narrow (phone) viewport -- they wrap to a second
    line under the title instead of clipping or forcing horizontal scroll. */
@@ -74,6 +74,24 @@ body {
   gap: 0.6rem;
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+
+.model-picker {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.model-picker select {
+  max-width: 11rem;
+  background: var(--panel-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem;
+  font: inherit;
 }
 
 button {
