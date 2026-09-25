@@ -62,6 +62,35 @@ describe('createOpenCodeProvider', () => {
     assert.deepEqual(await collect(provider.solve(IMAGE)), [{ type: 'error', kind: 'auth', message: 'bad key' }]);
   });
 
+  it('does not mark a partial answer complete when OpenCode reports an incomplete response', async () => {
+    const provider = createOpenCodeProvider({
+      apiKey: createSecret('opencode-test-key'),
+      systemPrompt: 'Solve it.',
+      fetch: async () => sse(
+        { type: 'response.output_text.delta', delta: 'partial answer' },
+        { type: 'response.incomplete', error: { message: 'generation stopped' } },
+      ),
+    });
+
+    assert.deepEqual(await collect(provider.solve(IMAGE)), [
+      { type: 'delta', text: 'partial answer' },
+      { type: 'error', kind: 'transient', message: 'generation stopped' },
+    ]);
+  });
+
+  it('reports a truncated stream instead of completing its partial answer', async () => {
+    const provider = createOpenCodeProvider({
+      apiKey: createSecret('opencode-test-key'),
+      systemPrompt: 'Solve it.',
+      fetch: async () => sse({ type: 'response.output_text.delta', delta: 'partial answer' }),
+    });
+
+    assert.deepEqual(await collect(provider.solve(IMAGE)), [
+      { type: 'delta', text: 'partial answer' },
+      { type: 'error', kind: 'transient', message: 'The OpenCode stream ended before the answer was complete.' },
+    ]);
+  });
+
   it('uses Go’s distinct endpoint catalog and stable session header', async () => {
     let url = '';
     let headers: Record<string, string> | undefined;
