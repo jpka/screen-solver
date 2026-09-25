@@ -5,9 +5,14 @@
 # out of date.
 set -euo pipefail
 
-# Both Codex and Claude sessions run hooks from the checkout. Prefer their
-# project variables when supplied, but never silently skip provisioning just
-# because one host uses different variable names.
+# Provision only remote sessions. Codex and Claude expose different remote
+# flags, while local checkouts already own their dependencies and should not
+# repeatedly install them or require the network on every session start.
+if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ] && [ "${CODEX_REMOTE:-}" != "true" ]; then
+  exit 0
+fi
+
+# Both hosts run hooks from the checkout. Prefer their project variables.
 PROJECT_DIR="${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}"
 cd "$PROJECT_DIR"
 
